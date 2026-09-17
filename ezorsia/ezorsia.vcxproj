@@ -201,6 +201,7 @@
     <ClInclude Include="codecaves.h" />
     <ClInclude Include="ReplacementFuncs.h" />
     <ClInclude Include="INIReader.h" />
+    <ClInclude Include="LatchFix.h" />
     <ClInclude Include="Memory.h" />
     <ClInclude Include="NMCO.h" />
     <ClInclude Include="SelectCharMacFix.h" />
@@ -217,6 +218,7 @@
     <ClCompile Include="ijl15.cpp" />
     <ClCompile Include="ZAllocEx.cpp" />
     <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="LatchFix.cpp" />
     <ClCompile Include="Memory.cpp" />
     <ClCompile Include="NMCO.cpp" />
     <ClCompile Include="SelectCharMacFix.cpp" />
