@@ -14,7 +14,6 @@ const DWORD dwCUserLocal__Update = 0x0094A144;
 const DWORD dwCMobTemplate__GetMobTemplate = 0x0067CD28; // CMobTemplate::GetMobTemplate(dwTemplateID)
 const DWORD dwGetBasicFont = 0x0098A707; // get_basic_font(FONT_TYPE), __cdecl(out com_ptr<IWzFont>*, int)
 const DWORD dwBstrCtor = 0x00406301; // _bstr_t::_bstr_t(char const*) (same helper AutoTypes.h calls _bstr_ctor)
-const DWORD dwBstrDataRelease = 0x00402EA5; // _bstr_t::Data_t::Release()
 const DWORD dwIWzFont__CalcTextWidth = 0x0042782E; // (font, &bstr, &variant) -> text width in px
 const DWORD dwIWzCanvas__DrawTextA = 0x004277AD; // (x, y, bstr, font, &vAlpha, &vTabOrg)
 const DWORD dwIWzGr2DLayer__GetCanvas = 0x00425D2E; // (layer, &canvas, &variant)
@@ -76,32 +75,38 @@ static void* pTextFont = nullptr;
 static void* pTextOutlineFont = nullptr;
 
 typedef void* (__fastcall* BstrCtor_t)(void* pBstr, void* edx, const char* sText);
-typedef unsigned long (__fastcall* BstrDataRelease_t)(void* pData, void* edx);
-typedef int (__fastcall* FontCalcTextWidth_t)(void* pFont, void* edx, void** ppBstr, const void* pVariant);
-typedef unsigned int (__fastcall* CanvasDrawTextA_t)(void* pCanvas, void* edx, int nLeft, int nTop, void** ppBstr, void* pFont, const void* pV1, const void* pV2);
+typedef int (__fastcall* FontCalcTextWidth_t)(void* pFont, void* edx, void* pBstrData, const void* pVariant);
+typedef unsigned int (__fastcall* CanvasDrawTextA_t)(void* pCanvas, void* edx, int nLeft, int nTop, void* pBstrData, void* pFont, const void* pV1, const void* pV2);
 typedef void* (__fastcall* LayerGetCanvas_t)(void* pLayer, void* edx, void** ppCanvas, const void* pVariant);
 typedef int (__fastcall* ShapeGetWidth_t)(void* pShape, void* edx);
 
 static auto _bstr_ctor = reinterpret_cast<BstrCtor_t>(dwBstrCtor);
-static auto _bstr_data_release = reinterpret_cast<BstrDataRelease_t>(dwBstrDataRelease);
 static auto _font_calc_text_width = reinterpret_cast<FontCalcTextWidth_t>(dwIWzFont__CalcTextWidth);
 static auto _canvas_draw_text = reinterpret_cast<CanvasDrawTextA_t>(dwIWzCanvas__DrawTextA);
 static auto _layer_get_canvas = reinterpret_cast<LayerGetCanvas_t>(dwIWzGr2DLayer__GetCanvas);
 static auto _shape_get_width = reinterpret_cast<ShapeGetWidth_t>(dwIWzShape2D__GetWidth);
 
-// Builds the client's _bstr_t in place; the drawing API only reads it, the measuring helper
-// consumes (releases) it, so callers must not release a slot that was handed to the measurer.
-static bool MakeBstr(char* pBstrSlot, const char* sText) {
+// The client's text APIs take a Ztl_bstr_t by value: what actually travels on the stack is the
+// wrapper's inner Data_t pointer (see IWzCanvas::DrawTextA / sub_42782E, which both end with
+// `mov ecx,[arg]; call _bstr_t::Data_t::Release`), and the callee destroys that reference. So every
+// call gets its own freshly built instance and nothing may be released on this side.
+static void* MakeBstrData(char* pBstrSlot, const char* sText) {
 	_bstr_ctor(pBstrSlot, nullptr, sText);
-	return *reinterpret_cast<void**>(pBstrSlot) != nullptr;
+	return *reinterpret_cast<void**>(pBstrSlot);
 }
 
-static void ReleaseBstr(char* pBstrSlot) {
-	void* pData = *reinterpret_cast<void**>(pBstrSlot);
-	if (pData != nullptr) {
-		_bstr_data_release(pData, nullptr);
-		*reinterpret_cast<void**>(pBstrSlot) = nullptr;
-	}
+static int MeasureTextWidth(void* pFont, const char* sText) {
+	char aBstr[8] = { 0 };
+	void* pData = MakeBstrData(aBstr, sText);
+	if (pData == nullptr) return 0;
+	return _font_calc_text_width(pFont, nullptr, pData, pEmptyVariant);
+}
+
+static void DrawTextOnePass(void* pCanvas, int nX, int nY, const char* sText, void* pFont) {
+	char aBstr[8] = { 0 };
+	void* pData = MakeBstrData(aBstr, sText);
+	if (pData == nullptr) return;
+	_canvas_draw_text(pCanvas, nullptr, nX, nY, pData, pFont, pEmptyVariant, pEmptyVariant);
 }
 
 static void ReleaseCanvas(void* pCanvas) {
@@ -109,6 +114,16 @@ static void ReleaseCanvas(void* pCanvas) {
 		void** pVtbl = *reinterpret_cast<void***>(pCanvas);
 		reinterpret_cast<unsigned long(__stdcall*)(void*)>(pVtbl[2])(pCanvas); // IUnknown::Release
 	}
+}
+
+// Reads a NUL-terminated ANSI string that came from the client's own tables, refusing obviously
+// unusable pointers instead of letting strncpy_s walk into unmapped memory.
+static bool CopyClientString(char* sOut, size_t nOutSize, const char* sSource) {
+	if (sOut == nullptr || nOutSize == 0) return false;
+	sOut[0] = 0;
+	if (sSource == nullptr || IsBadReadPtr(sSource, 1)) return false;
+	strncpy_s(sOut, nOutSize, sSource, _TRUNCATE);
+	return true;
 }
 
 
@@ -245,13 +260,26 @@ const char* BossHP::GetBossName(unsigned int dwMobID) {
 		static auto _GetMobTemplate = reinterpret_cast<GetMobTemplate_t>(dwCMobTemplate__GetMobTemplate);
 		void* pTemplate = _GetMobTemplate(dwMobID);
 		if (pTemplate != nullptr) {
-			const char* sName = *reinterpret_cast<const char**>(reinterpret_cast<char*>(pTemplate) + 0x30);
-			if (sName != nullptr) strncpy_s(sBossName, sizeof(sBossName), sName, _TRUNCATE);
+			if (!IsBadReadPtr(reinterpret_cast<char*>(pTemplate) + 0x30, sizeof(void*))) {
+				const char* sName = *reinterpret_cast<const char**>(reinterpret_cast<char*>(pTemplate) + 0x30);
+				CopyClientString(sBossName, sizeof(sBossName), sName);
+			}
 		}
 		dwBossNameMobId = dwMobID;
 		bBossNameLoaded = true;
 	}
 	return sBossName;
+}
+
+// Diagnostics only: the game's name string is in the client's own codepage, so print its raw bytes
+// (the log file itself is read back by editors that assume UTF-8).
+static void FormatNameHex(const char* sName, char* sOut, size_t nOutSize) {
+	size_t nOut = 0;
+	for (size_t i = 0; sName[i] != 0 && i < 8 && nOut + 3 < nOutSize; i++) {
+		sprintf_s(sOut + nOut, nOutSize - nOut, "%02X ", static_cast<unsigned char>(sName[i]));
+		nOut += 3;
+	}
+	sOut[nOut] = 0;
 }
 
 void* BossHP::GetFont(int nType) {
@@ -324,42 +352,28 @@ void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int
 
 	int nBarWidth = _shape_get_width(pCanvas, nullptr); // == 800 - minimap width
 	int nLeft = nBossGageIconWidth + 2;                 // never overlap the boss icon on the left
-	char aMeasure[8] = { 0 };
-	if (MakeBstr(aMeasure, sText)) {
-		// Same measuring call the client uses to right align its own numbers (the callee releases
-		// the bstr it was handed).
-		int nWidth = _font_calc_text_width(pFont, nullptr, reinterpret_cast<void**>(aMeasure), pEmptyVariant);
-		if (bShowTextName && nWidth > (nBarWidth - nTextMargin - nLeft)) { // too wide: drop the name
-			sprintf_s(sText, "%s", sHp);
-			char aMeasureHp[8] = { 0 };
-			if (MakeBstr(aMeasureHp, sText)) {
-				nWidth = _font_calc_text_width(pFont, nullptr, reinterpret_cast<void**>(aMeasureHp), pEmptyVariant);
-			}
-		}
+	int nWidth = MeasureTextWidth(pFont, sText);
+	if (bShowTextName && nWidth > (nBarWidth - nTextMargin - nLeft)) { // too wide: drop the name
+		sprintf_s(sText, "%s", sHp);
+		nWidth = MeasureTextWidth(pFont, sText);
+	}
 
-		int nX = nBarWidth - nTextMargin - nWidth;
-		if (nX < nLeft) nX = nLeft;
+	int nX = nBarWidth - nTextMargin - nWidth;
+	if (nX < nLeft) nX = nLeft;
 
-		// DrawTextA only reads the bstr, so one instance covers every pass.
-		char aDraw[8] = { 0 };
-		bool bDrawOk = MakeBstr(aDraw, sText);
-		if (bDrawOk) {
-			if (pOutline != nullptr) {
-				for (int i = 0; i < 8; i++) {
-					_canvas_draw_text(pCanvas, nullptr, nX + aTextOutlineOffset[i][0], nTextY + aTextOutlineOffset[i][1],
-						reinterpret_cast<void**>(aDraw), pOutline, pEmptyVariant, pEmptyVariant);
-				}
-			}
-			_canvas_draw_text(pCanvas, nullptr, nX, nTextY, reinterpret_cast<void**>(aDraw), pFont, pEmptyVariant, pEmptyVariant);
-			ReleaseBstr(aDraw);
-		}
-		if (bLog) {
-			BossTextLog("[%d] draw mobID=%u hp=%d maxHp=%d name='%s' fontType=%d outlineType=%d layer=%p canvas=%p font=%p outline=%p barWidth=%d textWidth=%d x=%d y=%d bstr=%d",
-				nDrawCount, dwMobID, nHP, nMaxHP, sName, nFillType, nTextOutlineFont, pLayer, pCanvas, pFont, pOutline, nBarWidth, nWidth, nX, nTextY, bDrawOk ? 1 : 0);
+	// Each pass hands the client its own bstr instance (the callee releases it).
+	if (pOutline != nullptr) {
+		for (int i = 0; i < 8; i++) {
+			DrawTextOnePass(pCanvas, nX + aTextOutlineOffset[i][0], nTextY + aTextOutlineOffset[i][1], sText, pOutline);
 		}
 	}
-	else if (bLog) {
-		BossTextLog("[%d] skip: _bstr_t ctor failed for '%s'", nDrawCount, sText);
+	DrawTextOnePass(pCanvas, nX, nTextY, sText, pFont);
+
+	if (bLog) {
+		char sNameHex[32];
+		FormatNameHex(sName, sNameHex, sizeof(sNameHex));
+		BossTextLog("[%d] draw mobID=%u hp=%d maxHp=%d nameBytes=%s fontType=%d outlineType=%d layer=%p canvas=%p font=%p outline=%p barWidth=%d textWidth=%d x=%d y=%d",
+			nDrawCount, dwMobID, nHP, nMaxHP, sNameHex, nFillType, nTextOutlineFont, pLayer, pCanvas, pFont, pOutline, nBarWidth, nWidth, nX, nTextY);
 	}
 	ReleaseCanvas(pCanvas);
 }
