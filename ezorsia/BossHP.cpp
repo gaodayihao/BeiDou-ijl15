@@ -361,9 +361,7 @@ void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int
 
 	const char* sName = bShowTextName ? GetBossName(dwMobID) : "";
 	if (sName[0] != 0) {
-		char sLabel[160];
-		sprintf_s(sLabel, "[%s]", sName);
-		DrawBarString(pCanvas, pFont, pOutline, nBossTextX, nBossNameTextY, sLabel, nBarWidth);
+		DrawBarString(pCanvas, pFont, pOutline, nBossTextX, nBossNameTextY, sName, nBarWidth);
 	}
 
 	if (bLog) {
