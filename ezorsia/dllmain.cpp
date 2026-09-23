@@ -99,6 +99,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			Client::talkRepeat = reader.GetBoolean("optional", "talkRepeat", false);
 			Client::talkTime = reader.GetInteger("optional", "talkTime", 2000);
 			fixMobLatch = reader.GetBoolean("optional", "fixMobLatch", true);
+			BossHP::bShowPercent = reader.GetBoolean("optional", "bossHpPercent", true);
+			BossHP::bShowText = reader.GetBoolean("optional", "bossHpText", true);
+			BossHP::bShowTextName = reader.GetBoolean("optional", "bossHpTextShowName", true);
+			BossHP::nTextFontType = reader.GetInteger("optional", "bossHpTextFont", -1);
+			BossHP::nTextMargin = reader.GetInteger("optional", "bossHpTextMargin", 12);
+			BossHP::nTextY = reader.GetInteger("optional", "bossHpTextY", 5);
 		}
 
 		Hook_CreateMutexA(true); //multiclient //ty darter, angel, and alias!
