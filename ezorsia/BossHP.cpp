@@ -29,6 +29,10 @@ const int nCField__MobHpTagLayer = 0x1E4;
 // 35x37 backgrnd on its left holds the 25x25 boss icon, the gage strip inside is ~19px tall.
 const int nBossGageIconWidth = 35;
 
+// get_basic_font slot 0 = 12px white; any unusable setting (negative type, or a slot that the
+// client refuses to build) falls back here instead of dropping the text.
+const int nDefaultTextFontType = 0;
+
 // White glyphs with a black outline: the client's font slots carry the colour, so the outline is
 // the same string drawn in a black slot around the white one (see bossHpTextOutlineFont).
 static const int aTextOutlineOffset[8][2] = {
@@ -295,11 +299,18 @@ void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int
 		return;
 	}
 
-	void* pFont = (pTextFont != nullptr) ? pTextFont : (pTextFont = GetFont(nTextFontType));
+	// A negative bossHpTextFont (kept from an older config where -1 meant "tooltip font") or a slot
+	// the client cannot build falls back to the default white slot instead of hiding the text.
+	int nFillType = (nTextFontType < 0) ? nDefaultTextFontType : nTextFontType;
+	void* pFont = (pTextFont != nullptr) ? pTextFont : (pTextFont = GetFont(nFillType));
+	if (pFont == nullptr && nFillType != nDefaultTextFontType) {
+		nFillType = nDefaultTextFontType;
+		pFont = pTextFont = GetFont(nFillType);
+	}
 	void* pOutline = (nTextOutlineFont < 0) ? nullptr
 		: ((pTextOutlineFont != nullptr) ? pTextOutlineFont : (pTextOutlineFont = GetFont(nTextOutlineFont)));
 	if (pFont == nullptr) {
-		if (bLog) BossTextLog("[%d] skip: font(type=%d) = null", nDrawCount, nTextFontType);
+		if (bLog) BossTextLog("[%d] skip: font(type=%d) = null", nDrawCount, nFillType);
 		ReleaseCanvas(pCanvas);
 		return;
 	}
@@ -343,8 +354,8 @@ void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int
 			ReleaseBstr(aDraw);
 		}
 		if (bLog) {
-			BossTextLog("[%d] draw mobID=%u hp=%d maxHp=%d name='%s' layer=%p canvas=%p font=%p outline=%p barWidth=%d textWidth=%d x=%d y=%d bstr=%d",
-				nDrawCount, dwMobID, nHP, nMaxHP, sName, pLayer, pCanvas, pFont, pOutline, nBarWidth, nWidth, nX, nTextY, bDrawOk ? 1 : 0);
+			BossTextLog("[%d] draw mobID=%u hp=%d maxHp=%d name='%s' fontType=%d outlineType=%d layer=%p canvas=%p font=%p outline=%p barWidth=%d textWidth=%d x=%d y=%d bstr=%d",
+				nDrawCount, dwMobID, nHP, nMaxHP, sName, nFillType, nTextOutlineFont, pLayer, pCanvas, pFont, pOutline, nBarWidth, nWidth, nX, nTextY, bDrawOk ? 1 : 0);
 		}
 	}
 	else if (bLog) {
