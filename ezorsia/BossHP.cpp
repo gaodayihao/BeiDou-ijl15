@@ -28,9 +28,9 @@ const int nCField__MobHpTagLayer = 0x1E4;
 // 35x37 backgrnd on its left holds the 25x25 boss icon, the gage strip inside is ~19px tall
 // (y = 4..24) and the canvas itself is 37px tall.
 const int nBossGageIconWidth = 35;
-const int nBossTextX = nBossGageIconWidth; // right of the icon cap == the gage's left edge
-const int nBossHpTextY = 6;       // hp: inside the gage strip
-const int nBossNameTextY = 24;    // name: the empty band right below the strip, still inside the bar
+const int nBossTextX = nBossGageIconWidth + 6; // a small gap right of the icon cap, at the gage's left edge
+const int nBossHpTextY = 4;       // hp: inside the gage strip (top edge of the ~19px strip)
+const int nBossNameTextY = 21;    // name: hugging the bottom of the gage strip
 
 // get_basic_font slots: 0 = 12px white glyphs, 1 = 12px black (used as the outline).
 const int nBossTextFont = 0;
