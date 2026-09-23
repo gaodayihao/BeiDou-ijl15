@@ -48,8 +48,10 @@ bool BossHP::bShowText = true;
 bool BossHP::bShowTextName = true;
 int BossHP::nTextFontType = 0;       // get_basic_font(0) = 12px white
 int BossHP::nTextOutlineFont = 1;    // get_basic_font(1) = 12px black
+bool BossHP::bTextAlignRight = false; // default: left aligned at the bar's left end (right of the boss icon)
+int BossHP::nTextX = 35;             // == the boss icon cap width, i.e. where the gage itself starts
 int BossHP::nTextMargin = 14;
-int BossHP::nTextY = 7;
+int BossHP::nTextY = 24;             // below the ~19px gage strip, still inside the 37px tall bar
 bool BossHP::bTextDebug = true;      // bossHpTextDebug: append diagnostics to boss_hp_text.log
 
 // Temporary diagnostics for the bar text (config: bossHpTextDebug).
@@ -350,16 +352,29 @@ void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int
 	if (sName[0] != 0) sprintf_s(sText, "[%s] %s", sName, sHp);
 	else sprintf_s(sText, "%s", sHp);
 
-	int nBarWidth = _shape_get_width(pCanvas, nullptr); // == 800 - minimap width
-	int nLeft = nBossGageIconWidth + 2;                 // never overlap the boss icon on the left
+	int nBarWidth = _shape_get_width(pCanvas, nullptr); // == UI width - minimap width
 	int nWidth = MeasureTextWidth(pFont, sText);
-	if (bShowTextName && nWidth > (nBarWidth - nTextMargin - nLeft)) { // too wide: drop the name
-		sprintf_s(sText, "%s", sHp);
-		nWidth = MeasureTextWidth(pFont, sText);
-	}
 
-	int nX = nBarWidth - nTextMargin - nWidth;
-	if (nX < nLeft) nX = nLeft;
+	// Placement: default is the bar's left end (just right of the 35px boss icon cap) on the band
+	// below the ~19px gage strip; bossHpTextAlign=1 keeps the old right aligned form instead.
+	int nX;
+	if (bTextAlignRight) {
+		int nLeft = nBossGageIconWidth + 2;
+		if (bShowTextName && nWidth > (nBarWidth - nTextMargin - nLeft)) { // too wide: drop the name
+			sprintf_s(sText, "%s", sHp);
+			nWidth = MeasureTextWidth(pFont, sText);
+		}
+		nX = nBarWidth - nTextMargin - nWidth;
+		if (nX < nLeft) nX = nLeft;
+	}
+	else {
+		nX = (nTextX < 0) ? 0 : nTextX;
+		if (bShowTextName && nWidth > (nBarWidth - nX - nTextMargin)) { // too wide: drop the name
+			sprintf_s(sText, "%s", sHp);
+			nWidth = MeasureTextWidth(pFont, sText);
+		}
+		if (nX + nWidth > nBarWidth) nX = (nBarWidth > nWidth) ? (nBarWidth - nWidth) : 0;
+	}
 
 	// Each pass hands the client its own bstr instance (the callee releases it).
 	if (pOutline != nullptr) {
