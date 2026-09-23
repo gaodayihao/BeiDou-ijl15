@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "BossHP.h"
+#include <stdarg.h>
 
 const DWORD dw_TSingleton_CUIMiniMap___ms_pInstance = 0x00BED788;
 const DWORD dwCField__ShowMobHpTag = 0x005336CA;
@@ -46,6 +47,22 @@ int BossHP::nTextFontType = 0;       // get_basic_font(0) = 12px white
 int BossHP::nTextOutlineFont = 1;    // get_basic_font(1) = 12px black
 int BossHP::nTextMargin = 14;
 int BossHP::nTextY = 7;
+bool BossHP::bTextDebug = true;      // bossHpTextDebug: append diagnostics to boss_hp_text.log
+
+// Temporary diagnostics for the bar text (config: bossHpTextDebug).
+static void BossTextLog(const char* sFormat, ...) {
+	if (!BossHP::bTextDebug) return;
+	char sLine[512];
+	va_list args;
+	va_start(args, sFormat);
+	_vsnprintf_s(sLine, sizeof(sLine), _TRUNCATE, sFormat, args);
+	va_end(args);
+	FILE* pFile = nullptr;
+	if (fopen_s(&pFile, "boss_hp_text.log", "a") == 0 && pFile != nullptr) {
+		fprintf(pFile, "%s\n", sLine);
+		fclose(pFile);
+	}
+}
 
 static char sBossName[128] = { 0 };
 static unsigned int dwBossNameMobId = 0;
@@ -252,20 +269,37 @@ void BossHP::DisposeBossHpBarText() {
 }
 
 void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int nMaxHP) {
-	if (!bShowText || pCField == nullptr) return;
-	if (dwMobID == 0 || nHP <= 0 || nMaxHP <= 0) return; // the client dropped the gage
+	static int nDrawCount = 0;
+	bool bLog = bTextDebug && (++nDrawCount <= 5 || (nDrawCount % 200) == 0);
+
+	if (!bShowText) {
+		if (bLog) BossTextLog("[%d] skip: bossHpText=false", nDrawCount);
+		return;
+	}
+	if (pCField == nullptr) return;
+	if (dwMobID == 0 || nHP <= 0 || nMaxHP <= 0) {
+		if (bLog) BossTextLog("[%d] skip: mobID=%u hp=%d maxHp=%d", nDrawCount, dwMobID, nHP, nMaxHP);
+		return; // the client dropped the gage
+	}
 
 	void* pLayer = *reinterpret_cast<void**>(reinterpret_cast<char*>(pCField) + nCField__MobHpTagLayer);
-	if (pLayer == nullptr) return;
+	if (pLayer == nullptr) {
+		if (bLog) BossTextLog("[%d] skip: layer(pCField+0x%X) = null, mobID=%u", nDrawCount, nCField__MobHpTagLayer, dwMobID);
+		return;
+	}
 
 	void* pCanvas = nullptr;
 	_layer_get_canvas(pLayer, nullptr, &pCanvas, pEmptyVariant);
-	if (pCanvas == nullptr) return;
+	if (pCanvas == nullptr) {
+		if (bLog) BossTextLog("[%d] skip: GetCanvas(%p) = null, mobID=%u", nDrawCount, pLayer, dwMobID);
+		return;
+	}
 
 	void* pFont = (pTextFont != nullptr) ? pTextFont : (pTextFont = GetFont(nTextFontType));
 	void* pOutline = (nTextOutlineFont < 0) ? nullptr
 		: ((pTextOutlineFont != nullptr) ? pTextOutlineFont : (pTextOutlineFont = GetFont(nTextOutlineFont)));
 	if (pFont == nullptr) {
+		if (bLog) BossTextLog("[%d] skip: font(type=%d) = null", nDrawCount, nTextFontType);
 		ReleaseCanvas(pCanvas);
 		return;
 	}
@@ -297,7 +331,8 @@ void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int
 
 		// DrawTextA only reads the bstr, so one instance covers every pass.
 		char aDraw[8] = { 0 };
-		if (MakeBstr(aDraw, sText)) {
+		bool bDrawOk = MakeBstr(aDraw, sText);
+		if (bDrawOk) {
 			if (pOutline != nullptr) {
 				for (int i = 0; i < 8; i++) {
 					_canvas_draw_text(pCanvas, nullptr, nX + aTextOutlineOffset[i][0], nTextY + aTextOutlineOffset[i][1],
@@ -307,6 +342,13 @@ void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int
 			_canvas_draw_text(pCanvas, nullptr, nX, nTextY, reinterpret_cast<void**>(aDraw), pFont, pEmptyVariant, pEmptyVariant);
 			ReleaseBstr(aDraw);
 		}
+		if (bLog) {
+			BossTextLog("[%d] draw mobID=%u hp=%d maxHp=%d name='%s' layer=%p canvas=%p font=%p outline=%p barWidth=%d textWidth=%d x=%d y=%d bstr=%d",
+				nDrawCount, dwMobID, nHP, nMaxHP, sName, pLayer, pCanvas, pFont, pOutline, nBarWidth, nWidth, nX, nTextY, bDrawOk ? 1 : 0);
+		}
+	}
+	else if (bLog) {
+		BossTextLog("[%d] skip: _bstr_t ctor failed for '%s'", nDrawCount, sText);
 	}
 	ReleaseCanvas(pCanvas);
 }

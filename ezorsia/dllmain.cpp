@@ -106,6 +106,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			BossHP::nTextOutlineFont = reader.GetInteger("optional", "bossHpTextOutlineFont", 1);
 			BossHP::nTextMargin = reader.GetInteger("optional", "bossHpTextMargin", 14);
 			BossHP::nTextY = reader.GetInteger("optional", "bossHpTextY", 7);
+			BossHP::bTextDebug = reader.GetBoolean("optional", "bossHpTextDebug", true);
 		}
 
 		Hook_CreateMutexA(true); //multiclient //ty darter, angel, and alias!

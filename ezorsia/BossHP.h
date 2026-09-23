@@ -13,6 +13,7 @@ public:
 	static int  nTextOutlineFont;  // bossHpTextOutlineFont : client font slot for the outline (1 = 12px black, -1 = none)
 	static int  nTextMargin;       // bossHpTextMargin      : px between the text and the bar's right edge
 	static int  nTextY;            // bossHpTextY           : text top inside the bar (bar is 37px tall)
+	static bool bTextDebug;        // bossHpTextDebug       : append diagnostics to boss_hp_text.log
 private:
 	static char aBossHpUIToolTip[1304];
 	static double dBossHpPercentage;
