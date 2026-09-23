@@ -12,18 +12,29 @@ const DWORD dwCUIToolTip__CreateToolTip = 0x008E49B5; // CUIToolTip::CUIToolTip
 const DWORD dwCUserLocal__Update = 0x0094A144;
 const DWORD dwCMobTemplate__GetMobTemplate = 0x0067CD28; // CMobTemplate::GetMobTemplate(dwTemplateID)
 const DWORD dwGetBasicFont = 0x0098A707; // get_basic_font(FONT_TYPE), __cdecl(out com_ptr<IWzFont>*, int)
+const DWORD dwBstrCtor = 0x00406301; // _bstr_t::_bstr_t(char const*) (same helper AutoTypes.h calls _bstr_ctor)
+const DWORD dwBstrDataRelease = 0x00402EA5; // _bstr_t::Data_t::Release()
+const DWORD dwIWzFont__CalcTextWidth = 0x0042782E; // (font, &bstr, &variant) -> text width in px
+const DWORD dwIWzCanvas__DrawTextA = 0x004277AD; // (x, y, bstr, font, &vAlpha, &vTabOrg)
+const DWORD dwIWzGr2DLayer__GetCanvas = 0x00425D2E; // (layer, &canvas, &variant)
+const DWORD dwIWzShape2D__GetWidth = 0x0040B920; // (canvas/layer) -> width
+const void* pEmptyVariant = reinterpret_cast<const void*>(0x00BF6300); // client's global empty Ztl_variant_t (pvargSrc)
 
-// CUIToolTip layout used by the bar text (verified against CUIToolTip::SetBasicInfo /
-// SetToolTip_String / MakeLayer in the client):
-//   +0x00C = layer width, set by SetToolTip_String to (text width + 8)
-//   +0x440 = the font SetToolTip_String draws with; replace it to change size/colour
-const int nCUIToolTip__LayerWidth = 0x00C;
-const int nCUIToolTip__Font = 0x440;
+// CField stores the MobGage layer created by CField::ShowMobHPTag at +0x1E4; drawing into that
+// layer's own canvas puts the text inside the bar (transparent around it, removed with the bar).
+const int nCField__MobHpTagLayer = 0x1E4;
 
 // UI/UIWindow.img/MobGage geometry (wz): the gage layer spans x = [minimap width, 800], the
 // 35x37 backgrnd on its left holds the 25x25 boss icon, the gage strip inside is ~19px tall.
-const int nBossGageRight = 800;
 const int nBossGageIconWidth = 35;
+
+// White glyphs with a black outline: the client's font slots carry the colour, so the outline is
+// the same string drawn in a black slot around the white one (see bossHpTextOutlineFont).
+static const int aTextOutlineOffset[8][2] = {
+	{ -1, -1 }, { 0, -1 }, { 1, -1 },
+	{ -1,  0 },            { 1,  0 },
+	{ -1,  1 }, { 0,  1 }, { 1,  1 },
+};
 
 char BossHP::aBossHpUIToolTip[1304];
 double BossHP::dBossHpPercentage = 0;
@@ -31,22 +42,54 @@ double BossHP::dBossHpPercentage = 0;
 bool BossHP::bShowPercent = true;
 bool BossHP::bShowText = true;
 bool BossHP::bShowTextName = true;
-int BossHP::nTextFontType = -1;
-int BossHP::nTextMargin = 12;
-int BossHP::nTextY = 5;
-
-char BossHP::aBossHpTextUIToolTip[1304];
-unsigned int BossHP::dwBossMobId = 0;
-int BossHP::nBossHp = 0;
-int BossHP::nBossMaxHp = 0;
+int BossHP::nTextFontType = 0;       // get_basic_font(0) = 12px white
+int BossHP::nTextOutlineFont = 1;    // get_basic_font(1) = 12px black
+int BossHP::nTextMargin = 14;
+int BossHP::nTextY = 7;
 
 static char sBossName[128] = { 0 };
 static unsigned int dwBossNameMobId = 0;
 static bool bBossNameLoaded = false;
-static char sBossHpTextLast[192] = { 0 };
-static int nBossHpTextLastX = 0;
-static bool bBossHpTextShown = false;
 static bool bBossHpPercentShown = false;
+static void* pTextFont = nullptr;
+static void* pTextOutlineFont = nullptr;
+
+typedef void* (__fastcall* BstrCtor_t)(void* pBstr, void* edx, const char* sText);
+typedef unsigned long (__fastcall* BstrDataRelease_t)(void* pData, void* edx);
+typedef int (__fastcall* FontCalcTextWidth_t)(void* pFont, void* edx, void** ppBstr, const void* pVariant);
+typedef unsigned int (__fastcall* CanvasDrawTextA_t)(void* pCanvas, void* edx, int nLeft, int nTop, void** ppBstr, void* pFont, const void* pV1, const void* pV2);
+typedef void* (__fastcall* LayerGetCanvas_t)(void* pLayer, void* edx, void** ppCanvas, const void* pVariant);
+typedef int (__fastcall* ShapeGetWidth_t)(void* pShape, void* edx);
+
+static auto _bstr_ctor = reinterpret_cast<BstrCtor_t>(dwBstrCtor);
+static auto _bstr_data_release = reinterpret_cast<BstrDataRelease_t>(dwBstrDataRelease);
+static auto _font_calc_text_width = reinterpret_cast<FontCalcTextWidth_t>(dwIWzFont__CalcTextWidth);
+static auto _canvas_draw_text = reinterpret_cast<CanvasDrawTextA_t>(dwIWzCanvas__DrawTextA);
+static auto _layer_get_canvas = reinterpret_cast<LayerGetCanvas_t>(dwIWzGr2DLayer__GetCanvas);
+static auto _shape_get_width = reinterpret_cast<ShapeGetWidth_t>(dwIWzShape2D__GetWidth);
+
+// Builds the client's _bstr_t in place; the drawing API only reads it, the measuring helper
+// consumes (releases) it, so callers must not release a slot that was handed to the measurer.
+static bool MakeBstr(char* pBstrSlot, const char* sText) {
+	_bstr_ctor(pBstrSlot, nullptr, sText);
+	return *reinterpret_cast<void**>(pBstrSlot) != nullptr;
+}
+
+static void ReleaseBstr(char* pBstrSlot) {
+	void* pData = *reinterpret_cast<void**>(pBstrSlot);
+	if (pData != nullptr) {
+		_bstr_data_release(pData, nullptr);
+		*reinterpret_cast<void**>(pBstrSlot) = nullptr;
+	}
+}
+
+static void ReleaseCanvas(void* pCanvas) {
+	if (pCanvas != nullptr) {
+		void** pVtbl = *reinterpret_cast<void***>(pCanvas);
+		reinterpret_cast<unsigned long(__stdcall*)(void*)>(pVtbl[2])(pCanvas); // IUnknown::Release
+	}
+}
+
 
 void BossHP::Hook() { // main method
 	HookInternal();
@@ -67,7 +110,6 @@ void BossHP::HookUpdate() {
 	{
 		_UserLocal__Update(pThis, edx);
 		DrawBossHpNumberIfNeed();
-		DrawBossHpBarTextIfNeed();
 	};
 
 	Memory::SetHook(true, reinterpret_cast<void**>(&_UserLocal__Update), Hook);
@@ -81,7 +123,7 @@ void BossHP::HookShowMobHPTag() {
 	{
 		_Field__ShowMobHPTag(pThis, edx, dwMobID, nColor, nBgColor, nHP, nMaxHP);
 		DrawBossHpNumber(nHP, nMaxHP);
-		DrawBossHpBarText(dwMobID, nHP, nMaxHP);
+		DrawBossHpBarText(pThis, dwMobID, nHP, nMaxHP); // the gage layer/canvas was just (re)created
 	};
 	Memory::SetHook(true, reinterpret_cast<void**>(&_Field__ShowMobHPTag), Hook);
 }
@@ -98,9 +140,6 @@ void BossHP::HookInitField() {
 		BossHP::DisposeToolTip((int)&aBossHpUIToolTip);
 		BossHP::CreateToolTip((int)&aBossHpUIToolTip);
 		BossHP::DisposeBossHpBarText();
-		BossHP::DisposeToolTip((int)&aBossHpTextUIToolTip);
-		BossHP::CreateToolTip((int)&aBossHpTextUIToolTip);
-		BossHP::ApplyTextFont((int)&aBossHpTextUIToolTip);
 		_Field__Init(pThis, edx);
 	};
 	Memory::SetHook(true, reinterpret_cast<void**>(&_Field__Init), Hook);
@@ -148,17 +187,15 @@ void BossHP::DisposeBossHpNumber() {
 	BossHP::ClearToolTip((int)&aBossHpUIToolTip);
 }
 
-// ----- "[Boss name] hp" label inside the boss gage (UI/UIWindow.img/MobGage) -----
+// ----- "[Boss name] hp" inside the boss gage (UI/UIWindow.img/MobGage) -----
 //
-// The label reuses the client's CUIToolTip like the percentage above does: it renders the text into
-// an own layer (with the client's own font/encoding handling, so Chinese names stay correct) which is
-// what makes a font change possible - SetToolTip_String always draws with the font stored at
-// CUIToolTip+0x440, so ApplyTextFont swaps exactly that slot. Right alignment needs the text width,
-// which SetToolTip_String publishes as (layer width - 8) at CUIToolTip+0x0C.
-
-static int ReadToolTipLayerWidth(int nInstance) {
-	return *reinterpret_cast<int*>(nInstance + nCUIToolTip__LayerWidth);
-}
+// The text goes straight into the canvas of the gage layer the client creates in
+// CField::ShowMobHPTag (CField+0x1E4): that canvas is transparent except for the bar itself, is
+// recreated on every bar update (so nothing can ghost) and dies with the bar. A CUIToolTip cannot be
+// used here - it paints a translucent black box and imposes its own layout.
+//
+// Font slots come from get_basic_font; the slot carries the colour, so "white with a black outline"
+// is the white slot drawn on top of the black slot at the 8 neighbouring pixels.
 
 void BossHP::FormatThousands(int nValue, char* sOut, size_t nOutSize) {
 	// the client's ZXString::Format has no thousands separator, so group the digits here
@@ -196,82 +233,82 @@ const char* BossHP::GetBossName(unsigned int dwMobID) {
 	return sBossName;
 }
 
-void BossHP::ApplyTextFont(int instance) {
-	if (instance == 0 || nTextFontType < 0) return; // -1 keeps the tooltip's own font
+void* BossHP::GetFont(int nType) {
+	if (nType < 0) return nullptr;
 
-	void* pFont = nullptr;
 	typedef void* (__cdecl* GetBasicFont_t)(void** pOut, int nType);
 	static auto _get_basic_font = reinterpret_cast<GetBasicFont_t>(dwGetBasicFont);
-	_get_basic_font(&pFont, nTextFontType);
-	if (pFont != nullptr) {
-		// Hand the reference returned by get_basic_font over to the tooltip slot: SetToolTip_String
-		// AddRef/Releases that slot around every draw, so the slot owns it from here on.
-		*reinterpret_cast<void**>(instance + nCUIToolTip__Font) = pFont;
-	}
-}
-
-void BossHP::DrawBossHpBarText(unsigned int dwMobID, int nHP, int nMaxHP) {
-	dwBossMobId = dwMobID;
-	nBossHp = nHP;
-	nBossMaxHp = nMaxHP;
-	if (nHP <= 0 || nMaxHP <= 0) DisposeBossHpBarText(); // the client drops the gage with it
+	void* pFont = nullptr;
+	_get_basic_font(&pFont, nType);
+	return pFont; // the slot is cached by the client and keeps its own reference
 }
 
 void BossHP::DisposeBossHpBarText() {
-	if (bBossHpTextShown) { // only touch a tooltip that has actually been drawn into
-		bBossHpTextShown = false;
-		BossHP::ClearToolTip((int)&aBossHpTextUIToolTip);
-	}
-	dwBossMobId = 0;
-	nBossHp = 0;
-	nBossMaxHp = 0;
+	// Nothing to clear: the text lives in the client's gage canvas, which is dropped with the bar.
+	// Only the per-mob cache has to go.
 	dwBossNameMobId = 0;
 	bBossNameLoaded = false;
 	sBossName[0] = 0;
-	sBossHpTextLast[0] = 0;
-	nBossHpTextLastX = 0;
 }
 
-void BossHP::DrawBossHpBarTextIfNeed() {
-	if (!bShowText) {
-		DisposeBossHpBarText();
+void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int nMaxHP) {
+	if (!bShowText || pCField == nullptr) return;
+	if (dwMobID == 0 || nHP <= 0 || nMaxHP <= 0) return; // the client dropped the gage
+
+	void* pLayer = *reinterpret_cast<void**>(reinterpret_cast<char*>(pCField) + nCField__MobHpTagLayer);
+	if (pLayer == nullptr) return;
+
+	void* pCanvas = nullptr;
+	_layer_get_canvas(pLayer, nullptr, &pCanvas, pEmptyVariant);
+	if (pCanvas == nullptr) return;
+
+	void* pFont = (pTextFont != nullptr) ? pTextFont : (pTextFont = GetFont(nTextFontType));
+	void* pOutline = (nTextOutlineFont < 0) ? nullptr
+		: ((pTextOutlineFont != nullptr) ? pTextOutlineFont : (pTextOutlineFont = GetFont(nTextOutlineFont)));
+	if (pFont == nullptr) {
+		ReleaseCanvas(pCanvas);
 		return;
 	}
-	if (dwBossMobId == 0 || nBossHp <= 0) return;
 
-	char sText[192];
-	const char* sName = bShowTextName ? GetBossName(dwBossMobId) : "";
 	char sHp[32];
-	FormatThousands(nBossHp, sHp, sizeof(sHp));
+	FormatThousands(nHP, sHp, sizeof(sHp));
+	char sText[192];
+	const char* sName = bShowTextName ? GetBossName(dwMobID) : "";
 	if (sName[0] != 0) sprintf_s(sText, "[%s] %s", sName, sHp);
 	else sprintf_s(sText, "%s", sHp);
 
-	int nInstance = (int)&aBossHpTextUIToolTip;
-	int nLeft = GetMiniMapWidth() + nBossGageIconWidth + 4;           // do not overlap the boss icon
-	int nAvail = nBossGageRight - nTextMargin - nLeft;
-
-	if (strcmp(sText, sBossHpTextLast) != 0) {
-		// Width is unknown until the client has laid the string out once, so measure with a throwaway
-		// call (the tooltip layer is replaced, not stacked) and place it right after. Measuring at the
-		// previous x keeps that intermediate layer next to its final spot.
-		int nMeasureX = (nBossHpTextLastX > nLeft) ? nBossHpTextLastX : nLeft;
-		BossHP::SetToolTip_String(nInstance, nMeasureX, nTextY, sText);
-		int nWidth = ReadToolTipLayerWidth(nInstance) - 8;
-		if (bShowTextName && nWidth > nAvail) { // too wide: keep the number, drop the name
-			BossHP::SetToolTip_String(nInstance, nLeft, nTextY, sHp);
-			nWidth = ReadToolTipLayerWidth(nInstance) - 8;
-			strcpy_s(sText, sHp);
+	int nBarWidth = _shape_get_width(pCanvas, nullptr); // == 800 - minimap width
+	int nLeft = nBossGageIconWidth + 2;                 // never overlap the boss icon on the left
+	char aMeasure[8] = { 0 };
+	if (MakeBstr(aMeasure, sText)) {
+		// Same measuring call the client uses to right align its own numbers (the callee releases
+		// the bstr it was handed).
+		int nWidth = _font_calc_text_width(pFont, nullptr, reinterpret_cast<void**>(aMeasure), pEmptyVariant);
+		if (bShowTextName && nWidth > (nBarWidth - nTextMargin - nLeft)) { // too wide: drop the name
+			sprintf_s(sText, "%s", sHp);
+			char aMeasureHp[8] = { 0 };
+			if (MakeBstr(aMeasureHp, sText)) {
+				nWidth = _font_calc_text_width(pFont, nullptr, reinterpret_cast<void**>(aMeasureHp), pEmptyVariant);
+			}
 		}
-		int nX = nBossGageRight - nTextMargin - 4 - nWidth; // CUIToolTip draws the string at (4, 1)
+
+		int nX = nBarWidth - nTextMargin - nWidth;
 		if (nX < nLeft) nX = nLeft;
-		BossHP::SetToolTip_String(nInstance, nX, nTextY, sText);
-		nBossHpTextLastX = nX;
-		strcpy_s(sBossHpTextLast, sText);
+
+		// DrawTextA only reads the bstr, so one instance covers every pass.
+		char aDraw[8] = { 0 };
+		if (MakeBstr(aDraw, sText)) {
+			if (pOutline != nullptr) {
+				for (int i = 0; i < 8; i++) {
+					_canvas_draw_text(pCanvas, nullptr, nX + aTextOutlineOffset[i][0], nTextY + aTextOutlineOffset[i][1],
+						reinterpret_cast<void**>(aDraw), pOutline, pEmptyVariant, pEmptyVariant);
+				}
+			}
+			_canvas_draw_text(pCanvas, nullptr, nX, nTextY, reinterpret_cast<void**>(aDraw), pFont, pEmptyVariant, pEmptyVariant);
+			ReleaseBstr(aDraw);
+		}
 	}
-	else {
-		BossHP::SetToolTip_String(nInstance, nBossHpTextLastX, nTextY, sBossHpTextLast);
-	}
-	bBossHpTextShown = true;
+	ReleaseCanvas(pCanvas);
 }
 
 // it's ToolTip region

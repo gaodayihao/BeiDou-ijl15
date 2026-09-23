@@ -1,4 +1,4 @@
-﻿// dllmain.cpp : Defines the entry point for the DLL application.
+// dllmain.cpp : Defines the entry point for the DLL application.
 #include "stdafx.h"
 #include "NMCO.h"
 #include "ijl15.h"
@@ -102,9 +102,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			BossHP::bShowPercent = reader.GetBoolean("optional", "bossHpPercent", true);
 			BossHP::bShowText = reader.GetBoolean("optional", "bossHpText", true);
 			BossHP::bShowTextName = reader.GetBoolean("optional", "bossHpTextShowName", true);
-			BossHP::nTextFontType = reader.GetInteger("optional", "bossHpTextFont", -1);
-			BossHP::nTextMargin = reader.GetInteger("optional", "bossHpTextMargin", 12);
-			BossHP::nTextY = reader.GetInteger("optional", "bossHpTextY", 5);
+			BossHP::nTextFontType = reader.GetInteger("optional", "bossHpTextFont", 0);
+			BossHP::nTextOutlineFont = reader.GetInteger("optional", "bossHpTextOutlineFont", 1);
+			BossHP::nTextMargin = reader.GetInteger("optional", "bossHpTextMargin", 14);
+			BossHP::nTextY = reader.GetInteger("optional", "bossHpTextY", 7);
 		}
 
 		Hook_CreateMutexA(true); //multiclient //ty darter, angel, and alias!
