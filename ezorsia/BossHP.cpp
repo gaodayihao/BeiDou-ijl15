@@ -24,16 +24,20 @@ const void* pEmptyVariant = reinterpret_cast<const void*>(0x00BF6300); // client
 // layer's own canvas puts the text inside the bar (transparent around it, removed with the bar).
 const int nCField__MobHpTagLayer = 0x1E4;
 
-// UI/UIWindow.img/MobGage geometry (wz): the gage layer spans x = [minimap width, 800], the
-// 35x37 backgrnd on its left holds the 25x25 boss icon, the gage strip inside is ~19px tall.
+// UI/UIWindow.img/MobGage geometry (wz): the gage layer spans x = [minimap width, UI width], the
+// 35x37 backgrnd on its left holds the 25x25 boss icon, the gage strip inside is ~19px tall
+// (y = 4..24) and the canvas itself is 37px tall.
 const int nBossGageIconWidth = 35;
+const int nBossTextX = nBossGageIconWidth; // right of the icon cap == the gage's left edge
+const int nBossHpTextY = 6;       // hp: inside the gage strip
+const int nBossNameTextY = 24;    // name: the empty band right below the strip, still inside the bar
 
-// get_basic_font slot 0 = 12px white; any unusable setting (negative type, or a slot that the
-// client refuses to build) falls back here instead of dropping the text.
-const int nDefaultTextFontType = 0;
+// get_basic_font slots: 0 = 12px white glyphs, 1 = 12px black (used as the outline).
+const int nBossTextFont = 0;
+const int nBossTextOutlineFont = 1;
 
-// White glyphs with a black outline: the client's font slots carry the colour, so the outline is
-// the same string drawn in a black slot around the white one (see bossHpTextOutlineFont).
+// White glyphs with a black outline: the font slot carries the colour, so the outline is the same
+// string drawn in the black slot at the 8 neighbouring pixels.
 static const int aTextOutlineOffset[8][2] = {
 	{ -1, -1 }, { 0, -1 }, { 1, -1 },
 	{ -1,  0 },            { 1,  0 },
@@ -46,15 +50,9 @@ double BossHP::dBossHpPercentage = 0;
 bool BossHP::bShowPercent = true;
 bool BossHP::bShowText = true;
 bool BossHP::bShowTextName = true;
-int BossHP::nTextFontType = 0;       // get_basic_font(0) = 12px white
-int BossHP::nTextOutlineFont = 1;    // get_basic_font(1) = 12px black
-bool BossHP::bTextAlignRight = false; // default: left aligned at the bar's left end (right of the boss icon)
-int BossHP::nTextX = 35;             // == the boss icon cap width, i.e. where the gage itself starts
-int BossHP::nTextMargin = 14;
-int BossHP::nTextY = 24;             // below the ~19px gage strip, still inside the 37px tall bar
-bool BossHP::bTextDebug = true;      // bossHpTextDebug: append diagnostics to boss_hp_text.log
+bool BossHP::bTextDebug = false; // mirrors [debug] debug=, i.e. no extra config key
 
-// Temporary diagnostics for the bar text (config: bossHpTextDebug).
+// Append diagnostics to boss_hp_text.log (only while the debug switch is on).
 static void BossTextLog(const char* sFormat, ...) {
 	if (!BossHP::bTextDebug) return;
 	char sLine[512];
@@ -302,6 +300,23 @@ void BossHP::DisposeBossHpBarText() {
 	sBossName[0] = 0;
 }
 
+// Draws one string left aligned at nX, keeping it inside the bar's canvas (the HP sits in the gage
+// strip, the name on the band below it, and both share nBossTextX so they line up).
+static void DrawBarString(void* pCanvas, void* pFont, void* pOutline, int nX, int nY, const char* sText, int nBarWidth) {
+	int nWidth = MeasureTextWidth(pFont, sText);
+	if (nX + nWidth > nBarWidth) nX = (nBarWidth > nWidth) ? (nBarWidth - nWidth) : 0;
+	if (nX < 0) nX = 0;
+
+	// White glyphs with a black outline: the outline is the same string in the black font slot.
+	// Each pass hands the client its own bstr instance (the callee releases it).
+	if (pOutline != nullptr) {
+		for (int i = 0; i < 8; i++) {
+			DrawTextOnePass(pCanvas, nX + aTextOutlineOffset[i][0], nY + aTextOutlineOffset[i][1], sText, pOutline);
+		}
+	}
+	DrawTextOnePass(pCanvas, nX, nY, sText, pFont);
+}
+
 void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int nMaxHP) {
 	static int nDrawCount = 0;
 	bool bLog = bTextDebug && (++nDrawCount <= 5 || (nDrawCount % 200) == 0);
@@ -329,66 +344,33 @@ void BossHP::DrawBossHpBarText(void* pCField, unsigned int dwMobID, int nHP, int
 		return;
 	}
 
-	// A negative bossHpTextFont (kept from an older config where -1 meant "tooltip font") or a slot
-	// the client cannot build falls back to the default white slot instead of hiding the text.
-	int nFillType = (nTextFontType < 0) ? nDefaultTextFontType : nTextFontType;
-	void* pFont = (pTextFont != nullptr) ? pTextFont : (pTextFont = GetFont(nFillType));
-	if (pFont == nullptr && nFillType != nDefaultTextFontType) {
-		nFillType = nDefaultTextFontType;
-		pFont = pTextFont = GetFont(nFillType);
-	}
-	void* pOutline = (nTextOutlineFont < 0) ? nullptr
-		: ((pTextOutlineFont != nullptr) ? pTextOutlineFont : (pTextOutlineFont = GetFont(nTextOutlineFont)));
+	void* pFont = (pTextFont != nullptr) ? pTextFont : (pTextFont = GetFont(nBossTextFont));
+	void* pOutline = (pTextOutlineFont != nullptr) ? pTextOutlineFont : (pTextOutlineFont = GetFont(nBossTextOutlineFont));
 	if (pFont == nullptr) {
-		if (bLog) BossTextLog("[%d] skip: font(type=%d) = null", nDrawCount, nFillType);
+		if (bLog) BossTextLog("[%d] skip: font(type=%d) = null", nDrawCount, nBossTextFont);
 		ReleaseCanvas(pCanvas);
 		return;
 	}
 
+	int nBarWidth = _shape_get_width(pCanvas, nullptr); // == UI width - minimap width
+
+	// HP inside the gage strip, name on the band below it; both left aligned at the gage's left edge.
 	char sHp[32];
 	FormatThousands(nHP, sHp, sizeof(sHp));
-	char sText[192];
+	DrawBarString(pCanvas, pFont, pOutline, nBossTextX, nBossHpTextY, sHp, nBarWidth);
+
 	const char* sName = bShowTextName ? GetBossName(dwMobID) : "";
-	if (sName[0] != 0) sprintf_s(sText, "[%s] %s", sName, sHp);
-	else sprintf_s(sText, "%s", sHp);
-
-	int nBarWidth = _shape_get_width(pCanvas, nullptr); // == UI width - minimap width
-	int nWidth = MeasureTextWidth(pFont, sText);
-
-	// Placement: default is the bar's left end (just right of the 35px boss icon cap) on the band
-	// below the ~19px gage strip; bossHpTextAlign=1 keeps the old right aligned form instead.
-	int nX;
-	if (bTextAlignRight) {
-		int nLeft = nBossGageIconWidth + 2;
-		if (bShowTextName && nWidth > (nBarWidth - nTextMargin - nLeft)) { // too wide: drop the name
-			sprintf_s(sText, "%s", sHp);
-			nWidth = MeasureTextWidth(pFont, sText);
-		}
-		nX = nBarWidth - nTextMargin - nWidth;
-		if (nX < nLeft) nX = nLeft;
+	if (sName[0] != 0) {
+		char sLabel[160];
+		sprintf_s(sLabel, "[%s]", sName);
+		DrawBarString(pCanvas, pFont, pOutline, nBossTextX, nBossNameTextY, sLabel, nBarWidth);
 	}
-	else {
-		nX = (nTextX < 0) ? 0 : nTextX;
-		if (bShowTextName && nWidth > (nBarWidth - nX - nTextMargin)) { // too wide: drop the name
-			sprintf_s(sText, "%s", sHp);
-			nWidth = MeasureTextWidth(pFont, sText);
-		}
-		if (nX + nWidth > nBarWidth) nX = (nBarWidth > nWidth) ? (nBarWidth - nWidth) : 0;
-	}
-
-	// Each pass hands the client its own bstr instance (the callee releases it).
-	if (pOutline != nullptr) {
-		for (int i = 0; i < 8; i++) {
-			DrawTextOnePass(pCanvas, nX + aTextOutlineOffset[i][0], nTextY + aTextOutlineOffset[i][1], sText, pOutline);
-		}
-	}
-	DrawTextOnePass(pCanvas, nX, nTextY, sText, pFont);
 
 	if (bLog) {
 		char sNameHex[32];
 		FormatNameHex(sName, sNameHex, sizeof(sNameHex));
-		BossTextLog("[%d] draw mobID=%u hp=%d maxHp=%d nameBytes=%s fontType=%d outlineType=%d layer=%p canvas=%p font=%p outline=%p barWidth=%d textWidth=%d x=%d y=%d",
-			nDrawCount, dwMobID, nHP, nMaxHP, sNameHex, nFillType, nTextOutlineFont, pLayer, pCanvas, pFont, pOutline, nBarWidth, nWidth, nX, nTextY);
+		BossTextLog("[%d] draw mobID=%u hp=%d maxHp=%d nameBytes=%s layer=%p canvas=%p font=%p outline=%p barWidth=%d hpWidth=%d",
+			nDrawCount, dwMobID, nHP, nMaxHP, sNameHex, pLayer, pCanvas, pFont, pOutline, nBarWidth, MeasureTextWidth(pFont, sHp));
 	}
 	ReleaseCanvas(pCanvas);
 }

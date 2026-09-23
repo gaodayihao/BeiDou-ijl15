@@ -102,13 +102,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			BossHP::bShowPercent = reader.GetBoolean("optional", "bossHpPercent", true);
 			BossHP::bShowText = reader.GetBoolean("optional", "bossHpText", true);
 			BossHP::bShowTextName = reader.GetBoolean("optional", "bossHpTextShowName", true);
-			BossHP::nTextFontType = reader.GetInteger("optional", "bossHpTextFont", 0);
-			BossHP::nTextOutlineFont = reader.GetInteger("optional", "bossHpTextOutlineFont", 1);
-			BossHP::bTextAlignRight = reader.GetInteger("optional", "bossHpTextAlign", 0) != 0;
-			BossHP::nTextX = reader.GetInteger("optional", "bossHpTextX", 35);
-			BossHP::nTextMargin = reader.GetInteger("optional", "bossHpTextMargin", 14);
-			BossHP::nTextY = reader.GetInteger("optional", "bossHpTextY", 24);
-			BossHP::bTextDebug = reader.GetBoolean("optional", "bossHpTextDebug", true);
+			BossHP::bTextDebug = Client::debug; // diagnostics follow the existing [debug] debug= switch
 		}
 
 		Hook_CreateMutexA(true); //multiclient //ty darter, angel, and alias!
