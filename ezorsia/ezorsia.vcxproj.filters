@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="Source Files">
@@ -141,6 +141,9 @@
     <ClInclude Include="BossHP.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="QuestBulb.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="HpMpAlert.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -177,6 +180,9 @@
       <Filter>Source Files\innerH</Filter>
     </ClCompile>
     <ClCompile Include="BossHP.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="QuestBulb.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="HpMpAlert.cpp">

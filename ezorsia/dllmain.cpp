@@ -9,6 +9,7 @@
 #include "HpMpAlert.h"
 #include "SelectCharMacFix.h"
 #include "LatchFix.h"
+#include "QuestBulb.h"
 #pragma comment(lib, "ws2_32.lib")
 
 // config.ini can use IP or hostname (ServerIP_Address=...).
@@ -103,6 +104,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			BossHP::bShowText = reader.GetBoolean("optional", "bossHpText", true);
 			BossHP::bShowTextName = reader.GetBoolean("optional", "bossHpTextShowName", true);
 			BossHP::bTextDebug = Client::debug; // diagnostics follow the existing [debug] debug= switch
+			QuestBulb::bFixed = reader.GetBoolean("optional", "questBulbFixed", true);
+			QuestBulb::nFixedX = reader.GetInteger("optional", "questBulbX", 10);
+			QuestBulb::nFixedY = reader.GetInteger("optional", "questBulbY", -1);
+			QuestBulb::bDebug = Client::debug; // same switch as above
 		}
 
 		Hook_CreateMutexA(true); //multiclient //ty darter, angel, and alias!
@@ -142,6 +147,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		Client::NoPassword();
 		Client::MoreHook();
 		BossHP::Hook();
+		QuestBulb::Hook(); // pin the auto-quest light bulb to the left edge of the screen
 		Client::WorldMap();
 		Client::RefreshRate(); 
 		Client::DeleteChar();
