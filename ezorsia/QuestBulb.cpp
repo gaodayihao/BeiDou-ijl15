@@ -33,8 +33,16 @@
 //
 //     sub_410FDF(&v, *(CWndMan::ms_pInstance + 0xDC), 1);   // VARIANT{VT_UNKNOWN, org window}
 //     IWzVector2D::put_origin (+100)  <- that VARIANT            // child of the SCREEN origin
-//     IWzVector2D::raw_RelMove (+144) <- nLeft, nTop             // position *inside* that frame
+//     IWzVector2D::raw_RelMove (+144) <- nLeft, nTop, empty, empty  // position *inside* that frame
 //     IWzGr2DLayer::PutZ (+180) / Putcolor (+224)
+//
+// Slot signatures are read off the mangled names in this exe, not guessed - a wrong argument
+// count on a vtable call corrupts the stack silently:
+//   ?raw_Move@CVecCtrl@@UAGJJJ@Z                    long raw_Move(long x, long y)
+//   ?raw_RelMove@CVecCtrl@@UAGJJJUtagVARIANT@@0@Z   long raw_RelMove(long x, long y, VARIANT, VARIANT)
+//   ?put_origin@CVecCtrl@@UAGJUtagVARIANT@@@Z       long put_origin(VARIANT)
+//   ?get_origin@CVecCtrl@@UAGJPAUtagVARIANT@@@Z     long get_origin(VARIANT* pOut)
+//   ?get_x@CVecCtrl@@UAGJPAJ@Z                      long get_x(long* pOut)
 //
 // `CWndMan+0xDC` is what CWndMan::GetOrgWindow (0x0048BBA5) returns - it ignores its UIOrigin
 // argument and always answers with that field, and CUIStatusBar::OnCreate (0x008D01B2) hangs the
@@ -79,13 +87,19 @@ const DWORD dwCWndMan__ms_pInstance = 0x00BEC20C;
 // CWndMan::GetOrgWindow 0x0048BBA5 answers with this field, whatever UIOrigin it is asked for.
 const int nCWndMan__OrgWindow = 0xDC;
 
+// Where the client's own placement puts the bulb: just above the character's head, and the follow
+// camera keeps the character on one screen spot, so that spot is the reference the target is
+// measured against. Only the difference matters, so a constant error here is a constant error in
+// the landing position - tuneable with questBulbX/questBulbY.
+const int nCharScreenOffsetY = 60;
+
 // CUserLocal+0x3180 is the bulb's IWzGr2DLayer (com_ptr, null while no bulb is shown);
 // the sibling flag CUserLocal+0x317C is not "a layer exists" - the client also loads the idle
 // animation with that flag cleared - so only the pointer is used here.
 const int nCUserLocal__QuestAlertLayer = 0x3180;
 
 typedef long(__stdcall* IWzVector2D__get_long_t)(void* pThis, long* pnOut);
-typedef long(__stdcall* IWzVector2D__raw_RelMove_t)(void* pThis, long nX, long nY);
+typedef long(__stdcall* IWzVector2D__raw_RelMove_t)(void* pThis, long nX, long nY, VARIANTARG vAttr1, VARIANTARG vAttr2);
 typedef long(__stdcall* IWzVector2D__get_origin_t)(void* pThis, VARIANTARG* pvOrigin);
 typedef long(__stdcall* IWzVector2D__put_origin_t)(void* pThis, VARIANTARG vOrigin);
 typedef void*(__fastcall* IWzGr2DLayer__GetLT_t)(void* pThis, void* edx, void** ppOut);
@@ -102,6 +116,8 @@ static bool bScreenParented = false; // false for a layer we must not touch
 static unsigned int nPinCount = 0;
 static long nWantedX = 0;        // screen position the bulb is pinned to (per layer instance)
 static long nWantedY = 0;
+static long nAnchorScreenX = 0;  // where the client's own placement put the bulb on screen
+static long nAnchorScreenY = 0;
 static int nPinnedHeight = 0;    // the layer height the vertical centring was derived from
 
 void QuestBulb::Log(const char* sFormat, ...) {
@@ -174,9 +190,21 @@ static void PutOrigin(void* pVector, void* pOrigin) {
 }
 
 // Moves a layer inside its current origin frame - the client's own positioning call.
+//
+// The two trailing VARIANTs are not optional padding: the real signature is
+// `long __stdcall raw_RelMove(long x, long y, VARIANT, VARIANT)` (mangled
+// `?raw_RelMove@CVecCtrl@@UAGJJJUtagVARIANT@@0@Z`), and CWnd::CreateWnd fills both with an empty
+// variant. Calling it with x/y alone leaves 32 bytes of garbage on the stack and the callee reads
+// the empty slot as a pointer - that is what crashed the client in the seventh test round
+// (fault: write to NULL at IWzGr2DLayer::GetLT+0x2E, from a stack that had already been unwound
+// by the wrong pop count).
 static void SetLayerPosition(void* pVector, long nX, long nY) {
 	void** pVtbl = *reinterpret_cast<void***>(pVector);
-	reinterpret_cast<IWzVector2D__raw_RelMove_t>(pVtbl[nVtbl_IWzVector2D__raw_RelMove / sizeof(void*)])(pVector, nX, nY);
+	VARIANTARG vAttr1;
+	VARIANTARG vAttr2;
+	memset(&vAttr1, 0, sizeof(vAttr1)); // VT_EMPTY: no move-path attributes, i.e. an instant move
+	memset(&vAttr2, 0, sizeof(vAttr2));
+	reinterpret_cast<IWzVector2D__raw_RelMove_t>(pVtbl[nVtbl_IWzVector2D__raw_RelMove / sizeof(void*)])(pVector, nX, nY, vAttr1, vAttr2);
 }
 
 // The screen origin every UI window is built under (CWnd::CreateWnd).
@@ -279,14 +307,25 @@ void QuestBulb::PinLayer(void* pLayer) {
 		bScreenParented = false;
 		nPinnedHeight = 0;
 
-		// One-time reparenting: from here on the layer's own coordinates are screen pixels, so
+		// One-time reparenting: from here on the layer's coordinates live in the screen frame, so
 		// nothing has to be re-derived as the character walks.
 		void* pOrgWindow = GetScreenOrigin();
 		if (pOrgWindow == nullptr) {
 			Log("layer=%p SCREEN_ORIGIN_MISSING - bulb left where the client put it", pLayer);
 			return;
 		}
+		long lxBefore = 0, lyBefore = 0;
+		GetLocalPosition(pLayer, &lxBefore, &lyBefore);
 		PutOrigin(pLayer, pOrgWindow);
+
+		// The screen frame has a bias of its own (CWnd::GetAbsLeft reads it back as
+		// `layer x - org window x`), and the screen origin's own coordinates are not readable.
+		// So the target is not written as an absolute screen position but as a shift from where
+		// the client's own placement lands *inside the new frame*: the bulb is one spot on screen
+		// before the reparenting and the anchor is where that spot is (window centre horizontally,
+		// head height above the vertical centre), and the frame is 1:1 with screen pixels.
+		long lxAnchored = 0, lyAnchored = 0;
+		GetLocalPosition(pLayer, &lxAnchored, &lyAnchored);
 		bScreenParented = true;
 
 		// Vertical centring is resolved once per layer instance: the bulb's animation frames do
@@ -298,15 +337,18 @@ void QuestBulb::PinLayer(void* pLayer) {
 			nTargetY = (Client::m_nGameHeight - nPinnedHeight) / 2;
 			if (nTargetY < 0) nTargetY = 0;
 		}
-		nWantedX = (nFixedX < 0) ? 0 : nFixedX;
-		nWantedY = nTargetY;
+		int nTargetX = (nFixedX < 0) ? 0 : nFixedX;
+		nAnchorScreenX = Client::m_nGameWidth / 2;
+		nAnchorScreenY = Client::m_nGameHeight / 2 - nCharScreenOffsetY;
+		nWantedX = lxAnchored + (nTargetX - nAnchorScreenX);
+		nWantedY = lyAnchored + (nTargetY - nAnchorScreenY);
 
 		int nZ = reinterpret_cast<IWzGr2DLayer__GetZ_t>(dwIWzGr2DLayer__GetZ)(pLayer, nullptr);
-		long ogx = 0, ogy = 0;
-		int ogd = 0;
-		bool bOrgResolved = ChainSum(pOrgWindow, &ogx, &ogy, &ogd);
-		Log("layer=%p h=%d target=(%ld,%ld) orgWindow=%p z=%d org=(%ld,%ld) depth=%d resolved=%d",
-			pLayer, nPinnedHeight, nWantedX, nWantedY, pOrgWindow, nZ, ogx, ogy, ogd, bOrgResolved ? 1 : 0);
+		long ox = 0, oy = 0;
+		GetLocalPosition(pOrgWindow, &ox, &oy);
+		Log("layer=%p h=%d anchor=(%d,%d) target=(%d,%d) wanted=(%ld,%ld) before=(%ld,%ld) anchored=(%ld,%ld) orgOwn=(%ld,%ld) orgWindow=%p z=%d",
+			pLayer, nPinnedHeight, nAnchorScreenX, nAnchorScreenY, nTargetX, nTargetY,
+			nWantedX, nWantedY, lxBefore, lyBefore, lxAnchored, lyAnchored, ox, oy, pOrgWindow, nZ);
 	}
 
 	if (!bScreenParented) return;
