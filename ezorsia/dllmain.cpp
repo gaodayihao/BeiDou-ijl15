@@ -10,6 +10,7 @@
 #include "SelectCharMacFix.h"
 #include "LatchFix.h"
 #include "QuestBulb.h"
+#include "BuffTimer.h"
 #pragma comment(lib, "ws2_32.lib")
 
 // config.ini can use IP or hostname (ServerIP_Address=...).
@@ -107,6 +108,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			QuestBulb::bFixed = reader.GetBoolean("optional", "questBulbFixed", true);
 			QuestBulb::nFixedX = reader.GetInteger("optional", "questBulbX", 10);
 			QuestBulb::nFixedY = reader.GetInteger("optional", "questBulbY", -1);
+			BuffTimer::bEnabled = reader.GetBoolean("optional", "buffTimer", true);
+			BuffTimer::nMinuteFont = reader.GetInteger("optional", "buffTimerMinuteFont", 7);
+			BuffTimer::nSecondFont = reader.GetInteger("optional", "buffTimerSecondFont", 3);
+			BuffTimer::nOutlineFont = reader.GetInteger("optional", "buffTimerOutlineFont", 1);
+			BuffTimer::nFontSize = reader.GetInteger("optional", "buffTimerSize", 14);
+			BuffTimer::nMaxMinutes = reader.GetInteger("optional", "buffTimerMaxMinutes", 10);
+			BuffTimer::nMinuteColor = reader.GetInteger("optional", "buffTimerMinuteColor", 0x5AFFAA);
+			BuffTimer::nSecondColor = reader.GetInteger("optional", "buffTimerSecondColor", 0xFFFF20);
+			BuffTimer::nOutlineColor = reader.GetInteger("optional", "buffTimerOutlineColor", 0x000000);
+			BuffTimer::nOffsetX = reader.GetInteger("optional", "buffTimerX", 4);
+			BuffTimer::nOffsetY = reader.GetInteger("optional", "buffTimerY", 17);
+			BuffTimer::bDebug = Client::debug; // diagnostics follow the existing [debug] debug= switch
 				}
 
 		Hook_CreateMutexA(true); //multiclient //ty darter, angel, and alias!
@@ -146,6 +159,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		Client::NoPassword();
 		Client::MoreHook();
 		BossHP::Hook();
+		BuffTimer::Hook(); // countdown under each buff icon (buffTimer=true)
 		QuestBulb::Hook(); // pin the auto-quest light bulb to the left edge of the screen
 		Client::WorldMap();
 		Client::RefreshRate(); 

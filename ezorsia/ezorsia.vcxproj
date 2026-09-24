@@ -173,6 +173,7 @@
     </ClInclude>
     <ClInclude Include="BossHP.h" />
     <ClInclude Include="QuestBulb.h" />
+    <ClInclude Include="BuffTimer.h" />
     <ClInclude Include="HpMpAlert.h" />
     <ClInclude Include="Client.h" />
     <ClInclude Include="FixBuddy.h" />
@@ -215,6 +216,7 @@
   <ItemGroup>
     <ClCompile Include="BossHP.cpp" />
     <ClCompile Include="QuestBulb.cpp" />
+    <ClCompile Include="BuffTimer.cpp" />
     <ClCompile Include="HpMpAlert.cpp" />
     <ClCompile Include="Client.cpp" />
     <ClCompile Include="ijl15.cpp" />
