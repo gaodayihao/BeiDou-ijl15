@@ -1,6 +1,5 @@
 #include "stdafx.h"
 #include "QuestBulb.h"
-#include <stdarg.h>
 #include <oleauto.h>
 
 // ===== Reverse-engineering anchors (Angel.exe / BeiDou.exe, v83) =====
@@ -70,7 +69,6 @@ const int nVtbl_IWzVector2D__raw_RelMove = 144;
 
 const DWORD dwCUserLocal__UpdateQuestAlertIcon = 0x0095CED9;
 const DWORD dwIWzGr2DLayer__GetHeight = 0x00440C2A;
-const DWORD dwIWzGr2DLayer__GetZ = 0x0044337D;
 const DWORD dwCWndMan__ms_pInstance = 0x00BEC20C;
 
 // CWndMan::GetOrgWindow 0x0048BBA5 answers with this field, whatever UIOrigin it is asked for.
@@ -85,33 +83,16 @@ typedef long(__stdcall* IWzVector2D__get_long_t)(void* pThis, long* pnOut);
 typedef long(__stdcall* IWzVector2D__raw_RelMove_t)(void* pThis, long nX, long nY, VARIANTARG vAttr1, VARIANTARG vAttr2);
 typedef long(__stdcall* IWzVector2D__put_origin_t)(void* pThis, VARIANTARG vOrigin);
 typedef int(__fastcall* IWzGr2DLayer__GetHeight_t)(void* pThis, void* edx);
-typedef int(__fastcall* IWzGr2DLayer__GetZ_t)(void* pThis, void* edx);
 
 bool QuestBulb::bFixed = true;
 int QuestBulb::nFixedX = 10;
 int QuestBulb::nFixedY = -1;
-bool QuestBulb::bDebug = false;
 
 static void* pPinnedLayer = nullptr;
 static bool bScreenParented = false; // false for a layer we must not touch
-static unsigned int nPinCount = 0;
 static long nWantedX = 0;     // screen position the bulb is pinned to (per layer instance)
 static long nWantedY = 0;
 static int nPinnedHeight = 0; // the layer height the vertical centring was derived from
-
-void QuestBulb::Log(const char* sFormat, ...) {
-	if (!bDebug) return;
-	char sLine[256];
-	va_list args;
-	va_start(args, sFormat);
-	_vsnprintf_s(sLine, sizeof(sLine), _TRUNCATE, sFormat, args);
-	va_end(args);
-	FILE* pFile = nullptr;
-	if (fopen_s(&pFile, "quest_bulb.log", "a") == 0 && pFile != nullptr) {
-		fprintf(pFile, "%s\n", sLine);
-		fclose(pFile);
-	}
-}
 
 static void GetLocalPosition(void* pVector, long* pnX, long* pnY) {
 	void** pVtbl = *reinterpret_cast<void***>(pVector);
@@ -194,7 +175,6 @@ void QuestBulb::PinLayer(void* pLayer) {
 
 	if (pPinnedLayer != pLayer) {
 		pPinnedLayer = pLayer;
-		nPinCount = 0;
 		bScreenParented = false;
 		nPinnedHeight = 0;
 
@@ -202,10 +182,7 @@ void QuestBulb::PinLayer(void* pLayer) {
 		// which is exactly how CWnd::CreateWnd places every UI window; the layer's own x/y is then
 		// frame-relative (a large negative number) and must not be used as a position.
 		void* pOrgWindow = GetScreenOrigin();
-		if (pOrgWindow == nullptr) {
-			Log("layer=%p SCREEN_ORIGIN_MISSING - bulb left where the client put it", pLayer);
-			return;
-		}
+		if (pOrgWindow == nullptr) return; // no screen frame: leave the bulb where the client put it
 		PutOrigin(pLayer, pOrgWindow);
 
 		// Vertical centring is resolved once per layer instance: the bulb's animation frames do
@@ -220,41 +197,17 @@ void QuestBulb::PinLayer(void* pLayer) {
 		nWantedX = (nFixedX < 0) ? 0 : nFixedX;
 		nWantedY = nTargetY;
 		bScreenParented = true;
-
-		long lx = 0, ly = 0, ox = 0, oy = 0;
-		GetLocalPosition(pLayer, &lx, &ly);
-		GetLocalPosition(pOrgWindow, &ox, &oy);
-		int nZ = reinterpret_cast<IWzGr2DLayer__GetZ_t>(dwIWzGr2DLayer__GetZ)(pLayer, nullptr);
-		Log("layer=%p h=%d target=(%ld,%ld) orgWindow=%p z=%d stock=(%ld,%ld) local=(%ld,%ld)",
-			pLayer, nPinnedHeight, nWantedX, nWantedY, pOrgWindow, nZ, lx - ox, ly - oy, lx, ly);
 	}
 
 	if (!bScreenParented) return;
 
-	// Screen position = the layer's own coordinates minus the screen origin's. Verified against the
-	// engine: after writing (x,y) the layer reads back local = (x,y) + origin, and the value stays
-	// put as the camera moves - so this holds the bulb on one screen spot.
+	// The screen position is the layer's own coordinates minus the screen origin's: the origin's
+	// own position follows the camera, the layer's coordinates follow it in step, and this
+	// difference is the spot on screen. Re-assert the wanted spot whenever it has slipped.
 	long lx = 0, ly = 0, ox = 0, oy = 0;
 	GetLocalPosition(pLayer, &lx, &ly);
 	GetLocalPosition(GetScreenOrigin(), &ox, &oy);
-	long nAbsX = lx - ox;
-	long nAbsY = ly - oy;
-	bool bCorrected = false;
-	if (nAbsX != nWantedX || nAbsY != nWantedY) {
+	if ((lx - ox) != nWantedX || (ly - oy) != nWantedY) {
 		SetLayerPosition(pLayer, nWantedX, nWantedY);
-		bCorrected = true;
-	}
-
-	nPinCount++;
-	if (bDebug && (bCorrected || nPinCount <= 5 || (nPinCount % 600) == 0)) {
-		if (bCorrected) { // confirm the write really landed where it was asked to
-			GetLocalPosition(pLayer, &lx, &ly);
-			GetLocalPosition(GetScreenOrigin(), &ox, &oy);
-			nAbsX = lx - ox;
-			nAbsY = ly - oy;
-		}
-		Log("[%u] layer=%p screen=(%ld,%ld) wanted=(%ld,%ld) eq=%d corrected=%d local=(%ld,%ld)",
-			nPinCount, pLayer, nAbsX, nAbsY, nWantedX, nWantedY,
-			(nAbsX == nWantedX && nAbsY == nWantedY) ? 1 : 0, bCorrected ? 1 : 0, lx, ly);
 	}
 }

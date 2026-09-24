@@ -107,8 +107,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			QuestBulb::bFixed = reader.GetBoolean("optional", "questBulbFixed", true);
 			QuestBulb::nFixedX = reader.GetInteger("optional", "questBulbX", 10);
 			QuestBulb::nFixedY = reader.GetInteger("optional", "questBulbY", -1);
-			QuestBulb::bDebug = Client::debug; // same switch as above
-		}
+				}
 
 		Hook_CreateMutexA(true); //multiclient //ty darter, angel, and alias!
 		HookCreateWindowExA(true); //default ezorsia

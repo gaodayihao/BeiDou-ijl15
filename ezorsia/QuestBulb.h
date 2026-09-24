@@ -16,10 +16,8 @@ public:
 	static bool bFixed;   // questBulbFixed : true = bulb stays at a fixed screen position
 	static int  nFixedX;  // questBulbX     : pixels from the screen's left edge
 	static int  nFixedY;  // questBulbY     : pixels from the screen's top edge; <0 = vertically centred
-	static bool bDebug;   // not a config key: mirrors [debug] debug= and drives quest_bulb.log
 
 private:
 	static void Apply(void* pCUserLocal);
 	static void PinLayer(void* pLayer);
-	static void Log(const char* sFormat, ...);
 };
