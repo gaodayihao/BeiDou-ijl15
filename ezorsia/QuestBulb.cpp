@@ -85,11 +85,7 @@ const DWORD dwCWndMan__ms_pInstance = 0x00BEC20C;
 // CWndMan::GetOrgWindow 0x0048BBA5 answers with this field, whatever UIOrigin it is asked for.
 const int nCWndMan__OrgWindow = 0xDC;
 
-// Where the client's own placement puts the bulb: just above the character's head, and the follow
-// camera keeps the character on one screen spot, so that spot is the reference the target is
-// measured against. Only the difference matters, so a constant error here is a constant error in
-// the landing position - tuneable with questBulbX/questBulbY.
-const int nCharScreenOffsetY = 60;
+
 
 // CUserLocal+0x3180 is the bulb's IWzGr2DLayer (com_ptr, null while no bulb is shown);
 // the sibling flag CUserLocal+0x317C is not "a layer exists" - the client also loads the idle
@@ -112,8 +108,7 @@ static bool bScreenParented = false; // false for a layer we must not touch
 static unsigned int nPinCount = 0;
 static long nWantedX = 0;        // screen position the bulb is pinned to (per layer instance)
 static long nWantedY = 0;
-static long nAnchorScreenX = 0;  // where the client's own placement put the bulb on screen
-static long nAnchorScreenY = 0;
+
 static int nPinnedHeight = 0;    // the layer height the vertical centring was derived from
 
 void QuestBulb::Log(const char* sFormat, ...) {
@@ -231,9 +226,9 @@ void QuestBulb::PinLayer(void* pLayer) {
 		}
 		PutOrigin(pLayer, pOrgWindow);
 
-		// Where the client's own placement sits, read back through that conversion, and where the
-		// bulb should sit instead. Both are absolute screen coordinates, so the frame's own bias
-		// cancels and the target keys are plain screen pixels.
+		// Where the client's own placement sits, read back through that conversion. Diagnostics
+		// only: with the frame being centre-based (see below) it reads back as
+		// `stock screen position - (width/2, height/2)`.
 		long lx = 0, ly = 0, ox = 0, oy = 0;
 		GetLocalPosition(pLayer, &lx, &ly);
 		GetLocalPosition(pOrgWindow, &ox, &oy);
@@ -249,16 +244,21 @@ void QuestBulb::PinLayer(void* pLayer) {
 			nTargetY = (Client::m_nGameHeight - nPinnedHeight) / 2;
 			if (nTargetY < 0) nTargetY = 0;
 		}
-		nAnchorScreenX = Client::m_nGameWidth / 2;
-		nAnchorScreenY = Client::m_nGameHeight / 2 - nCharScreenOffsetY;
-		nWantedX = nStockAbsX + ((nFixedX < 0 ? 0 : nFixedX) - nAnchorScreenX);
-		nWantedY = nStockAbsY + (nTargetY - nAnchorScreenY);
+		int nTargetX = (nFixedX < 0) ? 0 : nFixedX;
+
+		// The absolute frame is centre-based: CWndMan's constructor raw_RelMoves the root layer to
+		// (-width/2, -height/2), so a screen position is the absolute position plus half the
+		// window. The client's own placement confirms the scale - it reads back as (609,282) for a
+		// 1280x720 window, i.e. just above the character's head, slightly left of centre.
+		nWantedX = nTargetX - Client::m_nGameWidth / 2;
+		nWantedY = nTargetY - Client::m_nGameHeight / 2;
 		bScreenParented = true;
 
 		int nZ = reinterpret_cast<IWzGr2DLayer__GetZ_t>(dwIWzGr2DLayer__GetZ)(pLayer, nullptr);
-		Log("layer=%p h=%d anchor=(%d,%d) target=(%d,%d) stock=(%ld,%ld) wanted=(%ld,%ld) orgOwn=(%ld,%ld) orgWindow=%p z=%d",
-			pLayer, nPinnedHeight, nAnchorScreenX, nAnchorScreenY, nFixedX < 0 ? 0 : nFixedX, nTargetY,
-			nStockAbsX, nStockAbsY, nWantedX, nWantedY, ox, oy, pOrgWindow, nZ);
+		Log("layer=%p h=%d target=(%d,%d) wanted=(%ld,%ld) stock=(%ld,%ld) stockScreen=(%ld,%ld) orgOwn=(%ld,%ld) orgWindow=%p z=%d",
+			pLayer, nPinnedHeight, nTargetX, nTargetY, nWantedX, nWantedY, nStockAbsX, nStockAbsY,
+			nStockAbsX + Client::m_nGameWidth / 2, nStockAbsY + Client::m_nGameHeight / 2,
+			ox, oy, pOrgWindow, nZ);
 	}
 
 	if (!bScreenParented) return;
