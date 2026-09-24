@@ -21,40 +21,68 @@
 //                                                        companion flag at CUserLocal+0x317C.
 //   CUserLocal::Update                    0x0094A144  - calls the above every frame (0x0094BCB3).
 //
-// CUser::LoadLayer hands the new layer a *character* coordinate origin, so the bulb moves with
-// the head. The client already has a screen-space origin for exactly this kind of job: the
-// vector returned by CWndMan::GetOrgWindow (0x0048BBA5, i.e. CWndMan+0xDC), which is what
-// CField::ShowScreenEffect (0x00534F92) and CChatBalloon::MakeScreenBalloon (0x0048B86A) pass
-// as the origin of their own screen effects. Re-pointing our layer at that vector and moving it
-// to a fixed (x, y) is therefore the same mechanism the client uses itself.
+// Moving the bulb is a two-step problem, both halves measured on a live client:
 //
-// IWzVector2D vtable slots below are confirmed twice over in the same binary:
-//   * CVecCtrl implements that interface, and the vtable it installs at this+0x0C
-//     (0x00B3E1F8, written by CVecCtrl::CVecCtrl 0x009B0F71) still carries every PDB name:
-//     +32 get_x / +40 get_y / +64 raw_Move / +96 get_origin / +100 put_origin / +144 raw_RelMove;
+//   * The layer hangs off the character through its origin chain, so its own coordinates are an
+//     offset inside that frame; where it lands on screen is only decided by the chain. Asking
+//     GetLT (+200 wrapper 0x00440C54) for the position handle and summing x/y along get_origin
+//     (+96) resolves to world/map coordinates - (739,954) and (785,1178) for a 1280x720 window -
+//     which is exactly the camera-independent frame we want to leave alone.
+//   * Writing a layer's coordinates with raw_Move (+64) *detaches it from that origin*: the client
+//     never calls raw_Move on a layer anywhere (it positions everything with raw_RelMove, +144),
+//     and CVecCtrl::raw_Move 0x009B5E7F is plainly a teleport - it zeroes the velocity fields and
+//     calls SetMovePathAttribute(3). On a live layer the position handle also came back null right
+//     after the call. The symptom of leaving it detached is a bulb frozen at a spot in the map
+//     that the character can walk up to. put_x/put_rx are no help: CVecCtrl::put_x 0x009B5DA5
+//     and put_rx 0x009B60D0 both funnel back into raw_Move/raw_RelMove.
+//
+// So the position is written and the origin is put back immediately afterwards. Reading the
+// origin off the GetLT handle works (5 levels deep); the layer's own get_origin returns nothing.
+// put_origin (+100) is safe to call on a live layer - the very first attempt proved it relocates
+// the bulb without breaking its rendering.
+//
+// The relocation itself is a constant offset: the follow camera pins the character to one spot on
+// screen, so the bulb's screen position moves 1:1 with the layer's local coordinates. The target
+// is expressed in screen pixels and converted against that pin; questBulbX/questBulbY are
+// therefore plain screen coordinates, and any constant error is tunable from config.ini.
+//
+// Vtable slots are confirmed twice over in the same binary:
+//   * CVecCtrl implements IWzVector2D, and the vtable it installs at this+0x0C (0x00B3E1F8,
+//     written by CVecCtrl::CVecCtrl 0x009B0F71) still carries every PDB name: +32 get_x,
+//     +40 get_y, +64 raw_Move, +96 get_origin, +100 put_origin, +104 get_rx, +112 get_ry,
+//     +144 raw_RelMove;
 //   * the stateful wrappers agree - IWzShape2D::Getx 0x00403CB7 uses +32, IWzShape2D::Gety
-//     0x00403CDE uses +40, IWzVector2D::GetOrigin 0x00441AA1 uses +96, and the client's own
-//     CChatBalloon::MakeScreenBalloon 0x0048B86A re-origins a freshly created layer with +100.
+//     0x00403CDE uses +40, IWzVector2D::GetOrigin 0x00441AA1 uses +96.
 const int nVtbl_IWzVector2D__get_x = 32;
 const int nVtbl_IWzVector2D__get_y = 40;
 const int nVtbl_IWzVector2D__raw_Move = 64;
+const int nVtbl_IWzVector2D__get_origin = 96;
 const int nVtbl_IWzVector2D__put_origin = 100;
 
 const DWORD dwCUserLocal__UpdateQuestAlertIcon = 0x0095CED9;
-const DWORD dwTSingleton_CWndMan__ms_pInstance = 0x00BEC20C;
-const DWORD dwIWzGr2DLayer__GetHeight = 0x00440C2A; // IWzGr2DLayer::GetHeight wrapper, __thiscall
+const DWORD dwIWzGr2DLayer__GetLT = 0x00440C54;
+const DWORD dwIWzGr2DLayer__GetHeight = 0x00440C2A;
 
 // CUserLocal+0x3180 is the bulb's IWzGr2DLayer (com_ptr, null while no bulb is shown);
 // the sibling flag CUserLocal+0x317C is not "a layer exists" - the client also loads the idle
 // animation with that flag cleared - so only the pointer is used here.
 const int nCUserLocal__QuestAlertLayer = 0x3180;
 
-// CWndMan+0xDC is exactly what CWndMan::GetOrgWindow returns (it ignores its UIOrigin argument).
-const int nCWndMan__OrgWindow = 0xDC;
+// Probe step: confirms raw_Move really moves this layer, since its meaning cannot be read off
+// statically (no call site anywhere in this exe).
+const int nProbeDelta = 1000;
+const int nProbeTolerance = 400;
+
+// Where the bulb is assumed to be drawn before we touch it: just above the character, whom the
+// follow camera keeps at the centre of the window. Only the difference between this assumption
+// and the truth survives into the result - a plain constant, absorbable via questBulbX/Y.
+const int nCharScreenOffsetY = 60;
 
 typedef long(__stdcall* IWzVector2D__get_long_t)(void* pThis, long* pnOut);
 typedef long(__stdcall* IWzVector2D__raw_Move_t)(void* pThis, long nX, long nY);
+typedef long(__stdcall* IWzVector2D__get_origin_t)(void* pThis, VARIANTARG* pvOrigin);
 typedef long(__stdcall* IWzVector2D__put_origin_t)(void* pThis, VARIANTARG vOrigin);
+typedef void*(__fastcall* IWzGr2DLayer__GetLT_t)(void* pThis, void* edx, void** ppOut);
 typedef int(__fastcall* IWzGr2DLayer__GetHeight_t)(void* pThis, void* edx);
 
 bool QuestBulb::bFixed = true;
@@ -62,13 +90,14 @@ int QuestBulb::nFixedX = 10;
 int QuestBulb::nFixedY = -1;
 bool QuestBulb::bDebug = false;
 
-// The layer we already re-origined. put_origin AddRefs the screen origin vector (the client
-// passes it the same way, see sub_410FDF(..., 1)), and the callee owns that reference, so it is
-// set once per layer instance instead of once per frame.
 static void* pPinnedLayer = nullptr;
+static bool bPositionable = false; // stays false for a layer we must not touch
 static unsigned int nPinCount = 0;
-static int nPinnedY = 0;       // resolved once per layer instance (see PinLayer)
-static int nPinnedHeight = 0;  // the layer height that nPinnedY was derived from (diagnostics)
+static long nLocalTargetX = 0; // constant local offset resolved once per layer instance
+static long nLocalTargetY = 0;
+static int nPinnedHeight = 0;             // the layer height the centring was derived from
+static VARIANTARG vSavedOrigin;           // the origin the client gave the layer (we own a ref)
+static bool bHaveSavedOrigin = false;
 
 void QuestBulb::Log(const char* sFormat, ...) {
 	if (!bDebug) return;
@@ -82,6 +111,127 @@ void QuestBulb::Log(const char* sFormat, ...) {
 		fprintf(pFile, "%s\n", sLine);
 		fclose(pFile);
 	}
+}
+
+static void ReleaseVariant(VARIANTARG& v) {
+	if (v.vt == VT_UNKNOWN && v.punkVal != nullptr) v.punkVal->Release();
+	else if (v.vt == VT_DISPATCH && v.pdispVal != nullptr) v.pdispVal->Release();
+	memset(&v, 0, sizeof(v));
+}
+
+// get_origin answers with either pointer flavour, and may hand it back by reference.
+static void* ExtractObject(const VARIANTARG& v) {
+	VARTYPE vtBase = v.vt & ~VT_BYREF;
+	if (vtBase != VT_UNKNOWN && vtBase != VT_DISPATCH) return nullptr;
+	void* p = (vtBase == VT_UNKNOWN) ? static_cast<void*>(v.punkVal) : static_cast<void*>(v.pdispVal);
+	if ((v.vt & VT_BYREF) != 0) {
+		if (p == nullptr || IsBadReadPtr(p, sizeof(void*))) return nullptr;
+		p = *reinterpret_cast<void**>(p);
+	}
+	return p;
+}
+
+static void GetLocalPosition(void* pVector, long* pnX, long* pnY) {
+	void** pVtbl = *reinterpret_cast<void***>(pVector);
+	*pnX = 0;
+	*pnY = 0;
+	reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_x / sizeof(void*)])(pVector, pnX);
+	reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_y / sizeof(void*)])(pVector, pnY);
+}
+
+// Opens the layer's position handle (caller-owned, like the client treats it) and walks
+// get_origin from it, summing x/y. Returns false when the handle cannot be read at all.
+static void* OpenPositionHandle(void* pLayer) {
+	static auto _GetLT = reinterpret_cast<IWzGr2DLayer__GetLT_t>(dwIWzGr2DLayer__GetLT);
+	void* pLT = nullptr;
+	_GetLT(pLayer, nullptr, &pLT);
+	if (pLT == nullptr || IsBadReadPtr(pLT, sizeof(void*))) return nullptr;
+	return pLT;
+}
+
+static void ClosePositionHandle(void* pHandle) {
+	void** pVtbl = *reinterpret_cast<void***>(pHandle);
+	reinterpret_cast<unsigned long(__stdcall*)(void*)>(pVtbl[2])(pHandle); // IUnknown::Release
+}
+
+// Sums x/y along the origin chain starting at the layer's position handle: the layer's rendered
+// position in world coordinates. Diagnostics only - it tells whether the layer is still hanging
+// off the character (the value keeps changing as the character walks) or has been detached
+// (the value freezes), which is exactly what a position write must not do.
+static bool ResolveAbsolutePosition(void* pLayer, long* pnX, long* pnY, int* pnDepth) {
+	*pnX = 0;
+	*pnY = 0;
+	*pnDepth = 0;
+
+	void* pCur = OpenPositionHandle(pLayer);
+	if (pCur == nullptr) return false;
+	reinterpret_cast<IUnknown*>(pCur)->AddRef();
+
+	long nSumX = 0, nSumY = 0;
+	int nDepth = 0;
+	while (pCur != nullptr && nDepth < 8) {
+		void** pVtbl = *reinterpret_cast<void***>(pCur);
+		if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__get_origin + sizeof(void*))) break;
+
+		long nX = 0, nY = 0;
+		reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_x / sizeof(void*)])(pCur, &nX);
+		reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_y / sizeof(void*)])(pCur, &nY);
+		nSumX += nX;
+		nSumY += nY;
+		nDepth++;
+
+		VARIANTARG vOrigin;
+		memset(&vOrigin, 0, sizeof(vOrigin));
+		long hr = reinterpret_cast<IWzVector2D__get_origin_t>(pVtbl[nVtbl_IWzVector2D__get_origin / sizeof(void*)])(pCur, &vOrigin);
+		void* pParent = (hr >= 0) ? ExtractObject(vOrigin) : nullptr;
+		if (pParent == pCur) pParent = nullptr;
+		if (pParent != nullptr) reinterpret_cast<IUnknown*>(pParent)->AddRef();
+		ReleaseVariant(vOrigin);
+
+		reinterpret_cast<IUnknown*>(pCur)->Release();
+		pCur = pParent;
+	}
+	if (pCur != nullptr) reinterpret_cast<IUnknown*>(pCur)->Release();
+
+	*pnX = nSumX;
+	*pnY = nSumY;
+	*pnDepth = nDepth;
+	return nDepth >= 2;
+}
+
+// Saves the origin the client gave the layer, so it can be put back after a position write.
+static bool SaveOrigin(void* pHandle) {
+	bHaveSavedOrigin = false;
+	ReleaseVariant(vSavedOrigin);
+
+	void** pVtbl = *reinterpret_cast<void***>(pHandle);
+	if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__get_origin + sizeof(void*))) return false;
+
+	memset(&vSavedOrigin, 0, sizeof(vSavedOrigin));
+	long hr = reinterpret_cast<IWzVector2D__get_origin_t>(pVtbl[nVtbl_IWzVector2D__get_origin / sizeof(void*)])(pHandle, &vSavedOrigin);
+	if (hr < 0 || ExtractObject(vSavedOrigin) == nullptr) {
+		ReleaseVariant(vSavedOrigin);
+		return false;
+	}
+	bHaveSavedOrigin = true;
+	return true;
+}
+
+// Re-attaches the saved origin. raw_Move detaches the layer from it, so every write is followed
+// by this; the callee takes over the reference, hence the fresh AddRef.
+static void RestoreOrigin(void* pLayer) {
+	if (!bHaveSavedOrigin) return;
+	void** pVtbl = *reinterpret_cast<void***>(pLayer);
+	if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__put_origin + sizeof(void*))) return;
+
+	VARIANTARG vCopy;
+	memset(&vCopy, 0, sizeof(vCopy));
+	vCopy.vt = vSavedOrigin.vt;
+	vCopy.punkVal = vSavedOrigin.punkVal;
+	if (vCopy.vt == VT_UNKNOWN && vCopy.punkVal != nullptr) vCopy.punkVal->AddRef();
+	else if (vCopy.vt == VT_DISPATCH && vCopy.pdispVal != nullptr) vCopy.pdispVal->AddRef();
+	else return;
+	reinterpret_cast<IWzVector2D__put_origin_t>(pVtbl[nVtbl_IWzVector2D__put_origin / sizeof(void*)])(pLayer, vCopy);
 }
 
 void QuestBulb::Hook() {
@@ -103,7 +253,7 @@ void QuestBulb::Apply(void* pCUserLocal) {
 
 	void* pLayer = *reinterpret_cast<void**>(reinterpret_cast<char*>(pCUserLocal) + nCUserLocal__QuestAlertLayer);
 	if (pLayer == nullptr) {
-		pPinnedLayer = nullptr; // bulb taken down: the next one gets origined again
+		pPinnedLayer = nullptr; // bulb taken down: the next one gets measured again
 		return;
 	}
 	if (!bFixed) return;
@@ -117,47 +267,68 @@ void QuestBulb::PinLayer(void* pLayer) {
 	if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__put_origin + sizeof(void*))) return;
 
 	if (pPinnedLayer != pLayer) {
-		void* pWndMan = *reinterpret_cast<void**>(dwTSingleton_CWndMan__ms_pInstance);
-		if (pWndMan == nullptr) return;
-		void* pOrgWindow = *reinterpret_cast<void**>(reinterpret_cast<char*>(pWndMan) + nCWndMan__OrgWindow);
-		if (pOrgWindow == nullptr || IsBadReadPtr(pOrgWindow, sizeof(void*))) return;
+		long lx = 0, ly = 0, px = 0, py = 0;
+		GetLocalPosition(pLayer, &lx, &ly);
 
-		// put_origin(VARIANT) - the client builds the same VT_UNKNOWN variant through
-		// sub_410FDF(variant, pointer, 1), which also AddRefs before handing the reference over.
-		VARIANTARG vOrigin;
-		memset(&vOrigin, 0, sizeof(vOrigin));
-		vOrigin.vt = VT_UNKNOWN;
-		vOrigin.punkVal = reinterpret_cast<IUnknown*>(pOrgWindow);
-		vOrigin.punkVal->AddRef();
-		reinterpret_cast<IWzVector2D__put_origin_t>(pVtbl[nVtbl_IWzVector2D__put_origin / sizeof(void*)])(pLayer, vOrigin);
+		// The origin has to be saved before anything is written, otherwise there is no way back.
+		void* pLT = OpenPositionHandle(pLayer);
+		bool bOriginSaved = (pLT != nullptr) && SaveOrigin(pLT);
+		if (pLT != nullptr) ClosePositionHandle(pLT);
 
-		// Resolve the y target once per layer instance: the bulb's animation frames are not all
-		// the same height, so re-centring on the live height every frame would make it jitter.
-		nPinnedHeight = 0;
-		nPinnedY = nFixedY;
-		if (nPinnedY < 0) {
-			nPinnedHeight = reinterpret_cast<IWzGr2DLayer__GetHeight_t>(dwIWzGr2DLayer__GetHeight)(pLayer, nullptr);
-			if (nPinnedHeight < 0 || nPinnedHeight > Client::m_nGameHeight) nPinnedHeight = 0;
-			nPinnedY = (Client::m_nGameHeight - nPinnedHeight) / 2;
-			if (nPinnedY < 0) nPinnedY = 0;
+		// Confirm raw_Move really moves this layer, then undo both the move and the detachment.
+		bool bMoveWorks = false;
+		if (bOriginSaved) {
+			reinterpret_cast<IWzVector2D__raw_Move_t>(pVtbl[nVtbl_IWzVector2D__raw_Move / sizeof(void*)])(pLayer, lx + nProbeDelta, ly);
+			GetLocalPosition(pLayer, &px, &py);
+			reinterpret_cast<IWzVector2D__raw_Move_t>(pVtbl[nVtbl_IWzVector2D__raw_Move / sizeof(void*)])(pLayer, lx, ly);
+			RestoreOrigin(pLayer);
+			long nMoved = px - lx;
+			bMoveWorks = (nMoved > nProbeDelta - nProbeTolerance) && (nMoved < nProbeDelta + nProbeTolerance);
 		}
 
 		pPinnedLayer = pLayer;
 		nPinCount = 0;
+		bPositionable = bOriginSaved && bMoveWorks;
+
+		if (!bPositionable) {
+			Log("probe layer=%p UNPOSITIONABLE (originSaved=%d move %ld->%ld) - bulb left as the client made it",
+				pLayer, bOriginSaved ? 1 : 0, lx, px);
+			return;
+		}
+
+		// Vertical centring is resolved once per layer instance: the bulb's animation frames do
+		// not all have the same height, so re-centring every frame would make it jitter.
+		nPinnedHeight = 0;
+		int nTargetY = nFixedY;
+		if (nTargetY < 0) {
+			nPinnedHeight = reinterpret_cast<IWzGr2DLayer__GetHeight_t>(dwIWzGr2DLayer__GetHeight)(pLayer, nullptr);
+			if (nPinnedHeight < 0 || nPinnedHeight > Client::m_nGameHeight) nPinnedHeight = 0;
+			nTargetY = (Client::m_nGameHeight - nPinnedHeight) / 2;
+			if (nTargetY < 0) nTargetY = 0;
+		}
+		int nTargetX = (nFixedX < 0) ? 0 : nFixedX;
+
+		long nAnchorScreenX = Client::m_nGameWidth / 2;
+		long nAnchorScreenY = Client::m_nGameHeight / 2 - nCharScreenOffsetY;
+		nLocalTargetX = lx + (nTargetX - nAnchorScreenX);
+		nLocalTargetY = ly + (nTargetY - nAnchorScreenY);
+
+		Log("probe layer=%p h=%d anchor=(%ld,%ld) target=(%d,%d) => local=(%ld,%ld) (client had (%ld,%ld))",
+			pLayer, nPinnedHeight, nAnchorScreenX, nAnchorScreenY, nTargetX, nTargetY,
+			nLocalTargetX, nLocalTargetY, lx, ly);
 	}
 
-	int nX = (nFixedX < 0) ? 0 : nFixedX;
+	if (!bPositionable) return; // never touch a layer we cannot put back
 
-	reinterpret_cast<IWzVector2D__raw_Move_t>(pVtbl[nVtbl_IWzVector2D__raw_Move / sizeof(void*)])(pLayer, nX, nPinnedY);
+	reinterpret_cast<IWzVector2D__raw_Move_t>(pVtbl[nVtbl_IWzVector2D__raw_Move / sizeof(void*)])(pLayer, nLocalTargetX, nLocalTargetY);
+	RestoreOrigin(pLayer); // raw_Move detached the layer; put it back on the character
 
-	// Diagnostics (quest_bulb.log): what raw_Move was asked for, plus what the layer reports back.
-	// A readback that is not (nX, nPinnedY) means get_x/get_y are not in the origin's frame -
-	// useful when tuning, harmless otherwise.
 	if (bDebug && (++nPinCount <= 5 || (nPinCount % 300) == 0)) {
-		long nBackX = -1, nBackY = -1;
-		reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_x / sizeof(void*)])(pLayer, &nBackX);
-		reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_y / sizeof(void*)])(pLayer, &nBackY);
-		Log("[%u] layer=%p h=%d move=(%d,%d) readback=(%ld,%ld)",
-			nPinCount, pLayer, nPinnedHeight, nX, nPinnedY, nBackX, nBackY);
+		long lx = 0, ly = 0, ax = 0, ay = 0;
+		int nDepth = 0;
+		GetLocalPosition(pLayer, &lx, &ly);
+		bool bResolved = ResolveAbsolutePosition(pLayer, &ax, &ay, &nDepth);
+		Log("[%u] layer=%p local=(%ld,%ld) wanted=(%ld,%ld) world=(%ld,%ld) depth=%d resolved=%d",
+			nPinCount, pLayer, lx, ly, nLocalTargetX, nLocalTargetY, ax, ay, nDepth, bResolved ? 1 : 0);
 	}
 }
