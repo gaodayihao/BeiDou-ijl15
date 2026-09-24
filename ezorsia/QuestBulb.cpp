@@ -23,40 +23,39 @@
 //
 // CUser::LoadLayer hands the new layer the avatar layer under the face as its coordinate origin
 // (CAvatar::GetLayerUnderFace, 0x00451E7E -> sub_43EA3E), which is why the bulb rides the
-// character's head, the camera and the walk animation all at once.
+// character's head - and with it the camera and the walk animation. That origin is *world* space,
+// so no position written against it can ever stay put on screen: the bulb keeps the character's
+// on-screen motion (camera easing, jumps).
 //
-// Positioning an IWzVector2D - the layer's own x/y is NOT a screen coordinate:
+// The cure is the client's own recipe for anything that must sit at a fixed screen position, and
+// it is plain to read in CWnd::CreateWnd (0x009DE4D2), which builds every UI window:
 //
-//   * The engine keeps an absolute value alongside it: the layer's position in the root frame.
-//     That is what get_rx/get_ry report, and what raw_RelMove takes. `x` is the same value
-//     converted into the layer's current origin frame - measured on a live layer, after
-//     raw_RelMove(X) the layer reads back x = X + (origin's own x), i.e. the absolute is
-//     x - origin.x. The client's own CWnd::GetAbsLeft reads a position back exactly that way.
-//   * The absolute frame is centre-based: CWndMan's constructor raw_RelMoves the root layer to
-//     (-width/2, -height/2), so `screen = absolute + (width/2, height/2)`. The client's own
-//     placement of this bulb corroborates the scale: it reads back as (609,282) on a 1280x720
-//     window, i.e. just above the character's head and slightly left of centre.
+//     sub_410FDF(&v, *(CWndMan::ms_pInstance + 0xDC), 1);   // VARIANT{VT_UNKNOWN, screen origin}
+//     IWzVector2D::put_origin (+100)  <- that VARIANT        // child of the SCREEN frame
+//     IWzVector2D::raw_RelMove (+144) <- nLeft, nTop, empty, empty   // the window's screen position
+//     IWzGr2DLayer::PutZ (+180) / Putcolor (+224)
 //
-// The three relevant slots, with their signatures read off the mangled names in this exe (never
-// guess an argument count here - a wrong one corrupts the stack silently, see below):
+// `CWndMan+0xDC` is what CWndMan::GetOrgWindow (0x0048BBA5) answers with - it ignores its UIOrigin
+// argument and always returns that field - and CUIStatusBar::OnCreate (0x008D01B2) hangs the HUD
+// off it too. Sprite layers use the same origin: CChatBalloon::MakeScreenBalloon (0x0048B86A)
+// creates its layer at screen coordinates with IWzGr2D::CreateLayer (0x00426C7E) and points its
+// origin there. A layer parented to it takes *screen pixels* in raw_RelMove, so the target is the
+// literal questBulbX/questBulbY.
 //
-//   raw_RelMove  (+144)  long __stdcall(long x, long y, VARIANT, VARIANT)
-//                        Sets the ABSOLUTE position and converts internally. It does not touch the
-//                        origin, so nothing has to be saved or restored - this is the client's own
-//                        "put this layer here" call (CWnd::CreateWnd 0x009DE4D2 uses it for every
-//                        window, right after pointing the window's origin at the screen root).
-//                        Both VARIANTs are filled with VT_EMPTY, matching the client.
-//   raw_Move     (+64)   long __stdcall(long x, long y)
-//                        Teleport: CVecCtrl::raw_Move 0x009B5E7F zeroes the velocity fields and
-//                        calls SetMovePathAttribute(3), and it *detaches the layer from its
-//                        origin* - GetLT comes back null straight after. A bulb moved this way
-//                        freezes at a spot in the map that the character can walk up to, and
-//                        trying to undo it with put_origin rewrites the coordinates.
-//   put_origin   (+100)  long __stdcall(VARIANT)
-//                        Reparents. Right for a freshly created layer - CWnd::CreateWnd attaches
-//                        every window to CWndMan+0xDC that way - but reparenting *this* layer made
-//                        it disappear from the screen in two test rounds while its position read
-//                        back exactly as asked, so it is deliberately not used any more.
+// Slot signatures are read off the mangled names in this exe, never guessed - a wrong argument
+// count on a vtable call corrupts the stack silently:
+//   ?raw_Move@CVecCtrl@@UAGJJJ@Z                    long raw_Move(long x, long y)
+//   ?raw_RelMove@CVecCtrl@@UAGJJJUtagVARIANT@@0@Z   long raw_RelMove(long x, long y, VARIANT, VARIANT)
+//   ?put_origin@CVecCtrl@@UAGJUtagVARIANT@@@Z       long put_origin(VARIANT)
+//   ?get_origin@CVecCtrl@@UAGJPAUtagVARIANT@@@Z     long get_origin(VARIANT* pOut)
+//   ?get_x@CVecCtrl@@UAGJPAJ@Z                      long get_x(long* pOut)
+//   ?get_rx@CVecCtrl@@UAGJPAJ@Z / ?get_ry@...       long get_rx(long* pOut)
+//
+// raw_Move (+64) is the one to avoid: CVecCtrl::raw_Move 0x009B5E7F zeroes the velocity fields and
+// calls SetMovePathAttribute(3), and it *detaches the layer from its origin* (GetLT comes back null
+// straight after) - a bulb moved that way freezes at a spot in the map the character can walk up
+// to. raw_RelMove does not touch the origin, so re-writing the same position is free of side
+// effects and needs no restore.
 //
 // Vtable slots are confirmed twice over in the same binary:
 //   * CVecCtrl implements IWzVector2D, and the vtable it installs at this+0x0C (0x00B3E1F8,
@@ -66,27 +65,25 @@
 //     0x00403CDE uses +40, IWzVector2D::GetOrigin 0x00441AA1 uses +96.
 const int nVtbl_IWzVector2D__get_x = 32;
 const int nVtbl_IWzVector2D__get_y = 40;
-const int nVtbl_IWzVector2D__get_rx = 104;
-const int nVtbl_IWzVector2D__get_ry = 112;
+const int nVtbl_IWzVector2D__put_origin = 100;
 const int nVtbl_IWzVector2D__raw_RelMove = 144;
 
 const DWORD dwCUserLocal__UpdateQuestAlertIcon = 0x0095CED9;
 const DWORD dwIWzGr2DLayer__GetHeight = 0x00440C2A;
 const DWORD dwIWzGr2DLayer__GetZ = 0x0044337D;
+const DWORD dwCWndMan__ms_pInstance = 0x00BEC20C;
+
+// CWndMan::GetOrgWindow 0x0048BBA5 answers with this field, whatever UIOrigin it is asked for.
+const int nCWndMan__OrgWindow = 0xDC;
 
 // CUserLocal+0x3180 is the bulb's IWzGr2DLayer (com_ptr, null while no bulb is shown);
 // the sibling flag CUserLocal+0x317C is not "a layer exists" - the client also loads the idle
 // animation with that flag cleared - so only the pointer is used here.
 const int nCUserLocal__QuestAlertLayer = 0x3180;
 
-// Where the client's own placement puts the bulb on screen: just above the character's head, and
-// the follow camera keeps the character on one spot. Only differences against this are ever used,
-// so a constant error here is a constant error in the landing position, tuneable with
-// questBulbX/questBulbY.
-const int nCharScreenOffsetY = 60;
-
 typedef long(__stdcall* IWzVector2D__get_long_t)(void* pThis, long* pnOut);
 typedef long(__stdcall* IWzVector2D__raw_RelMove_t)(void* pThis, long nX, long nY, VARIANTARG vAttr1, VARIANTARG vAttr2);
+typedef long(__stdcall* IWzVector2D__put_origin_t)(void* pThis, VARIANTARG vOrigin);
 typedef int(__fastcall* IWzGr2DLayer__GetHeight_t)(void* pThis, void* edx);
 typedef int(__fastcall* IWzGr2DLayer__GetZ_t)(void* pThis, void* edx);
 
@@ -96,8 +93,9 @@ int QuestBulb::nFixedY = -1;
 bool QuestBulb::bDebug = false;
 
 static void* pPinnedLayer = nullptr;
+static bool bScreenParented = false; // false for a layer we must not touch
 static unsigned int nPinCount = 0;
-static long nWantedX = 0;     // the bulb's absolute position, i.e. screen minus half the window
+static long nWantedX = 0;     // screen position the bulb is pinned to (per layer instance)
 static long nWantedY = 0;
 static int nPinnedHeight = 0; // the layer height the vertical centring was derived from
 
@@ -123,24 +121,27 @@ static void GetLocalPosition(void* pVector, long* pnX, long* pnY) {
 	reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_y / sizeof(void*)])(pVector, pnY);
 }
 
-// The engine's own absolute position - the value raw_RelMove writes. Diagnostics: it is the one
-// number that says whether the bulb really ended up where it was asked to.
-static void GetAbsolutePosition(void* pVector, long* pnX, long* pnY) {
+// Reparents a layer onto the given screen-space origin. The origin is passed as a by-value
+// VARIANT built the way the client builds it (sub_410FDF: vt = VT_UNKNOWN, AddRef'd); the callee
+// takes that reference over, so the AddRef here is the one it will release.
+static void PutOrigin(void* pVector, void* pOrigin) {
 	void** pVtbl = *reinterpret_cast<void***>(pVector);
-	*pnX = 0;
-	*pnY = 0;
-	reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_rx / sizeof(void*)])(pVector, pnX);
-	reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_ry / sizeof(void*)])(pVector, pnY);
+	if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__put_origin + sizeof(void*))) return;
+
+	VARIANTARG vOrigin;
+	memset(&vOrigin, 0, sizeof(vOrigin));
+	vOrigin.vt = VT_UNKNOWN;
+	vOrigin.punkVal = reinterpret_cast<IUnknown*>(pOrigin);
+	vOrigin.punkVal->AddRef();
+	reinterpret_cast<IWzVector2D__put_origin_t>(pVtbl[nVtbl_IWzVector2D__put_origin / sizeof(void*)])(pVector, vOrigin);
 }
 
-// Places a layer at an absolute position. This is the client's own positioning call.
-//
-// The two trailing VARIANTs are not optional padding: the signature is
-// `long __stdcall raw_RelMove(long x, long y, VARIANT, VARIANT)` (mangled
-// `?raw_RelMove@CVecCtrl@@UAGJJJUtagVARIANT@@0@Z`), and CWnd::CreateWnd fills both with an empty
-// variant. Calling it with x/y alone leaves 32 bytes of garbage on the stack and the callee reads
-// the empty slot as a pointer - that is what crashed the client once (fault: write to NULL at
-// IWzGr2DLayer::GetLT+0x2E, from a stack already unwound by the wrong pop count).
+// Places a layer at a screen position - the client's own call, and the only writer that does not
+// disturb the layer. The two trailing VARIANTs are not optional padding: the signature is
+// `long __stdcall raw_RelMove(long x, long y, VARIANT, VARIANT)` and CWnd::CreateWnd fills both
+// with an empty variant. Calling it with x/y alone leaves 32 bytes of garbage on the stack and the
+// callee reads the empty slot as a pointer - that is what crashed the client once (fault: write to
+// NULL at IWzGr2DLayer::GetLT+0x2E, from a stack already unwound by the wrong pop count).
 static void SetLayerPosition(void* pVector, long nX, long nY) {
 	void** pVtbl = *reinterpret_cast<void***>(pVector);
 	VARIANTARG vAttr1;
@@ -148,6 +149,15 @@ static void SetLayerPosition(void* pVector, long nX, long nY) {
 	memset(&vAttr1, 0, sizeof(vAttr1)); // VT_EMPTY: no move-path attributes, i.e. an instant move
 	memset(&vAttr2, 0, sizeof(vAttr2));
 	reinterpret_cast<IWzVector2D__raw_RelMove_t>(pVtbl[nVtbl_IWzVector2D__raw_RelMove / sizeof(void*)])(pVector, nX, nY, vAttr1, vAttr2);
+}
+
+// The screen origin every UI window is built under (CWnd::CreateWnd).
+static void* GetScreenOrigin() {
+	void* pWndMan = *reinterpret_cast<void**>(dwCWndMan__ms_pInstance);
+	if (pWndMan == nullptr || IsBadReadPtr(pWndMan, nCWndMan__OrgWindow + sizeof(void*))) return nullptr;
+	void* pOrgWindow = *reinterpret_cast<void**>(reinterpret_cast<char*>(pWndMan) + nCWndMan__OrgWindow);
+	if (pOrgWindow == nullptr || IsBadReadPtr(pOrgWindow, sizeof(void*))) return nullptr;
+	return pOrgWindow;
 }
 
 void QuestBulb::Hook() {
@@ -185,7 +195,18 @@ void QuestBulb::PinLayer(void* pLayer) {
 	if (pPinnedLayer != pLayer) {
 		pPinnedLayer = pLayer;
 		nPinCount = 0;
+		bScreenParented = false;
 		nPinnedHeight = 0;
+
+		// One-time reparenting onto the screen frame. From here on raw_RelMove takes screen pixels,
+		// which is exactly how CWnd::CreateWnd places every UI window; the layer's own x/y is then
+		// frame-relative (a large negative number) and must not be used as a position.
+		void* pOrgWindow = GetScreenOrigin();
+		if (pOrgWindow == nullptr) {
+			Log("layer=%p SCREEN_ORIGIN_MISSING - bulb left where the client put it", pLayer);
+			return;
+		}
+		PutOrigin(pLayer, pOrgWindow);
 
 		// Vertical centring is resolved once per layer instance: the bulb's animation frames do
 		// not all have the same height, so re-centring every frame would make it jitter.
@@ -196,38 +217,44 @@ void QuestBulb::PinLayer(void* pLayer) {
 			nTargetY = (Client::m_nGameHeight - nPinnedHeight) / 2;
 			if (nTargetY < 0) nTargetY = 0;
 		}
-		int nTargetX = (nFixedX < 0) ? 0 : nFixedX;
+		nWantedX = (nFixedX < 0) ? 0 : nFixedX;
+		nWantedY = nTargetY;
+		bScreenParented = true;
 
-		// The client's own placement is the reference: it puts the bulb just above the character's
-		// head, and the follow camera keeps the character on one screen spot, so that spot is a
-		// known screen position. Only the difference between the target and it is needed, which
-		// makes the absolute frame's own bias cancel out.
-		long lx = 0, ly = 0, rx = 0, ry = 0;
+		long lx = 0, ly = 0, ox = 0, oy = 0;
 		GetLocalPosition(pLayer, &lx, &ly);
-		GetAbsolutePosition(pLayer, &rx, &ry);
-		long nAnchorScreenX = Client::m_nGameWidth / 2;
-		long nAnchorScreenY = Client::m_nGameHeight / 2 - nCharScreenOffsetY;
-		nWantedX = rx + (nTargetX - nAnchorScreenX);
-		nWantedY = ry + (nTargetY - nAnchorScreenY);
-
+		GetLocalPosition(pOrgWindow, &ox, &oy);
 		int nZ = reinterpret_cast<IWzGr2DLayer__GetZ_t>(dwIWzGr2DLayer__GetZ)(pLayer, nullptr);
-		Log("layer=%p h=%d anchor=(%ld,%ld) target=(%d,%d) wanted=(%ld,%ld) stock=(%ld,%ld) stockScreen=(%ld,%ld) local=(%ld,%ld) z=%d",
-			pLayer, nPinnedHeight, nAnchorScreenX, nAnchorScreenY, nTargetX, nTargetY, nWantedX, nWantedY, rx, ry,
-			rx + Client::m_nGameWidth / 2, ry + Client::m_nGameHeight / 2, lx, ly, nZ);
+		Log("layer=%p h=%d target=(%ld,%ld) orgWindow=%p z=%d stock=(%ld,%ld) local=(%ld,%ld)",
+			pLayer, nPinnedHeight, nWantedX, nWantedY, pOrgWindow, nZ, lx - ox, ly - oy, lx, ly);
 	}
 
-	// The absolute has to be re-asserted because the layer's origin chain (the character) keeps
-	// moving, which changes the layer's own coordinates. raw_RelMove does not touch the origin, so
-	// re-writing the same absolute is free of side effects.
-	SetLayerPosition(pLayer, nWantedX, nWantedY);
+	if (!bScreenParented) return;
+
+	// Screen position = the layer's own coordinates minus the screen origin's. Verified against the
+	// engine: after writing (x,y) the layer reads back local = (x,y) + origin, and the value stays
+	// put as the camera moves - so this holds the bulb on one screen spot.
+	long lx = 0, ly = 0, ox = 0, oy = 0;
+	GetLocalPosition(pLayer, &lx, &ly);
+	GetLocalPosition(GetScreenOrigin(), &ox, &oy);
+	long nAbsX = lx - ox;
+	long nAbsY = ly - oy;
+	bool bCorrected = false;
+	if (nAbsX != nWantedX || nAbsY != nWantedY) {
+		SetLayerPosition(pLayer, nWantedX, nWantedY);
+		bCorrected = true;
+	}
 
 	nPinCount++;
-	if (bDebug && (nPinCount <= 5 || (nPinCount % 600) == 0)) {
-		long lx = 0, ly = 0, rx = 0, ry = 0;
-		GetLocalPosition(pLayer, &lx, &ly);
-		GetAbsolutePosition(pLayer, &rx, &ry);
-		Log("[%u] layer=%p abs=(%ld,%ld) wanted=(%ld,%ld) eq=%d local=(%ld,%ld)",
-			nPinCount, pLayer, rx, ry, nWantedX, nWantedY,
-			(rx == nWantedX && ry == nWantedY) ? 1 : 0, lx, ly);
+	if (bDebug && (bCorrected || nPinCount <= 5 || (nPinCount % 600) == 0)) {
+		if (bCorrected) { // confirm the write really landed where it was asked to
+			GetLocalPosition(pLayer, &lx, &ly);
+			GetLocalPosition(GetScreenOrigin(), &ox, &oy);
+			nAbsX = lx - ox;
+			nAbsY = ly - oy;
+		}
+		Log("[%u] layer=%p screen=(%ld,%ld) wanted=(%ld,%ld) eq=%d corrected=%d local=(%ld,%ld)",
+			nPinCount, pLayer, nAbsX, nAbsY, nWantedX, nWantedY,
+			(nAbsX == nWantedX && nAbsY == nWantedY) ? 1 : 0, bCorrected ? 1 : 0, lx, ly);
 	}
 }
