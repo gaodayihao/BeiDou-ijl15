@@ -39,12 +39,15 @@
 // So the position is written and the origin is put back immediately afterwards. Reading the
 // origin off the GetLT handle works (5 levels deep); the layer's own get_origin returns nothing.
 // put_origin (+100) is safe to call on a live layer - the very first attempt proved it relocates
-// the bulb without breaking its rendering.
+// the bulb without breaking its rendering. Putting the origin back also rewrites the layer's
+// coordinates (measured: (-539,104) in, (-371,281) out), so the write is iterated until the value
+// that survives the restore is the wanted one.
 //
 // The relocation itself is a constant offset: the follow camera pins the character to one spot on
 // screen, so the bulb's screen position moves 1:1 with the layer's local coordinates. The target
-// is expressed in screen pixels and converted against that pin; questBulbX/questBulbY are
-// therefore plain screen coordinates, and any constant error is tunable from config.ini.
+// is expressed in screen pixels and converted against the coordinates the client itself picked for
+// the bulb (see nCharScreenOffsetY); questBulbX/questBulbY are therefore plain screen coordinates,
+// and any constant error is tunable from config.ini.
 //
 // Vtable slots are confirmed twice over in the same binary:
 //   * CVecCtrl implements IWzVector2D, and the vtable it installs at this+0x0C (0x00B3E1F8,
@@ -68,15 +71,19 @@ const DWORD dwIWzGr2DLayer__GetHeight = 0x00440C2A;
 // animation with that flag cleared - so only the pointer is used here.
 const int nCUserLocal__QuestAlertLayer = 0x3180;
 
+// The wanted position is a *screen* position, but nothing readable speaks screen coordinates -
+// get_rx/get_ry only echo the layer's own x/y, and WzGr2D::GetCamera is not exported. What saves
+// the day is that the client's own placement of this bulb is usable as the reference: the follow
+// camera pins the character to one spot on screen, so the bulb's screen position moves 1:1 with
+// the layer's local coordinates, and the spot the client itself picked for "just above the head"
+// (window centre horizontally, slightly above centre vertically) is the on-screen origin to
+// measure against. Everything below is therefore `clientLocal + (target - thatSpot)`.
+const int nCharScreenOffsetY = 60; // head height above the vertical centre: where the client puts the bulb
+
 // Probe step: confirms raw_Move really moves this layer, since its meaning cannot be read off
 // statically (no call site anywhere in this exe).
 const int nProbeDelta = 1000;
 const int nProbeTolerance = 400;
-
-// Where the bulb is assumed to be drawn before we touch it: just above the character, whom the
-// follow camera keeps at the centre of the window. Only the difference between this assumption
-// and the truth survives into the result - a plain constant, absorbable via questBulbX/Y.
-const int nCharScreenOffsetY = 60;
 
 typedef long(__stdcall* IWzVector2D__get_long_t)(void* pThis, long* pnOut);
 typedef long(__stdcall* IWzVector2D__raw_Move_t)(void* pThis, long nX, long nY);
@@ -93,8 +100,12 @@ bool QuestBulb::bDebug = false;
 static void* pPinnedLayer = nullptr;
 static bool bPositionable = false; // stays false for a layer we must not touch
 static unsigned int nPinCount = 0;
-static long nLocalTargetX = 0; // constant local offset resolved once per layer instance
-static long nLocalTargetY = 0;
+static long nWantedX = 0;     // local coordinates that put the bulb on target (per layer instance)
+static long nWantedY = 0;
+static long nLocalBaseX = 0;  // the local coordinates the client itself chose, i.e. where it laid
+static long nLocalBaseY = 0;  // the bulb out before we touched it - the on-screen reference point
+static long nAnchorScreenX = 0;
+static long nAnchorScreenY = 0;
 static int nPinnedHeight = 0;             // the layer height the centring was derived from
 static VARIANTARG vSavedOrigin;           // the origin the client gave the layer (we own a ref)
 static bool bHaveSavedOrigin = false;
@@ -308,27 +319,52 @@ void QuestBulb::PinLayer(void* pLayer) {
 		}
 		int nTargetX = (nFixedX < 0) ? 0 : nFixedX;
 
-		long nAnchorScreenX = Client::m_nGameWidth / 2;
-		long nAnchorScreenY = Client::m_nGameHeight / 2 - nCharScreenOffsetY;
-		nLocalTargetX = lx + (nTargetX - nAnchorScreenX);
-		nLocalTargetY = ly + (nTargetY - nAnchorScreenY);
+		// The client's own coordinates for this bulb are the on-screen reference: they put it
+		// just above the character's head, and the camera keeps the character on one spot, so
+		// nAnchorScreen is where the bulb would appear if it were left alone. Since the origin
+		// chain is 1:1, adding (target - anchor) moves it by exactly that many screen pixels.
+		nLocalBaseX = lx;
+		nLocalBaseY = ly;
+		nAnchorScreenX = Client::m_nGameWidth / 2;
+		nAnchorScreenY = Client::m_nGameHeight / 2 - nCharScreenOffsetY;
+		nWantedX = lx + (nTargetX - nAnchorScreenX);
+		nWantedY = ly + (nTargetY - nAnchorScreenY);
 
-		Log("probe layer=%p h=%d anchor=(%ld,%ld) target=(%d,%d) => local=(%ld,%ld) (client had (%ld,%ld))",
+		Log("probe layer=%p h=%d anchor=(%ld,%ld) target=(%d,%d) => wanted=(%ld,%ld) (client had (%ld,%ld))",
 			pLayer, nPinnedHeight, nAnchorScreenX, nAnchorScreenY, nTargetX, nTargetY,
-			nLocalTargetX, nLocalTargetY, lx, ly);
+			nWantedX, nWantedY, lx, ly);
 	}
 
 	if (!bPositionable) return; // never touch a layer we cannot put back
 
-	reinterpret_cast<IWzVector2D__raw_Move_t>(pVtbl[nVtbl_IWzVector2D__raw_Move / sizeof(void*)])(pLayer, nLocalTargetX, nLocalTargetY);
-	RestoreOrigin(pLayer); // raw_Move detached the layer; put it back on the character
+	// bulbScreen = anchor + (local - localBase): the chain is 1:1, so the layer's own coordinates
+	// are the only thing that has to be driven, and they have to end up on the constant nWanted.
+	//
+	// One wrinkle: putting the origin back rewrites those coordinates. Measured on a live client:
+	// writing (-539,104) came back as (-371,281), an extra (168,177) - the same x-rx gap the layer
+	// reports on its own. So the write is iterated until the *post-restore* coordinates are the
+	// wanted ones; each round compensates whatever the restore added on top.
+	long nWriteX = nWantedX;
+	long nWriteY = nWantedY;
+	for (int i = 0; i < 3; i++) {
+		reinterpret_cast<IWzVector2D__raw_Move_t>(pVtbl[nVtbl_IWzVector2D__raw_Move / sizeof(void*)])(pLayer, nWriteX, nWriteY);
+		RestoreOrigin(pLayer);
+
+		long lx = 0, ly = 0;
+		GetLocalPosition(pLayer, &lx, &ly);
+		if (lx == nWantedX && ly == nWantedY) break;
+		nWriteX -= (lx - nWantedX);
+		nWriteY -= (ly - nWantedY);
+	}
 
 	if (bDebug && (++nPinCount <= 5 || (nPinCount % 300) == 0)) {
 		long lx = 0, ly = 0, ax = 0, ay = 0;
 		int nDepth = 0;
 		GetLocalPosition(pLayer, &lx, &ly);
 		bool bResolved = ResolveAbsolutePosition(pLayer, &ax, &ay, &nDepth);
-		Log("[%u] layer=%p local=(%ld,%ld) wanted=(%ld,%ld) world=(%ld,%ld) depth=%d resolved=%d",
-			nPinCount, pLayer, lx, ly, nLocalTargetX, nLocalTargetY, ax, ay, nDepth, bResolved ? 1 : 0);
+		Log("[%u] layer=%p local=(%ld,%ld) wanted=(%ld,%ld) wrote=(%ld,%ld) screen~=(%ld,%ld) world=(%ld,%ld) depth=%d resolved=%d",
+			nPinCount, pLayer, lx, ly, nWantedX, nWantedY, nWriteX, nWriteY,
+			nAnchorScreenX + (lx - nLocalBaseX), nAnchorScreenY + (ly - nLocalBaseY),
+			ax, ay, nDepth, bResolved ? 1 : 0);
 	}
 }
