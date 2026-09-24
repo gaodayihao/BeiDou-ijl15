@@ -74,12 +74,10 @@
 //     0x00403CDE uses +40, IWzVector2D::GetOrigin 0x00441AA1 uses +96.
 const int nVtbl_IWzVector2D__get_x = 32;
 const int nVtbl_IWzVector2D__get_y = 40;
-const int nVtbl_IWzVector2D__get_origin = 96;
 const int nVtbl_IWzVector2D__put_origin = 100;
 const int nVtbl_IWzVector2D__raw_RelMove = 144;
 
 const DWORD dwCUserLocal__UpdateQuestAlertIcon = 0x0095CED9;
-const DWORD dwIWzGr2DLayer__GetLT = 0x00440C54;
 const DWORD dwIWzGr2DLayer__GetHeight = 0x00440C2A;
 const DWORD dwIWzGr2DLayer__GetZ = 0x0044337D;
 const DWORD dwCWndMan__ms_pInstance = 0x00BEC20C;
@@ -100,9 +98,7 @@ const int nCUserLocal__QuestAlertLayer = 0x3180;
 
 typedef long(__stdcall* IWzVector2D__get_long_t)(void* pThis, long* pnOut);
 typedef long(__stdcall* IWzVector2D__raw_RelMove_t)(void* pThis, long nX, long nY, VARIANTARG vAttr1, VARIANTARG vAttr2);
-typedef long(__stdcall* IWzVector2D__get_origin_t)(void* pThis, VARIANTARG* pvOrigin);
 typedef long(__stdcall* IWzVector2D__put_origin_t)(void* pThis, VARIANTARG vOrigin);
-typedef void*(__fastcall* IWzGr2DLayer__GetLT_t)(void* pThis, void* edx, void** ppOut);
 typedef int(__fastcall* IWzGr2DLayer__GetHeight_t)(void* pThis, void* edx);
 typedef int(__fastcall* IWzGr2DLayer__GetZ_t)(void* pThis, void* edx);
 
@@ -134,44 +130,12 @@ void QuestBulb::Log(const char* sFormat, ...) {
 	}
 }
 
-static void ReleaseVariant(VARIANTARG& v) {
-	if (v.vt == VT_UNKNOWN && v.punkVal != nullptr) v.punkVal->Release();
-	else if (v.vt == VT_DISPATCH && v.pdispVal != nullptr) v.pdispVal->Release();
-	memset(&v, 0, sizeof(v));
-}
-
-// get_origin answers with either pointer flavour, and may hand it back by reference.
-static void* ExtractObject(const VARIANTARG& v) {
-	VARTYPE vtBase = v.vt & ~VT_BYREF;
-	if (vtBase != VT_UNKNOWN && vtBase != VT_DISPATCH) return nullptr;
-	void* p = (vtBase == VT_UNKNOWN) ? static_cast<void*>(v.punkVal) : static_cast<void*>(v.pdispVal);
-	if ((v.vt & VT_BYREF) != 0) {
-		if (p == nullptr || IsBadReadPtr(p, sizeof(void*))) return nullptr;
-		p = *reinterpret_cast<void**>(p);
-	}
-	return p;
-}
-
 static void GetLocalPosition(void* pVector, long* pnX, long* pnY) {
 	void** pVtbl = *reinterpret_cast<void***>(pVector);
 	*pnX = 0;
 	*pnY = 0;
 	reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_x / sizeof(void*)])(pVector, pnX);
 	reinterpret_cast<IWzVector2D__get_long_t>(pVtbl[nVtbl_IWzVector2D__get_y / sizeof(void*)])(pVector, pnY);
-}
-
-// Opens the layer's position handle (caller-owned, like the client treats it).
-static void* OpenPositionHandle(void* pLayer) {
-	static auto _GetLT = reinterpret_cast<IWzGr2DLayer__GetLT_t>(dwIWzGr2DLayer__GetLT);
-	void* pLT = nullptr;
-	_GetLT(pLayer, nullptr, &pLT);
-	if (pLT == nullptr || IsBadReadPtr(pLT, sizeof(void*))) return nullptr;
-	return pLT;
-}
-
-static void ClosePositionHandle(void* pHandle) {
-	void** pVtbl = *reinterpret_cast<void***>(pHandle);
-	reinterpret_cast<unsigned long(__stdcall*)(void*)>(pVtbl[2])(pHandle); // IUnknown::Release
 }
 
 // Reparents a layer onto the given screen-space origin. The origin is passed as a by-value
@@ -189,15 +153,17 @@ static void PutOrigin(void* pVector, void* pOrigin) {
 	reinterpret_cast<IWzVector2D__put_origin_t>(pVtbl[nVtbl_IWzVector2D__put_origin / sizeof(void*)])(pVector, vOrigin);
 }
 
-// Moves a layer inside its current origin frame - the client's own positioning call.
+// Places a layer at an absolute (screen) position. This is the client's own call - CWnd::CreateWnd
+// runs it right after put_origin with the window's screen coordinates. It converts the position
+// into the layer's current frame internally, so the layer's own x/y afterwards is a frame-relative
+// value (measured: writing X left `x` at X + origin x, i.e. `x - origin x == X`).
 //
-// The two trailing VARIANTs are not optional padding: the real signature is
+// The two trailing VARIANTs are not optional padding: the signature is
 // `long __stdcall raw_RelMove(long x, long y, VARIANT, VARIANT)` (mangled
-// `?raw_RelMove@CVecCtrl@@UAGJJJUtagVARIANT@@0@Z`), and CWnd::CreateWnd fills both with an empty
-// variant. Calling it with x/y alone leaves 32 bytes of garbage on the stack and the callee reads
-// the empty slot as a pointer - that is what crashed the client in the seventh test round
-// (fault: write to NULL at IWzGr2DLayer::GetLT+0x2E, from a stack that had already been unwound
-// by the wrong pop count).
+// `?raw_RelMove@CVecCtrl@@UAGJJJUtagVARIANT@@0@Z`). Calling it with x/y alone leaves 32 bytes of
+// garbage on the stack and the callee reads the empty slot as a pointer - that is what crashed the
+// client once (fault: write to NULL at IWzGr2DLayer::GetLT+0x2E, from a stack already unwound by
+// the wrong pop count).
 static void SetLayerPosition(void* pVector, long nX, long nY) {
 	void** pVtbl = *reinterpret_cast<void***>(pVector);
 	VARIANTARG vAttr1;
@@ -207,66 +173,14 @@ static void SetLayerPosition(void* pVector, long nX, long nY) {
 	reinterpret_cast<IWzVector2D__raw_RelMove_t>(pVtbl[nVtbl_IWzVector2D__raw_RelMove / sizeof(void*)])(pVector, nX, nY, vAttr1, vAttr2);
 }
 
-// The screen origin every UI window is built under (CWnd::CreateWnd).
+// The screen origin every UI window is built under (CWnd::CreateWnd). Its own coordinates are the
+// frame's bias: CWnd::GetAbsLeft reads a position back as `layer x - origin x`.
 static void* GetScreenOrigin() {
 	void* pWndMan = *reinterpret_cast<void**>(dwCWndMan__ms_pInstance);
 	if (pWndMan == nullptr || IsBadReadPtr(pWndMan, nCWndMan__OrgWindow + sizeof(void*))) return nullptr;
 	void* pOrgWindow = *reinterpret_cast<void**>(reinterpret_cast<char*>(pWndMan) + nCWndMan__OrgWindow);
 	if (pOrgWindow == nullptr || IsBadReadPtr(pOrgWindow, sizeof(void*))) return nullptr;
 	return pOrgWindow;
-}
-
-// Sums x/y along the origin chain starting at the given vector (the start is borrowed; it is
-// AddRef'd here). Diagnostics only: on the screen origin it reveals which convention the UI frame
-// uses - (0,0) for plain screen pixels, or (-width/2,-height/2) for the centre-based frame the
-// CWndMan constructor sets up. Both give the same target, since the frame's own offset and the
-// renderer's centre are the same shift.
-static bool ChainSum(void* pStart, long* pnX, long* pnY, int* pnDepth) {
-	*pnX = 0;
-	*pnY = 0;
-	*pnDepth = 0;
-	if (pStart == nullptr || IsBadReadPtr(pStart, sizeof(void*))) return false;
-
-	reinterpret_cast<IUnknown*>(pStart)->AddRef();
-	void* pCur = pStart;
-	long nSumX = 0, nSumY = 0;
-	int nDepth = 0;
-	while (pCur != nullptr && nDepth < 8) {
-		void** pVtbl = *reinterpret_cast<void***>(pCur);
-		if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__get_origin + sizeof(void*))) break;
-
-		long nX = 0, nY = 0;
-		GetLocalPosition(pCur, &nX, &nY);
-		nSumX += nX;
-		nSumY += nY;
-		nDepth++;
-
-		VARIANTARG vOrigin;
-		memset(&vOrigin, 0, sizeof(vOrigin));
-		long hr = reinterpret_cast<IWzVector2D__get_origin_t>(pVtbl[nVtbl_IWzVector2D__get_origin / sizeof(void*)])(pCur, &vOrigin);
-		void* pParent = (hr >= 0) ? ExtractObject(vOrigin) : nullptr;
-		if (pParent == pCur) pParent = nullptr;
-		if (pParent != nullptr) reinterpret_cast<IUnknown*>(pParent)->AddRef();
-		ReleaseVariant(vOrigin);
-
-		reinterpret_cast<IUnknown*>(pCur)->Release();
-		pCur = pParent;
-	}
-	if (pCur != nullptr) reinterpret_cast<IUnknown*>(pCur)->Release();
-
-	*pnX = nSumX;
-	*pnY = nSumY;
-	*pnDepth = nDepth;
-	return nDepth >= 2;
-}
-
-// Same, starting from a layer's position handle.
-static bool ResolveAbsolutePosition(void* pLayer, long* pnX, long* pnY, int* pnDepth) {
-	void* pLT = OpenPositionHandle(pLayer);
-	if (pLT == nullptr) return false;
-	bool bOk = ChainSum(pLT, pnX, pnY, pnDepth);
-	ClosePositionHandle(pLT);
-	return bOk;
 }
 
 void QuestBulb::Hook() {
@@ -307,26 +221,24 @@ void QuestBulb::PinLayer(void* pLayer) {
 		bScreenParented = false;
 		nPinnedHeight = 0;
 
-		// One-time reparenting: from here on the layer's coordinates live in the screen frame, so
-		// nothing has to be re-derived as the character walks.
+		// One-time reparenting: from here on raw_RelMove (below) speaks screen coordinates, because
+		// the origin chain's own offset is the screen frame (that is exactly how CWnd::CreateWnd
+		// places every window, and how CWnd::GetAbsLeft reads a position back: layer x - origin x).
 		void* pOrgWindow = GetScreenOrigin();
 		if (pOrgWindow == nullptr) {
 			Log("layer=%p SCREEN_ORIGIN_MISSING - bulb left where the client put it", pLayer);
 			return;
 		}
-		long lxBefore = 0, lyBefore = 0;
-		GetLocalPosition(pLayer, &lxBefore, &lyBefore);
 		PutOrigin(pLayer, pOrgWindow);
 
-		// The screen frame has a bias of its own (CWnd::GetAbsLeft reads it back as
-		// `layer x - org window x`), and the screen origin's own coordinates are not readable.
-		// So the target is not written as an absolute screen position but as a shift from where
-		// the client's own placement lands *inside the new frame*: the bulb is one spot on screen
-		// before the reparenting and the anchor is where that spot is (window centre horizontally,
-		// head height above the vertical centre), and the frame is 1:1 with screen pixels.
-		long lxAnchored = 0, lyAnchored = 0;
-		GetLocalPosition(pLayer, &lxAnchored, &lyAnchored);
-		bScreenParented = true;
+		// Where the client's own placement sits, read back through that conversion, and where the
+		// bulb should sit instead. Both are absolute screen coordinates, so the frame's own bias
+		// cancels and the target keys are plain screen pixels.
+		long lx = 0, ly = 0, ox = 0, oy = 0;
+		GetLocalPosition(pLayer, &lx, &ly);
+		GetLocalPosition(pOrgWindow, &ox, &oy);
+		long nStockAbsX = lx - ox;
+		long nStockAbsY = ly - oy;
 
 		// Vertical centring is resolved once per layer instance: the bulb's animation frames do
 		// not all have the same height, so re-centring every frame would make it jitter.
@@ -337,40 +249,46 @@ void QuestBulb::PinLayer(void* pLayer) {
 			nTargetY = (Client::m_nGameHeight - nPinnedHeight) / 2;
 			if (nTargetY < 0) nTargetY = 0;
 		}
-		int nTargetX = (nFixedX < 0) ? 0 : nFixedX;
 		nAnchorScreenX = Client::m_nGameWidth / 2;
 		nAnchorScreenY = Client::m_nGameHeight / 2 - nCharScreenOffsetY;
-		nWantedX = lxAnchored + (nTargetX - nAnchorScreenX);
-		nWantedY = lyAnchored + (nTargetY - nAnchorScreenY);
+		nWantedX = nStockAbsX + ((nFixedX < 0 ? 0 : nFixedX) - nAnchorScreenX);
+		nWantedY = nStockAbsY + (nTargetY - nAnchorScreenY);
+		bScreenParented = true;
 
 		int nZ = reinterpret_cast<IWzGr2DLayer__GetZ_t>(dwIWzGr2DLayer__GetZ)(pLayer, nullptr);
-		long ox = 0, oy = 0;
-		GetLocalPosition(pOrgWindow, &ox, &oy);
-		Log("layer=%p h=%d anchor=(%d,%d) target=(%d,%d) wanted=(%ld,%ld) before=(%ld,%ld) anchored=(%ld,%ld) orgOwn=(%ld,%ld) orgWindow=%p z=%d",
-			pLayer, nPinnedHeight, nAnchorScreenX, nAnchorScreenY, nTargetX, nTargetY,
-			nWantedX, nWantedY, lxBefore, lyBefore, lxAnchored, lyAnchored, ox, oy, pOrgWindow, nZ);
+		Log("layer=%p h=%d anchor=(%d,%d) target=(%d,%d) stock=(%ld,%ld) wanted=(%ld,%ld) orgOwn=(%ld,%ld) orgWindow=%p z=%d",
+			pLayer, nPinnedHeight, nAnchorScreenX, nAnchorScreenY, nFixedX < 0 ? 0 : nFixedX, nTargetY,
+			nStockAbsX, nStockAbsY, nWantedX, nWantedY, ox, oy, pOrgWindow, nZ);
 	}
 
 	if (!bScreenParented) return;
 
-	// Write only when the position is actually off. In screen space the client has no reason to
-	// move this layer again, so after the first frame this normally does nothing at all - and a
-	// write that is not needed is a write that only adds jitter.
-	long lx = 0, ly = 0;
+	// raw_RelMove writes the *absolute* position; the layer's own x/y is frame-relative and its
+	// frame (the screen origin) is redrawn every frame as the camera moves, so the absolute has to
+	// be re-asserted whenever it slipped. When it has not slipped nothing is written at all.
+	long lx = 0, ly = 0, ox = 0, oy = 0;
 	GetLocalPosition(pLayer, &lx, &ly);
+	GetLocalPosition(GetScreenOrigin(), &ox, &oy);
+	long nAbsX = lx - ox;
+	long nAbsY = ly - oy;
 	bool bCorrected = false;
-	if (lx != nWantedX || ly != nWantedY) {
+	if (nAbsX != nWantedX || nAbsY != nWantedY) {
 		SetLayerPosition(pLayer, nWantedX, nWantedY);
-		GetLocalPosition(pLayer, &lx, &ly);
+		nAbsX = nWantedX;
+		nAbsY = nWantedY;
 		bCorrected = true;
 	}
 
 	nPinCount++;
 	if (bDebug && (bCorrected || nPinCount <= 5 || (nPinCount % 600) == 0)) {
-		long ax = 0, ay = 0;
-		int nDepth = 0;
-		bool bResolved = ResolveAbsolutePosition(pLayer, &ax, &ay, &nDepth);
-		Log("[%u] layer=%p local=(%ld,%ld) wanted=(%ld,%ld) corrected=%d screen=(%ld,%ld) depth=%d resolved=%d",
-			nPinCount, pLayer, lx, ly, nWantedX, nWantedY, bCorrected ? 1 : 0, ax, ay, nDepth, bResolved ? 1 : 0);
+		if (bCorrected) { // confirm the write really landed where it was asked to
+			GetLocalPosition(pLayer, &lx, &ly);
+			GetLocalPosition(GetScreenOrigin(), &ox, &oy);
+			nAbsX = lx - ox;
+			nAbsY = ly - oy;
+		}
+		Log("[%u] layer=%p abs=(%ld,%ld) wanted=(%ld,%ld) eq=%d local=(%ld,%ld) orgOwn=(%ld,%ld)",
+			nPinCount, pLayer, nAbsX, nAbsY, nWantedX, nWantedY,
+			(nAbsX == nWantedX && nAbsY == nWantedY) ? 1 : 0, lx, ly, ox, oy);
 	}
 }
