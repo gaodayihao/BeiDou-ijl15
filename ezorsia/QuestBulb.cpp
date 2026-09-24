@@ -188,19 +188,19 @@ static void* GetScreenOrigin() {
 	return pOrgWindow;
 }
 
-// Sums x/y along the origin chain starting at the layer's position handle. With the layer
-// parented to the screen origin this is expected to read back as the screen position itself -
-// diagnostics only, it tells whether the reparenting took effect (small numbers) or whether the
-// layer is still hanging off the character in world coordinates (map-sized numbers).
-static bool ResolveAbsolutePosition(void* pLayer, long* pnX, long* pnY, int* pnDepth) {
+// Sums x/y along the origin chain starting at the given vector (the start is borrowed; it is
+// AddRef'd here). Diagnostics only: on the screen origin it reveals which convention the UI frame
+// uses - (0,0) for plain screen pixels, or (-width/2,-height/2) for the centre-based frame the
+// CWndMan constructor sets up. Both give the same target, since the frame's own offset and the
+// renderer's centre are the same shift.
+static bool ChainSum(void* pStart, long* pnX, long* pnY, int* pnDepth) {
 	*pnX = 0;
 	*pnY = 0;
 	*pnDepth = 0;
+	if (pStart == nullptr || IsBadReadPtr(pStart, sizeof(void*))) return false;
 
-	void* pCur = OpenPositionHandle(pLayer);
-	if (pCur == nullptr) return false;
-	reinterpret_cast<IUnknown*>(pCur)->AddRef();
-
+	reinterpret_cast<IUnknown*>(pStart)->AddRef();
+	void* pCur = pStart;
 	long nSumX = 0, nSumY = 0;
 	int nDepth = 0;
 	while (pCur != nullptr && nDepth < 8) {
@@ -230,6 +230,15 @@ static bool ResolveAbsolutePosition(void* pLayer, long* pnX, long* pnY, int* pnD
 	*pnY = nSumY;
 	*pnDepth = nDepth;
 	return nDepth >= 2;
+}
+
+// Same, starting from a layer's position handle.
+static bool ResolveAbsolutePosition(void* pLayer, long* pnX, long* pnY, int* pnDepth) {
+	void* pLT = OpenPositionHandle(pLayer);
+	if (pLT == nullptr) return false;
+	bool bOk = ChainSum(pLT, pnX, pnY, pnDepth);
+	ClosePositionHandle(pLT);
+	return bOk;
 }
 
 void QuestBulb::Hook() {
@@ -293,7 +302,11 @@ void QuestBulb::PinLayer(void* pLayer) {
 		nWantedY = nTargetY;
 
 		int nZ = reinterpret_cast<IWzGr2DLayer__GetZ_t>(dwIWzGr2DLayer__GetZ)(pLayer, nullptr);
-		Log("layer=%p h=%d target=(%ld,%ld) orgWindow=%p z=%d", pLayer, nPinnedHeight, nWantedX, nWantedY, pOrgWindow, nZ);
+		long ogx = 0, ogy = 0;
+		int ogd = 0;
+		bool bOrgResolved = ChainSum(pOrgWindow, &ogx, &ogy, &ogd);
+		Log("layer=%p h=%d target=(%ld,%ld) orgWindow=%p z=%d org=(%ld,%ld) depth=%d resolved=%d",
+			pLayer, nPinnedHeight, nWantedX, nWantedY, pOrgWindow, nZ, ogx, ogy, ogd, bOrgResolved ? 1 : 0);
 	}
 
 	if (!bScreenParented) return;
