@@ -23,7 +23,7 @@
 | `0x007B3176` | 条目构造函数 | — | 建 `entry+0x28`（图标）与 `entry+0x2C`（覆盖层）两个 Gr2DLayer |
 | `0x007B2BB0` | `CTemporaryStatView::AdjustPosition` | `int __thiscall(void)` | 用 `raw_RelMove` 把两层叠在同一像素（增删 buff 后整行重排） |
 | `0x007B2E58` | `CTemporaryStatView::ShowToolTip` | `int __thiscall(CUIToolTip&, tagPOINT&, long&, long)` | 读条目字段（本文件的字段布局来源之一） |
-| `0x007B44F4` | 冷却数字重画（未命名） | — | 客户端自带的技能冷却数字（`entry+0x38 / +0x3C` 分档 → `UIWindow.img/Skill/Cooldown` 数字图） |
+| `0x007B44F4` | 冷却数字更新（未命名） | `void __thiscall(void)` | 客户端自带的技能冷却数字：`entry+0x38 / +0x3C` 取整到 15 档 → `RemoveCanvas(-2)` + `Animate(64,210,500)` 重画到 `entry+0x2C` |
 | `0x007B4819` | 单图标数值写入 | `void __thiscall(int value)` | 写 `entry+0x38`，并调 `sub_7B44F4` |
 | `0x007B4D1D` | `ZList<ZRef<TEMPORARY_STAT>>::FindIndex` | `__POSITION* __thiscall(unsigned int) const` | 取第 n 个图标节点 |
 | `0x004374CB` | `IWzGr2D::GetCenter` | `_com_ptr_t<IWzVector2D> __thiscall(void)` | Gr2D 中心向量：**图标层的 origin 就是它**（条目构造调用） |
@@ -33,9 +33,9 @@
 | 地址 | 符号 | 原型 | 用途 |
 |---|---|---|---|
 | `0x00426C7E` | `IWzGr2D::CreateLayer` | `_com_ptr_t<IWzGr2DLayer> __thiscall(long x,long y,ulong cx,ulong cy,long z,variant&,variant&)` | 建标签层 |
-| `0x00425D2E` | `IWzGr2DLayer::GetCanvas` | `_com_ptr_t<IWzCanvas> __thiscall(variant&)` | 取（必要时建）图层画布；raw 槽 **+256** |
-| `0x004143FB` | `IWzGr2DLayer::RemoveCanvas` | `_com_ptr_t<IWzCanvas> __thiscall(variant&)` | 摘掉画布；raw 槽 **+264**。**本特性不用**（见 §6.2） |
-| `0x0048ECA7` | `IWzCanvas::Create` | `long __thiscall(int cx,int cy,variant&,variant&)` | **原地重分配画布 = 擦除**；raw 槽 **+44** |
+| `0x00425D2E` | `IWzGr2DLayer::GetCanvas` | `_com_ptr_t<IWzCanvas> __thiscall(variant&)` | 取图层**已有**的画布（不新建）；raw 槽 **+256**。画布没了就永远返回 null |
+| `0x004143FB` | `IWzGr2DLayer::RemoveCanvas` | `_com_ptr_t<IWzCanvas> __thiscall(variant&)` | 摘掉画布；raw 槽 **+264**。**是收尾/拆层调用，不是擦除**（见 §6.2），本特性不用 |
+| `0x0048ECA7` | `IWzCanvas::Create` | `long __thiscall(int cx,int cy,variant&,variant&)` | 申请/重分配画布自身的内存；raw 槽 **+44**。**不是擦除**（见 §6.2），本特性不用 |
 | `0x004277AD` | `IWzCanvas::DrawTextA` | `unsigned long __thiscall(long,long,Ztl_bstr_t,IWzFont*,variant&,variant&)` | 画字 |
 | `0x0042782E` | `IWzFont::CalcTextWidth` | `int __thiscall(Ztl_bstr_t,variant&)` | 量宽（水平钳制用） |
 | `0x0045144A` | `IWzGr2DLayer::Putcolor` | `void __thiscall(unsigned long argb)` | raw 槽 **+224**；`0xFFFFFFFF` 可见 / `0` 隐藏 |
@@ -50,6 +50,7 @@
 
 vtable 槽位汇总（本轮实测）：`IWzVector2D` `get_x +32` / `get_y +40` / `put_origin +100` / `raw_RelMove +144`；
 `IWzGr2DLayer` `PutZ +180` / `Putcolor +224`；`IWzCanvas` `Create +44` / `DrawCanvas +128` / `DrawRectangle +140`。
+`Create` 的槽位是对的，但**不代表它能把图层正在渲染的画布擦干净**（§6.2 是实测结论）。
 
 **调用约定（坑）**：`GetCanvas`/`RemoveCanvas`/`CreateLayer`/`GetCenter` 都是「按值返回 `_com_ptr_t`」的成员函数。
 MSVC 把隐藏返回槽当**第一个栈参数**压入，因此实际形态是
@@ -158,7 +159,7 @@ writeInt(0) | writeByte(0) | writeInt(首个 statup 的值) | [special 时 skip(
 所以本插件**自建字体**：照抄上面那条构造链，但字号/颜色换成 `config.ini` 的
 `buffTimerSize` / `buffTimerMinuteColor` / `buffTimerSecondColor` / `buffTimerOutlineColor`
 （`0xRRGGBB`，插件补 `0xFF` alpha）。`buffTimerSize=-1` 时跳过自建、退回表槽位（`buffTimerMinuteFont` 等）。
-自建失败（任一步抛 `_com_error` 或返回空）也退表槽位，只记 `buff_timer.log`，不影响功能。
+自建失败（任一步抛 `_com_error` 或返回空）也退表槽位，不影响功能。
 
 ## 5. 绘制方案
 
@@ -174,9 +175,14 @@ IWzGr2DLayer::Putcolor   (+224)  <- 0xFFFFFFFF                     ← 新层不
 
 - **origin = 图标层**（不是 Gr2D 中心）：这样客户端 `AdjustPosition` 每次重排整行时，标签自动跟着走，
   插件不需要自己算坐标。代价是 origin 会持有图标层的 COM 引用，**必须在 buff 消失时交还**（§6.3）。
-- **擦除 = `IWzCanvas::Create(cx, cy, empty, empty)`**（raw `+44`）：图层自己的画布原地重分配成空白，
-  对象不变、图层引用不变。这是客户端自己的复用方式（`CField_LimitedView::Init` `0x0055BC6C`、
-  `sub_537FDA` `0x005384AA` 都对成员画布调它）。数字变化时先擦后画，`10 → 9` 不会残留 `0`。
+- **换数字 = 换图层**：图层的画布**没法擦**（§6.2），所以数字一变就 `ClearLabelLayer`
+  旧的（交还 origin → `Putcolor(0)` → 释放引用）再建一个新的、重绑到同一个图标层，然后画字。
+  新建图层的画布天然是空的，`10 → 9` 不会残留 `0`。代价是每秒一次 `CreateLayer`（秒级档）/ 每分钟一次（分钟档），
+  实测无掉帧。
+- **深度要每帧跟**：`PutZ` 只在绑定时抄一次图标层的 `GetZ`，而 `CTemporaryStatView` 在**行重排**
+  （有 buff 到期）时会重新给剩下的图标分配深度 ⇒ 标签留在旧深度上会画到自己图标**背后**，数字看起来"消失"。
+  故 `Tick` 每帧比对图标层 `GetZ` 并跟随时重设（`SetLayerZ`），顺带把自己重新插到该深度的末尾、压在图标之上。
+  同理，客户端若给同一个 entry 换了图标层（刷新 buff 会），标签也必须重建。
 - **画字**：`DrawTextA(canvas, x, y, bstr, font, empty, empty)`；描边 = 黑字字体在 8 个邻位各画一遍，
   再画主体色一遍（BossHP 已验证的同一手法）。位置 `(buffTimerX, buffTimerY)`，并按图层宽高与字号钳制。
 - **分档与封顶**：`bufflength ≥ buffTimerMaxMinutes`（默认 10 分钟）→ 不显示；`≥ 1 分钟` → 绿色向上取整分钟；
@@ -192,13 +198,44 @@ IWzGr2DLayer::Putcolor   (+224)  <- 0xFFFFFFFF                     ← 新层不
 画上去的数字会同时出现在**所有** buff 图标上（实机：2 倍 drop 本来正确不显示，一用轻功就跟着变成 5）。
 `CUIToolTip::MakeLayer`（`0x008F3141`）传的是真实宽高，故不踩此坑。⇒ 自建层必须给真实尺寸。
 
-### 6.2 `RemoveCanvas` 是重画数字的死路
+### 6.2 图层的画布**擦不掉**：`RemoveCanvas` 是收尾、`Create` 会把渲染搞死
 
-`RemoveCanvas`（raw `+264`）把图层的画布**摘走**，下一次 `GetCanvas` 另建一块。实测：这样换过画布之后
-**图层整体不再渲染**（数字全部消失），且它还需要一个 variant 实参（客户端自己传 `(VT_I4)-2`，
-`0x007B44F4` 就是这么写的；传空 variant 会被判 `E_INVALIDARG`）。⇒ 擦除改用 `IWzCanvas::Create`（§5）。
+结论：**没有任何 API 能给一个已存在的图层换上一块新的空白画布**。唯一的空白画布是 `CreateLayer` 给的那块，
+所以数字一变就整层重建（§5）。两条弯路与证据：
 
-另：`GetCanvas`/`RemoveCanvas` 的包装都是「HRESULT < 0 就 `_com_issue_errorex`」，而 `_com_raise_error`
+**弯路一：`RemoveCanvas`（raw `+264`，variant 传 `(VT_I4)-2`）不是擦除，是拆层收尾。**
+它把画布从图层上摘掉，而 `GetCanvas` **不会按需补一块**——传 `(VT_I4)0` 也只会得到 null，永远。实测日志：
+
+```
+[draw] GetCanvas layer=2A062FE4 canvas=29A5F374 text=41   ← 摘之前拿得到
+[draw] RemoveCanvas layer=2A062FE4 removed=00000000       ← 返回值是 null：什么也没摘到
+[draw] layer 2A062FE4 has no canvas after the wipe
+[draw] GetCanvas layer=2A062FE4 canvas=00000000 …         ← 此后永远是 null
+```
+
+这正是"数字过一会儿就消失"的成因：分钟档只在**跨分钟**时重画，所以能活一分钟；秒级每秒都变，
+第一次重画就把画布摘没了；刷新 buff 同样是"文本变化"，所以刷新也救不回来。
+
+> 上一版文档把 `CUser::Update` `0x00931D4C`/`0x00931DEC` 读成了"每帧 Get→draw→Remove 的擦除循环"，
+> 是错的。那里的控制流是：`GetCanvas(0)` → **若返回 null** 才走 `RemoveCanvas(-2)`，即"画布已经没了，顺手清干净"；
+> 另一个调用点 `sub_5385E2` 更直白——整个函数就是拆层收尾（摘画布 + 清标志位）。
+> `CMob::ShowHPIndicator` `0x0066363B` 摘完画布立刻 `Animate` 重建帧画布，那是动画图层的路子，静态层没有对应物。
+
+**弯路二：`IWzCanvas::Create(cx, cy, empty, empty)`（raw `+44`）原地重分配也救不回来。**
+图层渲染的是它自己那块画布，`Create` 把它底下的内存重分配之后数字就不再出现（首版就是这么丢的）。
+复核了客户端的调用点：`CChatBalloon::CreateCanvas` `0x004890C4` 是 `PcCreateObject::IWzCanvas` **新建**一块画布
+再 `Create` 定尺寸，`CField_LimitedView::Init` `0x0055BC6C` 是在 `Init` 里对成员画布调一次（`0x13C`×`0x13C`）——
+**没有一个调用点是在"擦图层正在渲染的画布"**，所以它不能当擦除手法用。
+
+> **客户端自己怎么换数字（留给后续优化）**：`sub_7B44F4`（buff 图标自带的冷却数字，`0x007B4819` 写
+> `entry+0x38` 后调它）在数字变化时走的是
+> `RemoveCanvas(layer, (VT_I4)-2)` `0x007B46A6` → **`Animate(64, 210, 500)`** `0x007B4748`。
+> 也就是说 `RemoveCanvas` 之后**补画布的是 `Animate`**（和 `CMob::ShowHPIndicator` `0x0066363B`
+> 摘完画布立刻 `Animate` 是同一套）。本插件没走这条路：`Animate` 的参数同时是 500ms 的入场动画
+> （`0x40`=类型、`0xD2`=210、`0x1F4`=500，条目构造也是这一组），用在标签层上会连位移一起做，
+> 重建图层更直接、也没有动画副作用。真要省掉每秒一次 `CreateLayer` 时，可以从这里试。
+
+**顺带**：`GetCanvas`/`RemoveCanvas` 的包装都是「HRESULT < 0 就 `_com_issue_errorex`」，而 `_com_raise_error`
 （`0x00A605C3`）**抛 C++ `_com_error`**，客户端顶层会把它变成弹框（首版就是这么崩的：
 `0x80070057 E_INVALIDARG`）。本工程所有 Gr2D 调用都套 `try/catch(...)`，失败退化为"不显示数字"。
 
@@ -211,7 +248,7 @@ IWzGr2DLayer::Putcolor   (+224)  <- 0xFFFFFFFF                     ← 新层不
 - buff 消失时（`ResetTemporary` 只释放 entry、**exe 里没有 `RemoveLayer` 这种 API**）必须把标签层的 origin
   交还给 `IWzGr2D::GetCenter()`，否则标签层一直攥着图标层的引用 ⇒ 图标层析构不掉，**过期图标继续留在屏幕上**，
   而排版已经把它从行里去掉 ⇒ 旧图标与左移过来的图标重叠；要等新 buff 复用该槽位时才消失。
-  交还 origin 后再 `Putcolor(0)` 隐藏、擦净画布，把层留给下一个图标复用。
+  交还 origin 后 `Putcolor(0)` 隐藏即可——图层是插件自己建的，**再释放这一份引用它就没了**，不需要擦画布。
 
 ### 6.4 `get_x/get_y` 返回的是**解算后**位置
 
@@ -232,8 +269,10 @@ alpha 只影响淡入。同理 `Putcolor` 的 alpha 位有效（条目构造用 
 1. **HUD 整体隐藏时不跟随**：标签层是独立根图层，只继承坐标不继承图标的 alpha（§6.5）⇒ 客户端隐藏整行 buff
    时（切图/演出）数字可能仍可见。需要的话按 §6.5 的客户端手法给标签层做 alpha 镜像。
 2. **`CWvsContext::Update` 的调用频率**假定为每帧（`Tick` 内部按 100ms 自限流，不依赖帧率）。
-3. **数字与技能说明文字可能不一致**：本插件忠实显示服务端下发的时长（§3）；服务端的时长修正属服务端登记面。
-4. **地址族**：见页首提醒；换 exe 必须复核 §1 全表与 §2 偏移。
+3. **换数字要重建图层**（§5）：秒级档 = 每秒一次 `CreateLayer`，分钟档 = 每分钟一次；实机长时间挂机无掉帧，
+   但这是本特性唯一有量的资源开销。想省掉可试 §6.2 末尾的 `RemoveCanvas + Animate` 路线。
+4. **数字与技能说明文字可能不一致**：本插件忠实显示服务端下发的时长（§3）；服务端的时长修正属服务端登记面。
+5. **地址族**：见页首提醒；换 exe 必须复核 §1 全表与 §2 偏移。
 
 ## 8. 配置键（`config.ini` 的 `[optional]`）
 
@@ -248,4 +287,4 @@ alpha 只影响淡入。同理 `Putcolor` 的 alpha 位有效（条目构造用 
 | `buffTimerMinuteFont` / `SecondFont` / `OutlineFont` | `7` / `3` / `1` | 自建字体不可用时的表槽位 |
 | `buffTimerX` / `buffTimerY` | `4` / `17` | 文字锚点（32×32 图标画布内，左下附近） |
 
-`[debug] debug=true` 时 `buff_timer.log` 一直写（否则只写前若干条：报文 20 条、图标 300 行、绘制 60 行）。
+`[debug] debug=` 与本特性无关：绘制不写日志文件。
