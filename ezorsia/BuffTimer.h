@@ -17,7 +17,6 @@ public:
 	static int nOutlineColor;   // buffTimerOutlineColor
 	static int nOffsetX;        // buffTimerX          : text anchor inside the icon canvas
 	static int nOffsetY;        // buffTimerY
-	static bool bDebug;         // not a config key: mirrors [debug] debug= and drives buff_timer.log
 
 	// Called from the file-scope __fastcall thunks that Memory::SetHook installs.
 	static void CaptureDurations(void* pPacket);
@@ -28,7 +27,7 @@ private:
 	// GetLabelFont), so each role gets a font built with the requested size and colour.
 	enum { kFontMinute = 0, kFontSecond = 1, kFontOutline = 2, kFontRoleCount = 3 };
 
-	static void ParseDurations(void* pPacket, int* pnTriplets);
+	static void ParseDurations(void* pPacket);
 	static void HookTemporaryStatSet();
 	static void HookWvsContextUpdate();
 	//
@@ -36,17 +35,15 @@ private:
 	static void ForgetBuff(unsigned int dwId);
 	static int FindRemainingMs(unsigned int dwId);
 	//
-	// One label layer per buff icon; the client's own overlay layer is zero-sized and therefore has
-	// no canvas of its own to draw on.
-	static bool DrawLabel(void* pLayer, const char* sText, int nFontType, bool bErase, bool bLog);
+	// One label layer per buff icon. A layer's canvas cannot be cleared, so the layer is replaced
+	// whenever the number changes - see the rebuild in Tick.
+	static bool DrawLabel(void* pLayer, const char* sText, int nRole);
 	static void* CreateLabelLayer();
 	static void BindLabelLayer(void* pLayer, void* pIconLayer);
 	static bool SetLayerOrigin(void* pLayer, void* pOrigin);
-	static bool ReadLayerPos(void* pLayer, long* pnX, long* pnY);
-	static bool EraseCanvas(void* pLayer, bool bLog);
+	static bool SetLayerZ(void* pLayer, int nZ);
 	static void ClearLabelLayer(void* pLayer);
 	static void* GetFont(int nType);
 	static void* GetLabelFont(int nRole);
 	static void* CreateFont(int nSize, int nRgb);
-	static void Log(const char* sFormat, ...);
 };

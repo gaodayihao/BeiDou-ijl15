@@ -162,10 +162,16 @@ struct TRACKED_BUFF
 
 // One label layer per buff icon. The layer is ours (created with a real size so it owns a canvas),
 // its origin is the icon layer, and its position is (0,0), so the text lands on the icon itself.
+// pIconLayer is remembered because the client may hand the same entry a different icon layer when a
+// buff is refreshed, and the label is attached to that layer. nZ is the depth the label was last put
+// at, so Tick can notice the icon row re-packing. The layer is replaced - not wiped - whenever the
+// number changes: see the rebuild in Tick for why a blank canvas can only be had from a new layer.
 struct LABEL_LAYER
 {
 	void* pLayer;
 	void* pEntry;
+	void* pIconLayer;
+	int nZ;
 	char sText[8];
 	bool bSeen;
 };
@@ -174,10 +180,6 @@ static TRACKED_BUFF aTracked[nMaxTracked];
 static int nTrackedNext = 0;
 static LABEL_LAYER aLabels[nMaxIcons];
 static unsigned int dwLastTick = 0;
-static unsigned int dwCaptureCount = 0;
-
-// Every icon is logged until this runs out, so one short session is enough to diagnose a mismatch.
-static int nIconLogBudget = 300;
 
 bool BuffTimer::bEnabled = true;
 int BuffTimer::nMinuteFont = 7;
@@ -190,7 +192,6 @@ int BuffTimer::nSecondColor = 0xFFFF20;
 int BuffTimer::nOutlineColor = 0x000000;
 int BuffTimer::nOffsetX = 4;
 int BuffTimer::nOffsetY = 17;
-bool BuffTimer::bDebug = false;
 
 typedef void* (__fastcall* LayerGetCanvas_t)(void* pLayer, void* edx, void** ppCanvas, const void* pVariant);
 typedef int (__fastcall* LayerGetSize_t)(void* pLayer, void* edx);
@@ -198,14 +199,9 @@ typedef void* (__fastcall* Gr2DCreateLayer_t)(void* pGr2D, void* edx, void** ppL
 typedef void* (__fastcall* Gr2DGetCenter_t)(void* pGr2D, void* edx, void** ppCenter);
 typedef long(__stdcall* VectorPutOrigin_t)(void* pVector, VARIANTARG vOrigin);
 typedef long(__stdcall* VectorRawRelMove_t)(void* pVector, long nX, long nY, VARIANTARG vAttr1, VARIANTARG vAttr2);
-typedef long(__stdcall* VectorGetLong_t)(void* pVector, long* pnOut);
 typedef long(__stdcall* LayerPutZ_t)(void* pLayer, int nZ);
 typedef int (__fastcall* LayerGetZ_t)(void* pLayer, void* edx);
 typedef void (__fastcall* LayerPutColor_t)(void* pLayer, void* edx, unsigned long nColor);
-typedef int (__fastcall* CanvasGetSize_t)(void* pCanvas, void* edx);
-// IWzCanvas::Create(cx, cy, VARIANT, VARIANT): the two variants travel as pointers to the callee's
-// own copies, matching the tlh wrapper the client itself calls (0x0048ECA7).
-typedef long(__fastcall* CanvasCreate_t)(void* pCanvas, void* edx, int nCx, int nCy, const void* pV1, const void* pV2);
 typedef void* (__fastcall* ZListFindIndex_t)(void* pList, void* edx, unsigned int nIndex);
 typedef void* (__fastcall* BstrCtor_t)(void* pBstr, void* edx, const char* sText);
 typedef int (__fastcall* FontCalcTextWidth_t)(void* pFont, void* edx, void* pBstrData, const void* pVariant);
@@ -227,13 +223,10 @@ static auto _create_layer = reinterpret_cast<Gr2DCreateLayer_t>(dwIWzGr2D__Creat
 static auto _gr2d_get_center = reinterpret_cast<Gr2DGetCenter_t>(dwIWzGr2D__GetCenter);
 static auto _layer_get_z = reinterpret_cast<LayerGetZ_t>(dwIWzGr2DLayer__GetZ);
 static auto _layer_put_color = reinterpret_cast<LayerPutColor_t>(dwIWzGr2DLayer__Putcolor);
-static auto _canvas_get_cx = reinterpret_cast<CanvasGetSize_t>(dwIWzCanvas__Getcx);
-static auto _canvas_get_cy = reinterpret_cast<CanvasGetSize_t>(dwIWzCanvas__Getcy);
 static auto _zlist_find_index = reinterpret_cast<ZListFindIndex_t>(dwZList__FindIndex);
 static auto _bstr_ctor = reinterpret_cast<BstrCtor_t>(dwBstrCtor);
 static auto _font_calc_text_width = reinterpret_cast<FontCalcTextWidth_t>(dwIWzFont__CalcTextWidth);
 static auto _canvas_draw_text = reinterpret_cast<CanvasDrawTextA_t>(dwIWzCanvas__DrawTextA);
-static auto _canvas_create = reinterpret_cast<CanvasCreate_t>(dwIWzCanvas__Create);
 static auto _packet_decode_buffer = reinterpret_cast<PacketDecodeBuffer_t>(dwCInPacket__DecodeBuffer);
 static auto _packet_decode2 = reinterpret_cast<PacketDecode2_t>(dwCInPacket__Decode2);
 static auto _packet_decode4 = reinterpret_cast<PacketDecode4_t>(dwCInPacket__Decode4);
@@ -244,19 +237,16 @@ static auto _pc_create_font = reinterpret_cast<PcCreateFont_t>(dwPcCreateObject_
 static auto _font_init = reinterpret_cast<FontInit_t>(dwIWzFont__Init);
 static auto _zxstring_w_release = reinterpret_cast<ZXStringWRelease_t>(dwZXStringW__Release);
 
-// Diagnostics only, appended to buff_timer.log. Callers decide when a line is worth writing; the
-// first few labels always leave a trail so a fresh test needs no config change to be diagnosable.
-void BuffTimer::Log(const char* sFormat, ...) {
-	char sLine[512];
-	va_list args;
-	va_start(args, sFormat);
-	_vsnprintf_s(sLine, sizeof(sLine), _TRUNCATE, sFormat, args);
-	va_end(args);
-	FILE* pFile = nullptr;
-	if (fopen_s(&pFile, "buff_timer.log", "a") == 0 && pFile != nullptr) {
-		fprintf(pFile, "%s\n", sLine);
-		fclose(pFile);
-	}
+// WzGr2D addresses the canvas a layer call refers to with a VARIANT, and the client's own value is
+// the one to copy: GetCanvas is always called with (VT_I4)0 (CUIToolTip::MakeLayer 0x008F344F,
+// CUser::Update 0x00931D4C). The id selects the layer's one canvas - GetCanvas never makes a new
+// one, it answers null once the canvas is gone (see the rebuild in Tick).
+static VARIANTARG MakeCanvasIdVariant(long nId) {
+	VARIANTARG vId;
+	memset(&vId, 0, sizeof(vId));
+	vId.vt = VT_I4;
+	vId.lVal = nId;
+	return vId;
 }
 
 // The client's text APIs take a Ztl_bstr_t by value: what travels on the stack is the wrapper's
@@ -326,10 +316,7 @@ void* BuffTimer::CreateFont(int nSize, int nRgb) {
 			// the string's data pointer sits behind its 12-byte header, which is what _Release wants
 			_zxstring_w_release(reinterpret_cast<char*>(pClassName) - 12);
 		}
-		if (pFont == nullptr) {
-			Log("[font] size=%d rgb=0x%06X: no font object", nSize, nRgb & 0xFFFFFF);
-			return nullptr;
-		}
+		if (pFont == nullptr) return nullptr;
 
 		// Ztl_bstr_t is a single pointer too, and IWzFont::Init releases the one it is handed, so the
 		// slot must not be released here - the same shape as every text call in this file.
@@ -337,16 +324,9 @@ void* BuffTimer::CreateFont(int nSize, int nRgb) {
 		_stringpool_get_bstr(pPool, nullptr, &pFace, nFontFaceId);
 
 		_font_init(pFont, nullptr, pFace, nSize, nColor, g_pEmptyVariant);
-
-		Log("[font] built size=%d rgb=0x%06X -> %p", nSize, nRgb & 0xFFFFFF, pFont);
 		return pFont;
 	}
-	catch (_com_error& e) {
-		Log("[font] size=%d rgb=0x%06X failed hr=0x%08X", nSize, nRgb & 0xFFFFFF,
-			static_cast<unsigned int>(e.Error()));
-	}
 	catch (...) {
-		Log("[font] size=%d rgb=0x%06X failed", nSize, nRgb & 0xFFFFFF);
 	}
 	return nullptr;
 }
@@ -374,9 +354,6 @@ void* BuffTimer::GetLabelFont(int nRole) {
 	apFonts[nRole] = (nFontSize > 0) ? CreateFont(nFontSize, nRgb) : nullptr;
 	if (apFonts[nRole] == nullptr) {
 		apFonts[nRole] = GetFont(nSlot);
-		if (nFontSize > 0) {
-			Log("[font] role %d: custom font unavailable, using slot %d -> %p", nRole, nSlot, apFonts[nRole]);
-		}
 	}
 	return apFonts[nRole];
 }
@@ -426,55 +403,28 @@ int BuffTimer::FindRemainingMs(unsigned int dwId) {
 // Separated from CaptureDurations because SEH (__try/__except) and C++ EH (try/catch) cannot share
 // one function: the first guards against a bad pointer, the second against the ZException the
 // client's own Decode* raise on a short read. Neither may reach the client's top-level handler.
-void BuffTimer::ParseDurations(void* pPacket, int* pnTriplets) {
+void BuffTimer::ParseDurations(void* pPacket) {
 	try {
 		unsigned char aMask[16];
 		memset(aMask, 0, sizeof(aMask));
 		_packet_decode_buffer(pPacket, nullptr, aMask, sizeof(aMask));
-
-		// Diagnostics: the first few packets are logged whole, because a wrong field order shows up
-		// here as values that do not match the skill/item the buff came from. The raw bytes go in
-		// too, so the real layout can be read straight off the log even if it is not (2, 4, 4).
-		static int nPktCount = 0;
-		const bool bLogPkt = bDebug || (++nPktCount <= 20);
-		if (bLogPkt) {
-			const char* pData = *reinterpret_cast<const char**>(reinterpret_cast<char*>(pPacket) + nCInPacket__Data);
-			if (pData != nullptr) {
-				unsigned int nCursor = *reinterpret_cast<unsigned int*>(reinterpret_cast<char*>(pPacket) + nCInPacket__Cursor);
-				if (!IsBadReadPtr(pData + nCursor, 48)) {
-					char sHex[3 * 48 + 1];
-					for (int k = 0; k < 48; k++) {
-						sprintf_s(sHex + 3 * k, 4, "%02X ", static_cast<unsigned char>(pData[nCursor + k]));
-					}
-					Log("[pkt %d] raw@%u: %s", nPktCount, nCursor, sHex);
-				}
-			}
-			Log("[pkt %d] mask=%08X %08X %08X %08X", nPktCount,
-				*reinterpret_cast<unsigned int*>(aMask + 0),
-				*reinterpret_cast<unsigned int*>(aMask + 4),
-				*reinterpret_cast<unsigned int*>(aMask + 8),
-				*reinterpret_cast<unsigned int*>(aMask + 12));
-		}
 
 		// One triplet per set bit; the bits are consumed in the same order the client reads them,
 		// but the order does not matter here - id and duration are read together, so every triplet
 		// is self-consistent whichever bit it belongs to.
 		for (int i = 0; i < 128; i++) {
 			if ((aMask[i >> 3] & (1 << (i & 7))) == 0) continue;
-			unsigned int dwValue = _packet_decode2(pPacket, nullptr);
+			_packet_decode2(pPacket, nullptr); // value: not shown, the label is driven by the duration
 			unsigned int dwId = _packet_decode4(pPacket, nullptr);
 			unsigned int dwDuration = _packet_decode4(pPacket, nullptr);
 			// An item buff travels with a negated source id (StatEffect.applyBuffEffect sends
 			// `skill ? sourceid : -sourceid`) while the icon carries the positive one, so both sides
 			// have to be compared as magnitudes.
 			if ((dwId & 0x80000000u) != 0) dwId = 0u - dwId;
-			if (bLogPkt) Log("[pkt %d]   bit=%d value=%u id=%u duration=%u", nPktCount, i, dwValue, dwId, dwDuration);
 			RememberBuff(dwId, dwDuration);
-			(*pnTriplets)++;
 		}
 	}
 	catch (...) {
-		*pnTriplets = -1;
 	}
 }
 
@@ -483,20 +433,14 @@ void BuffTimer::CaptureDurations(void* pPacket) {
 	if (pPacket == nullptr || IsBadReadPtr(pPacket, nCInPacket__Cursor + sizeof(int))) return;
 
 	unsigned int dwSavedCursor = *reinterpret_cast<unsigned int*>(reinterpret_cast<char*>(pPacket) + nCInPacket__Cursor);
-	int nTriplets = 0;
 	__try {
-		ParseDurations(pPacket, &nTriplets);
+		ParseDurations(pPacket);
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
-		nTriplets = -1;
 	}
 
 	// hand the packet back exactly as it was found, the client parses it next
 	*reinterpret_cast<unsigned int*>(reinterpret_cast<char*>(pPacket) + nCInPacket__Cursor) = dwSavedCursor;
-
-	if (bDebug && (++dwCaptureCount <= 5 || (dwCaptureCount % 100) == 0)) {
-		Log("[%u] capture triplets=%d cursor=%u", dwCaptureCount, nTriplets, dwSavedCursor);
-	}
 }
 
 // ----- drawing ------------------------------------------------------------
@@ -525,42 +469,22 @@ void* BuffTimer::CreateLabelLayer() {
 		_create_layer(pGr2D, nullptr, &pLayer, 0, 0, nLabelLayerSize, nLabelLayerSize, nLabelLayerZ, aEmpty1, aEmpty2);
 	}
 	catch (...) {
-		Log("[label] CreateLayer failed");
 		return nullptr;
 	}
-	Log("[label] CreateLayer -> %p", pLayer);
 	return pLayer;
 }
 
 // Runs one binding step and survives its failure. Every Gr2D wrapper here raises a _com_error on a
-// failed HRESULT, and letting that escape would leave the layer half-bound with no way to tell which
-// call went wrong, so each step reports itself and the binding carries on.
-#define BIND_STEP(sName, ...) \
+// failed HRESULT, and letting that escape would leave the layer half-bound and kill the caller's
+// frame, so each step is guarded on its own and the binding carries on.
+#define BIND_STEP(...) \
 	do { \
 		try { \
-			Log("[label] bind step: %s", sName); \
 			__VA_ARGS__; \
 		} \
 		catch (...) { \
-			Log("[label] bind step %s threw", sName); \
 		} \
 	} while (0)
-
-// Reads a layer's position as the layer itself resolves it. get_x/get_y answer in the frame the
-// layer ends up drawn in, not in the frame its own origin defines, which is why a layer hung under
-// another one reports the parent's position and not (0,0).
-bool BuffTimer::ReadLayerPos(void* pLayer, long* pnX, long* pnY) {
-	void** pVtbl = *reinterpret_cast<void***>(pLayer);
-	if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__get_y + sizeof(void*))) return false;
-	try {
-		reinterpret_cast<VectorGetLong_t>(pVtbl[nVtbl_IWzVector2D__get_x / sizeof(void*)])(pLayer, pnX);
-		reinterpret_cast<VectorGetLong_t>(pVtbl[nVtbl_IWzVector2D__get_y / sizeof(void*)])(pLayer, pnY);
-		return true;
-	}
-	catch (...) {
-		return false;
-	}
-}
 
 // Points a layer's coordinate frame at another vector or layer. put_origin is a property put: it
 // hands the layer its own reference to the new origin, so whatever reference the caller used (an
@@ -580,7 +504,6 @@ bool BuffTimer::SetLayerOrigin(void* pLayer, void* pOrigin) {
 		return true;
 	}
 	catch (...) {
-		Log("[label] layer %p would not take origin %p", pLayer, pOrigin);
 		return false;
 	}
 }
@@ -595,11 +518,11 @@ void BuffTimer::BindLabelLayer(void* pLayer, void* pIconLayer) {
 	void** pVtbl = *reinterpret_cast<void***>(pLayer);
 	if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__raw_RelMove + sizeof(void*))) return;
 
-	BIND_STEP("put_origin", SetLayerOrigin(pLayer, pIconLayer));
+	BIND_STEP(SetLayerOrigin(pLayer, pIconLayer));
 
 	// raw_RelMove needs both VARIANTs spelled out: calling it with x/y alone leaves 32 bytes of
 	// garbage on the stack and the callee reads the empty slot as a pointer (see QuestBulb.cpp).
-	BIND_STEP("raw_RelMove", [&] {
+	BIND_STEP([&] {
 		VARIANTARG vAttr1;
 		VARIANTARG vAttr2;
 		memset(&vAttr1, 0, sizeof(vAttr1));
@@ -610,63 +533,43 @@ void BuffTimer::BindLabelLayer(void* pLayer, void* pIconLayer) {
 
 	// CreateLayer's fifth argument is not necessarily the depth (CWnd::CreateWnd sets the depth with
 	// PutZ afterwards), so match the icon layer explicitly: same depth, created later, drawn later.
-	BIND_STEP("PutZ", reinterpret_cast<LayerPutZ_t>(pVtbl[nVtbl_IWzGr2DLayer__PutZ / sizeof(void*)])
-		(pLayer, _layer_get_z(pIconLayer, nullptr)));
+	BIND_STEP(SetLayerZ(pLayer, _layer_get_z(pIconLayer, nullptr)));
 
 	// CUIToolTip::MakeLayer ends with exactly this call, and it is the difference between a layer that
 	// renders and one that does not: CreateLayer leaves the layer colour at zero, so without it the
 	// label would be drawn onto an invisible layer.
-	BIND_STEP("Putcolor", _layer_put_color(pLayer, nullptr, 0xFFFFFFFFu));
-
-	long lIconX = 0, lIconY = 0, lLayerX = 0, lLayerY = 0;
-	ReadLayerPos(pIconLayer, &lIconX, &lIconY);
-	ReadLayerPos(pLayer, &lLayerX, &lLayerY);
-	Log("[label] bind layer=%p icon=%p icon xy=(%d,%d) z=%d | layer xy=(%d,%d) z=%d",
-		pLayer, pIconLayer, lIconX, lIconY, _layer_get_z(pIconLayer, nullptr),
-		lLayerX, lLayerY, _layer_get_z(pLayer, nullptr));
+	BIND_STEP(_layer_put_color(pLayer, nullptr, 0xFFFFFFFFu));
 }
 
 #undef BIND_STEP
 
-// Wipes the layer's canvas so the next digit does not sit on top of the previous one. The canvas is
-// the drawing surface, not a buffer to clear, and the client never rubs text out: every path that
-// redraws a layer either covers the whole canvas again (CField::ShowMobHPTag) or re-allocates it with
-// IWzCanvas::Create and draws from scratch (CField_LimitedView::Init). The layer keeps the same
-// canvas object either way, which matters - swapping the object out is what makes a layer stop
-// showing anything at all.
-bool BuffTimer::EraseCanvas(void* pLayer, bool bLog) {
+// Copies the icon's depth onto the label, and re-inserts the label at the end of that depth, so it
+// stays above the icon it belongs to. Depth is the one attachment the client does not keep in sync
+// for us: put_origin carries the label along when the row slides, but Z is a plain number read at
+// bind time, and CTemporaryStatView re-assigns it whenever the row re-packs because a buff ran out.
+// A label left at the old depth draws behind its own icon, so the digits are simply not visible any
+// more - not on the next redraw, and not after a re-buff either.
+bool BuffTimer::SetLayerZ(void* pLayer, int nZ) {
+	void** pVtbl = *reinterpret_cast<void***>(pLayer);
+	if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzGr2DLayer__PutZ + sizeof(void*))) return false;
 	try {
-		void* pCanvas = nullptr;
-		_layer_get_canvas(pLayer, nullptr, &pCanvas, g_pEmptyVariant);
-		if (pCanvas == nullptr) return false;
-
-		const int nWidth = _layer_get_width(pLayer, nullptr);
-		const int nHeight = _layer_get_height(pLayer, nullptr);
-		const long lResult = _canvas_create(pCanvas, nullptr, nWidth, nHeight, g_pEmptyVariant, g_pEmptyVariant);
-		if (bLog || lResult < 0) {
-			Log("[draw] canvas %p recreated %dx%d hr=0x%08X", pCanvas, nWidth, nHeight,
-				static_cast<unsigned int>(lResult));
-		}
-		ReleaseComPtr(pCanvas);
-		return lResult >= 0;
-	}
-	catch (_com_error& e) {
-		Log("[draw] canvas Create on layer %p failed hr=0x%08X", pLayer, static_cast<unsigned int>(e.Error()));
+		reinterpret_cast<LayerPutZ_t>(pVtbl[nVtbl_IWzGr2DLayer__PutZ / sizeof(void*)])(pLayer, nZ);
+		return true;
 	}
 	catch (...) {
-		Log("[draw] canvas Create on layer %p failed", pLayer);
+		return false;
 	}
-	return false;
 }
 
-// Blanks and hides the layer, and hands its origin back to the Gr2D centre - the origin the client
-// gives the icon layers themselves (entry ctor 0x007B3176). Until that origin stops pointing at the
-// icon layer, this label holds a reference to it, the client's own release cannot free it, and an
-// expired icon stays drawn over the icons that the row has shifted up. The layer itself stays around
-// to be bound to whatever icon shows up next.
+// Takes a label layer off the screen for good: hands its origin back to the Gr2D centre - the origin
+// the client gives the icon layers themselves (entry ctor 0x007B3176) - turns it invisible, and drops
+// the caller's reference, which is what frees it (there is no RemoveLayer API in the exe; a Gr2D
+// layer lives exactly as long as its references). Handing the origin back first matters even though
+// the layer is going away: until that origin stops pointing at the icon layer, this label holds a
+// reference to it, the client's own release cannot free it, and an expired icon stays drawn over the
+// icons the row has shifted up.
 void BuffTimer::ClearLabelLayer(void* pLayer) {
 	if (pLayer == nullptr) return;
-	EraseCanvas(pLayer, false);
 	try {
 		void* pGr2D = *reinterpret_cast<void**>(dwGr2DInstance);
 		void* pCenter = nullptr;
@@ -679,31 +582,22 @@ void BuffTimer::ClearLabelLayer(void* pLayer) {
 	}
 	catch (...) {
 	}
+	ReleaseComPtr(pLayer);
 }
 
-// One attempt at putting sText on the layer's canvas. bErase wipes that canvas first. nRole picks the
-// font (minutes, seconds or the black outline), see GetLabelFont.
-bool BuffTimer::DrawLabel(void* pLayer, const char* sText, int nRole, bool bErase, bool bLog) {
+// One attempt at putting sText on the layer's canvas. nRole picks the font (minutes, seconds or the
+// black outline), see GetLabelFont. The caller hands over a layer that has just been created, so its
+// canvas is blank: nothing here has to clear anything, and nothing may - see Tick.
+bool BuffTimer::DrawLabel(void* pLayer, const char* sText, int nRole) {
 	try {
-		// Nothing on the canvas yet only for the first label of a freshly bound layer; once a digit is
-		// there, the canvas has to be wiped before the new one is drawn, or a shorter number leaves
-		// the tail of the longer one behind. A wipe that fails must not fall through to the draw: the
-		// stale number is left alone until the next redraw instead of being overdrawn.
-		if (bErase && !EraseCanvas(pLayer, bLog)) {
-			Log("[draw] could not wipe layer %p, leaving the number as it is", pLayer);
-			return false;
-		}
-
+		const VARIANTARG vZero = MakeCanvasIdVariant(0);
 		void* pCanvas = nullptr;
-		_layer_get_canvas(pLayer, nullptr, &pCanvas, g_pEmptyVariant);
-		if (bLog) Log("[draw] GetCanvas layer=%p canvas=%p erase=%d text=%s", pLayer, pCanvas, bErase ? 1 : 0, sText);
+		_layer_get_canvas(pLayer, nullptr, &pCanvas, &vZero);
 		if (pCanvas == nullptr) return false; // nothing to draw on; the label is skipped, not forced
 
 		void* pFont = GetLabelFont(nRole);
 		void* pOutline = GetLabelFont(kFontOutline);
-		if (bLog) Log("[draw] fonts role=%d font=%p outline=%p", nRole, pFont, pOutline);
 		if (pFont == nullptr) {
-			Log("[draw] no font for role %d, text=%s", nRole, sText);
 			ReleaseComPtr(pCanvas);
 			return false;
 		}
@@ -726,24 +620,17 @@ bool BuffTimer::DrawLabel(void* pLayer, const char* sText, int nRole, bool bEras
 		}
 		if (nY < 0) nY = 0;
 
-		if (bLog) Log("[draw] layer=%dx%d x=%d y=%d w=%d canvas=%dx%d", nLayerWidth, nLayerHeight, nX, nY, nWidth,
-			_canvas_get_cx(pCanvas, nullptr), _canvas_get_cy(pCanvas, nullptr));
-
 		if (pOutline != nullptr) {
 			for (int i = 0; i < 8; i++) {
 				DrawTextOnePass(pCanvas, nX + aTextOutlineOffset[i][0], nY + aTextOutlineOffset[i][1], sText, pOutline);
 			}
 		}
-		unsigned int nDrawn = DrawTextOnePass(pCanvas, nX, nY, sText, pFont);
+		DrawTextOnePass(pCanvas, nX, nY, sText, pFont);
 		ReleaseComPtr(pCanvas);
-
-		if (bLog) Log("[draw] ok text=%s role=%d erase=%d drawn=%u layer=%dx%d x=%d y=%d w=%d",
-			sText, nRole, bErase ? 1 : 0, nDrawn, nLayerWidth, nLayerHeight, nX, nY, nWidth);
 		return true;
 	}
 	catch (...) {
 		// Never let a failed COM call reach the client's top-level handler: skip the label instead.
-		Log("[draw] COM call failed (erase=%d text=%s layer=%p)", bErase ? 1 : 0, sText, pLayer);
 		return false;
 	}
 }
@@ -782,21 +669,15 @@ void BuffTimer::Tick(void* pWvsContext) {
 
 		int nRemaining = FindRemainingMs(dwKey);
 
-		// Diagnostics: what each icon is paired with. A label that never moves shows up here as a
-		// remaining value that keeps getting refreshed, or as a key that does not belong to the icon.
-		if (nIconLogBudget > 0) {
-			nIconLogBudget--;
-			Log("[icon %d] ptr=%p type=%d id=%d key=%u remaining=%d", i, pEntry, nType, nId, dwKey, nRemaining);
-		}
-
-		if (nRemaining <= 0) continue;
-
 		// Long buffs get no number at all: a countdown that starts in the forties is noise, and the
 		// official client does not show one either. nMaxMinutes <= 0 lifts the cap back to an hour.
 		const unsigned int nCapMs = (nMaxMinutes > 0)
 			? static_cast<unsigned int>(nMaxMinutes) * nMinuteMs
 			: nHourMs;
-		if (static_cast<unsigned int>(nRemaining) >= nCapMs) continue;
+		if (nRemaining <= 0 || static_cast<unsigned int>(nRemaining) >= nCapMs) {
+			// No number for this icon; the sweep below drops whatever label it had.
+			continue;
+		}
 
 		char sText[8];
 		int nRole;
@@ -821,41 +702,71 @@ void BuffTimer::Tick(void* pWvsContext) {
 			for (int j = 0; j < nMaxIcons; j++) {
 				if (aLabels[j].pEntry == nullptr && !aLabels[j].bSeen) { nSlot = j; break; }
 			}
-			if (nSlot >= 0) {
-				void* pIconLayer = *reinterpret_cast<void**>(reinterpret_cast<char*>(pEntry) + nTempStat__Icon);
-				void* pLayer = aLabels[nSlot].pLayer;
-				if (pLayer == nullptr) pLayer = CreateLabelLayer();
-				if (pLayer == nullptr || pIconLayer == nullptr || IsBadReadPtr(pIconLayer, sizeof(void*))) {
-					aLabels[nSlot].bSeen = true; // do not let another icon in this tick take the slot
-					continue;
-				}
-				BindLabelLayer(pLayer, pIconLayer);
-				aLabels[nSlot].pLayer = pLayer;
-				aLabels[nSlot].pEntry = pEntry;
-				aLabels[nSlot].sText[0] = 0; // nothing was drawn on this layer for this icon yet
-			}
+			if (nSlot >= 0) aLabels[nSlot].pEntry = pEntry; // the layer comes with the first draw
 		}
 		if (nSlot < 0) continue;
 
 		aLabels[nSlot].bSeen = true;
-		if (strcmp(aLabels[nSlot].sText, sText) != 0) {
-			static int nDrawCount = 0;
-			const bool bLog = bDebug || (++nDrawCount <= 60);
-			// Nothing on the canvas yet only for the first label of a freshly bound layer.
-			const bool bErase = (aLabels[nSlot].sText[0] != 0);
-			if (DrawLabel(aLabels[nSlot].pLayer, sText, nRole, bErase, bLog)) {
-				strncpy_s(aLabels[nSlot].sText, sText, _TRUNCATE);
+
+		// The client can hand the same entry a different icon layer (a refreshed buff does this), and
+		// the label is attached to that layer as much as drawn onto it: the label has to be rebuilt.
+		void* pIconLayer = *reinterpret_cast<void**>(reinterpret_cast<char*>(pEntry) + nTempStat__Icon);
+		if (pIconLayer == nullptr || IsBadReadPtr(pIconLayer, sizeof(void*))) continue;
+
+		const bool bTextChanged = (strcmp(aLabels[nSlot].sText, sText) != 0);
+		const bool bIconChanged = (pIconLayer != aLabels[nSlot].pIconLayer);
+
+		// Nothing to redraw: keep the layer, but follow the icon's depth. The row re-packs whenever a
+		// buff runs out, and that re-assigns the depth of every icon left in it. put_origin drags the
+		// label along with its icon, but the depth is a number this side owns: left alone it goes
+		// stale, the label ends up behind its own icon, and the digits stop being visible even though
+		// everything below keeps redrawing them.
+		if (!bTextChanged && !bIconChanged) {
+			const int nIconZ = _layer_get_z(pIconLayer, nullptr);
+			if (nIconZ != aLabels[nSlot].nZ) {
+				SetLayerZ(aLabels[nSlot].pLayer, nIconZ);
+				aLabels[nSlot].nZ = nIconZ;
 			}
+			continue;
+		}
+
+		// A new number needs a canvas with nothing on it, and the only blank canvas a layer ever has
+		// is the one it was created with. IWzCanvas::Create re-allocates the very surface the layer is
+		// rendering (the digits stop appearing), and RemoveCanvas(-2) is the client's *teardown* call,
+		// not an erase - GetCanvas answers null for good once it has run (CUser::Update
+		// 0x00931D4C/0x00931DEC only reaches it when GetCanvas has already returned null, and
+		// sub_5385E2 is the same reset on the way out). The client's own cooldown digit pairs the
+		// removal with Animate (sub_7B44F4 0x007B46A6/0x007B4748), which rebuilds the canvas but also
+		// plays a 500ms entrance animation, so a fresh layer is the simpler equivalent. That is what
+		// made the numbers disappear as soon as their value changed, so the label is rebuilt instead:
+		// one CreateLayer per number that changes, i.e. once a second for a second-tier buff.
+		ClearLabelLayer(aLabels[nSlot].pLayer);
+		aLabels[nSlot].pLayer = nullptr;
+		aLabels[nSlot].pIconLayer = nullptr;
+		aLabels[nSlot].nZ = 0;
+		aLabels[nSlot].sText[0] = 0;
+
+		void* pLayer = CreateLabelLayer(); // the slot stays claimed by the entry, so a failure retries
+		if (pLayer == nullptr) continue;
+		BindLabelLayer(pLayer, pIconLayer);
+		aLabels[nSlot].pLayer = pLayer;
+		aLabels[nSlot].pIconLayer = pIconLayer;
+		aLabels[nSlot].nZ = _layer_get_z(pIconLayer, nullptr);
+
+		if (DrawLabel(pLayer, sText, nRole)) {
+			strncpy_s(aLabels[nSlot].sText, sText, _TRUNCATE);
 		}
 	}
 
 	// Icons that vanished this tick must not keep a cached label: the same address may come back.
 	for (int i = 0; i < nMaxIcons; i++) {
 		if (!aLabels[i].bSeen && aLabels[i].pEntry != nullptr) {
-			// The buff is gone: blank the canvas so the number cannot outlive its icon, and keep the
-			// layer around to be bound to whatever icon shows up next.
+			// The buff is gone: take the number off the screen with its layer.
 			ClearLabelLayer(aLabels[i].pLayer);
+			aLabels[i].pLayer = nullptr;
 			aLabels[i].pEntry = nullptr;
+			aLabels[i].pIconLayer = nullptr;
+			aLabels[i].nZ = 0;
 			aLabels[i].sText[0] = 0;
 		}
 	}

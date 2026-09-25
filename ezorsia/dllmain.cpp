@@ -119,7 +119,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			BuffTimer::nOutlineColor = reader.GetInteger("optional", "buffTimerOutlineColor", 0x000000);
 			BuffTimer::nOffsetX = reader.GetInteger("optional", "buffTimerX", 4);
 			BuffTimer::nOffsetY = reader.GetInteger("optional", "buffTimerY", 17);
-			BuffTimer::bDebug = Client::debug; // diagnostics follow the existing [debug] debug= switch
 				}
 
 		Hook_CreateMutexA(true); //multiclient //ty darter, angel, and alias!
