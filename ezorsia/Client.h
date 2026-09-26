@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 class Client
 {
 public:
@@ -44,4 +44,5 @@ public:
 	static int serverIP_Port;
 	static bool talkRepeat;
 	static int talkTime;
+	static bool comboOrbDistinct; // 斗气集中：5 个斗气球各用一张 state 贴图（原版相邻两球位共用一张）
 };

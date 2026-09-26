@@ -447,3 +447,15 @@ const DWORD dwLoginFindIDBtn = 0x00620735;
 const DWORD dwLoginSaveIDBtn = 0x006206BE;
 const DWORD dwLoginWebHomeBtn = 0x006208A0;
 const DWORD dwLoginWebRegisterBtn = 0x00620829;
+
+// ===== Combo Attack (3rd job warrior) combo orb sprites =====
+// CUser::OnTemporaryStatChanged keeps 10 orb slots for the COMBO temporary stat and derives each
+// slot's sprite as Skill/<job>.img/skill/<id>/state/((i + 1) / 2) - an *integer* division, so two
+// neighbouring slots share one picture and a 5-orb bar can only ever show three of them. The site
+// the code cave replaces is exactly that division:
+//   0093D594   99 2B C2 D1 F8   cdq / sub eax,edx / sar eax,1        (5 bytes, one jmp)
+// The cave answers state/(i <= 5 ? i : i - 5), so the five slots of the normal ring each get their
+// own picture while the upper five keep reading indices the wz actually ships (state/0..5).
+// Reverse-engineering record: docs/客户端逆向-斗气球贴图.md
+const DWORD dwComboOrbStateIdx = 0x0093D594;
+const DWORD dwComboOrbStateIdxRetn = 0x0093D599;	// mov [ebp-0x10], eax : stores the sprite index

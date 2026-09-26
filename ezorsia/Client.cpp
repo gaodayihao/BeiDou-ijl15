@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 #include "AddyLocations.h"
 #include "codecaves.h"
 #include "FixIme.h"
@@ -30,6 +30,7 @@ std::string Client::ServerIP_AddressFromINI = "127.0.0.1"; // 服务器IP地址
 int Client::serverIP_Port = 8484; // 服务器端口
 bool Client::talkRepeat = false; // 重复说话
 int Client::talkTime = 2000; // 说话间隔时间
+bool Client::comboOrbDistinct = true; // 斗气集中：5 个斗气球各用一张 state 贴图
 
 void Client::UpdateGameStartup() {
 	//Memory::CodeCave(cc0x0044E550, dw0x0044E550, dw0x0044E550Nops); //run from packed client //skip //sub_44E546
@@ -138,6 +139,13 @@ void Client::UpdateGameStartup() {
 
 	//optional non-resolution related stuff
 	if (useTubi) { Memory::FillBytes(0x00485C32, 0x90, 2); }
+
+	// 斗气集中：球位→贴图下标原版是 (i+1)/2（整数除法），相邻两个球位撞同一张图，
+	// 5 个斗气球只出现 3 种图案。改成 i <= 5 ? i : i - 5，5 个球位各用一张图。
+	// 站点、字节与放弃方案见 AddyLocations.h / docs/客户端逆向-斗气球贴图.md。
+	if (comboOrbDistinct) {
+		Memory::CodeCave(ComboOrbStateIndex, dwComboOrbStateIdx, 5);
+	}
 
 	Memory::WriteInt(0x0077E055 + 1, 2147483646); // 物攻PAD 相关具体不明，默认值1999，int 4字节
 	Memory::WriteInt(0x0077E12F + 1, 2147483646); // 技能 相关具体不明，默认值1999，int 4字节

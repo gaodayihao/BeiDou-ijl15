@@ -1664,3 +1664,21 @@ __declspec(naked) void skillToolTipNew()
 		jmp skillToolTipNewRtn
 	}
 }
+
+// Combo Attack orbs: pick the state/N sprite by orb slot.
+//   in : eax = i + 1      (i = orb slot, 1..10)
+//   out: eax = i <= 5 ? i : i - 5      (slots 1..5 and 6..10 both read state/1..5)
+// The stock code divided by two, so two neighbouring slots shared one picture and a 5-orb bar
+// could only show state/1,1,2,2,3. Site bytes and discarded alternatives:
+// docs/客户端逆向-斗气球贴图.md
+__declspec(naked) void ComboOrbStateIndex()
+{
+	__asm {
+		dec eax
+		cmp eax, 5
+		jle comboOrbIdxKeep
+		sub eax, 5
+comboOrbIdxKeep:
+		jmp dword ptr[dwComboOrbStateIdxRetn]
+	}
+}

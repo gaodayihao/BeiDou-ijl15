@@ -100,6 +100,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			Client::climbSpeed = reader.GetFloat("optional", "climbSpeed", 1.0);
 			Client::talkRepeat = reader.GetBoolean("optional", "talkRepeat", false);
 			Client::talkTime = reader.GetInteger("optional", "talkTime", 2000);
+			Client::comboOrbDistinct = reader.GetBoolean("optional", "comboOrbDistinct", true);
 			fixMobLatch = reader.GetBoolean("optional", "fixMobLatch", true);
 			BossHP::bShowPercent = reader.GetBoolean("optional", "bossHpPercent", true);
 			BossHP::bShowText = reader.GetBoolean("optional", "bossHpText", true);
