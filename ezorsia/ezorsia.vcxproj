@@ -205,6 +205,7 @@
     <ClInclude Include="INIReader.h" />
     <ClInclude Include="LatchFix.h" />
     <ClInclude Include="NewCharEquipFix.h" />
+    <ClInclude Include="ItemWndExpanded.h" />
     <ClInclude Include="Memory.h" />
     <ClInclude Include="NMCO.h" />
     <ClInclude Include="SelectCharMacFix.h" />
@@ -225,6 +226,7 @@
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="LatchFix.cpp" />
     <ClCompile Include="NewCharEquipFix.cpp" />
+    <ClCompile Include="ItemWndExpanded.cpp" />
     <ClCompile Include="Memory.cpp" />
     <ClCompile Include="NMCO.cpp" />
     <ClCompile Include="SelectCharMacFix.cpp" />

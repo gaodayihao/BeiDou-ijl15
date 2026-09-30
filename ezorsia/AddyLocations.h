@@ -459,3 +459,43 @@ const DWORD dwLoginWebRegisterBtn = 0x00620829;
 // Reverse-engineering record: docs/客户端逆向-斗气球贴图.md
 const DWORD dwComboOrbStateIdx = 0x0093D594;
 const DWORD dwComboOrbStateIdxRetn = 0x0093D599;	// mov [ebp-0x10], eax : stores the sprite index
+
+// ===== Item window: open in the expanded ("flat", every tab at once) layout by default =====
+// CUIItem keeps its whole layout mode in one field, CUIItem+604h: 0 = the narrow window with a
+// scrollbar, 1 = the wide window that draws every tab side by side. CUIItem::CUIItem fills it once
+// from CConfig::GetInventoryExpanded, and OnCreate / Draw / GetItemSlotRect / GetSlotPositionFromPoint
+// / OnTabChanged all read that same field - one value at the source decides the entire layout:
+//   0081C4BE  E8 17 31 C8 FF        call CConfig::GetInventoryExpanded
+//   0081C4C3  89 86 04 06 00 00     mov  [esi+604h], eax
+// That getter asks the per-character game-option registry key for "InventoryExpanded" and hands
+// CConfig::GetOpt_BOOL a hard-coded default for the case where the value is absent:
+//   0049F603  6A 00                push 0        ; the default - 0 = narrow
+//   0049F605  50                   push eax      ; "InventoryExpanded"
+//   0049F606  6A 02                push 2        ; game-option key
+//   0049F608  8B CE                mov  ecx, esi
+//   0049F60A  E8 CC F7 FF FF       call CConfig::GetOpt_BOOL
+// The absent case is the normal one: CConfig::SaveCharacter enumerates every value of that key,
+// deletes them all and writes back only its own list, which does not contain InventoryExpanded - so
+// a click on the window's expand button never survives to the next session and this default is what
+// actually decides a fresh session.
+// Reverse-engineering record: docs/客户端逆向-背包默认展平.md
+const DWORD dwInvExpandedDefaultPush = 0x0049F603;	// "push 0": opcode + the default value byte
+const DWORD dwInvExpandedDefaultValue = 0x0049F604;	// the imm8 carrying that default value
+const DWORD dwInvExpandedGetOptCall = 0x0049F60A;	// call CConfig::GetOpt_BOOL (0x0049EDDB)
+
+// The two CConfig accessors of that one value - both look up the same StringPool id 4503 (1197h)
+// right after their exception prologue, which is what identifies them. The setter is the one the
+// expand/collapse button ends up in (CUIItem::OnButtonClicked -> sub_81E541 -> 0x0049F62C).
+const DWORD dwInvExpandedGet = 0x0049F5DA;	// CConfig::GetInventoryExpanded
+const DWORD dwInvExpandedSet = 0x0049F62C;	// sub_49F62C: the matching setter
+
+// CConfig::SaveCharacter: the only place in the whole client that calls RegEnumValueA and
+// RegDeleteValueA (one xref each). It wipes the per-character game-option key and rewrites only its
+// own option list, which is why "InventoryExpanded" does not survive an exit:
+//   0049DA62  FF 34 81              push [ecx+eax*4]      ; value name
+//   0049DA65  FF B6 C8 00 00 00     push [esi+0C8h]       ; game-option key = CConfig+0xC8
+//   0049DA6B  FF 15 B8 05 BF 00     call RegDeleteValueA
+// Callers: CWvsContext::OnLeaveGame (exit), CUIGameOpt::SetRet (option dialog OK),
+// CUIStatusBar::OnCreate, CConfig::~CConfig.
+const DWORD dwSaveCharacter = 0x0049D90D;	// CConfig::SaveCharacter
+const int OFF_CConfig_GameOptKey = 0xC8;	// HKEY, the offset the wipe site pushes
