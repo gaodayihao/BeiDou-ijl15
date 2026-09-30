@@ -48,6 +48,22 @@
 // up to ms). The cursor at CInPacket+0x14 is saved and put back, so the client parses the packet
 // exactly as if this hook were not there.
 //
+// --- when the labels go away ---------------------------------------------
+// A label hangs off its icon layer through put_origin, which holds a COM reference to that layer.
+// The client empties the whole buff row in one go when the player leaves the game:
+//
+//   CWvsContext::OnLeaveGame                0x00A041FF  the way out of the game
+//     -> CTemporaryStatView::Clear          0x00A04695  releases every entry of the row
+//        -> sub_7B4CE3                      0x007B4CE3  the per-entry release
+//   set_stage                               0x00777347  calls OnLeaveGame whenever the target
+//                                                       stage is not a field stage (0x777494)
+//
+// Every "back to the login screen" path arrives there - UI_Menu 0x00A0680F, ReturnToTitle
+// 0x00A246AB (which is what the quit menu item runs), the cash-shop/ITC stage switches - and so
+// does the client's own teardown. A label left attached to its icon layer keeps that layer alive
+// through the release, and on the login screen nothing cleans up afterwards: Tick is driven from
+// CWvsContext::Update (0x00A03350), whose only caller is CField::Update (0x00531B8D).
+//
 // --- colour ---------------------------------------------------------------
 // get_basic_font (0x0098A707) has 56 FONT_TYPE slots; the call that builds each one carries a literal
 // ARGB colour (and size/typeface), so the slot, not the draw call, picks the colour. Slots this
@@ -57,6 +73,7 @@
 
 const DWORD dwCWvsContext__OnTemporaryStatSet = 0x00A202BE;
 const DWORD dwCWvsContext__Update = 0x00A03350;
+const DWORD dwCWvsContext__OnLeaveGame = 0x00A041FF;
 const DWORD dwCInPacket__DecodeBuffer = 0x00432257;
 const DWORD dwCInPacket__Decode2 = 0x0042470C;
 const DWORD dwCInPacket__Decode4 = 0x00406629;
@@ -573,7 +590,13 @@ void BuffTimer::ClearLabelLayer(void* pLayer) {
 	try {
 		void* pGr2D = *reinterpret_cast<void**>(dwGr2DInstance);
 		void* pCenter = nullptr;
-		_gr2d_get_center(pGr2D, nullptr, &pCenter);
+		// GetCenter is a thiscall on the global Gr2D. There is nothing to hand the origin back to
+		// without one, and this runs from OnLeaveGame too - a path that also runs on the way out of
+		// the client, where the global is the first thing that can go. CreateLabelLayer guards the
+		// same read; the layer itself is still released either way.
+		if (pGr2D != nullptr && !IsBadReadPtr(pGr2D, sizeof(void*))) {
+			_gr2d_get_center(pGr2D, nullptr, &pCenter);
+		}
 		if (pCenter != nullptr) {
 			SetLayerOrigin(pLayer, pCenter);
 			ReleaseComPtr(pCenter); // ours; the layer kept its own
@@ -583,6 +606,31 @@ void BuffTimer::ClearLabelLayer(void* pLayer) {
 	catch (...) {
 	}
 	ReleaseComPtr(pLayer);
+}
+
+// Called when the client drops the buff row wholesale, i.e. when the player leaves the game
+// (CWvsContext::OnLeaveGame -> CTemporaryStatView::Clear). Every label layer holds its icon layer
+// as its origin, and Clear only releases the entry's own reference: while a label is still attached
+// the icon layer is never freed and the icon keeps being drawn. On the login screen the sweep at
+// the end of Tick cannot help either, because Tick is driven from CField::Update - so the icons
+// stay on top of the login screen for good. Handing the origins back here is what lets the icons go
+// away with the row. The client may call OnLeaveGame more than once per exit (UI_Menu calls it both
+// through set_stage and directly), so this has to be safe to repeat.
+void BuffTimer::ForgetAll() {
+	for (int i = 0; i < nMaxIcons; i++) {
+		ClearLabelLayer(aLabels[i].pLayer);
+		aLabels[i].pLayer = nullptr;
+		aLabels[i].pEntry = nullptr;
+		aLabels[i].pIconLayer = nullptr;
+		aLabels[i].nZ = 0;
+		aLabels[i].sText[0] = 0;
+		aLabels[i].bSeen = false;
+	}
+
+	// The remembered durations belong to the buffs that just went away. Keeping them would let a
+	// buff used after re-entering the game start its countdown where the old one stopped.
+	for (int i = 0; i < nMaxTracked; i++) aTracked[i].dwId = 0;
+	nTrackedNext = 0;
 }
 
 // One attempt at putting sText on the layer's canvas. nRole picks the font (minutes, seconds or the
@@ -778,6 +826,8 @@ static void(__fastcall* _WvsContext__OnTemporaryStatSet)(void* pThis, void* edx,
 	reinterpret_cast<void(__fastcall*)(void*, void*, void*)>(dwCWvsContext__OnTemporaryStatSet);
 static void(__fastcall* _WvsContext__Update)(void* pThis, void* edx) =
 	reinterpret_cast<void(__fastcall*)(void*, void*)>(dwCWvsContext__Update);
+static int(__fastcall* _WvsContext__OnLeaveGame)(void* pThis, void* edx) =
+	reinterpret_cast<int(__fastcall*)(void*, void*)>(dwCWvsContext__OnLeaveGame);
 
 static void __fastcall WvsContext__OnTemporaryStatSet_Hook(void* pThis, void* edx, void* pPacket) {
 	BuffTimer::CaptureDurations(pPacket); // the triplet it needs is still unread in the packet
@@ -789,6 +839,13 @@ static void __fastcall WvsContext__Update_Hook(void* pThis, void* edx) {
 	BuffTimer::Tick(pThis); // the client has just updated the buff row, so it is safe to draw into it
 }
 
+// Ahead of the original, not behind it: the labels are the only thing keeping the icon layers this
+// call is about to release alive, so their references have to be gone first.
+static int __fastcall WvsContext__OnLeaveGame_Hook(void* pThis, void* edx) {
+	BuffTimer::ForgetAll();
+	return _WvsContext__OnLeaveGame(pThis, edx);
+}
+
 void BuffTimer::HookTemporaryStatSet() {
 	Memory::SetHook(true, reinterpret_cast<void**>(&_WvsContext__OnTemporaryStatSet), WvsContext__OnTemporaryStatSet_Hook);
 }
@@ -797,7 +854,12 @@ void BuffTimer::HookWvsContextUpdate() {
 	Memory::SetHook(true, reinterpret_cast<void**>(&_WvsContext__Update), WvsContext__Update_Hook);
 }
 
+void BuffTimer::HookWvsContextLeaveGame() {
+	Memory::SetHook(true, reinterpret_cast<void**>(&_WvsContext__OnLeaveGame), WvsContext__OnLeaveGame_Hook);
+}
+
 void BuffTimer::Hook() {
 	HookTemporaryStatSet();
 	HookWvsContextUpdate();
+	HookWvsContextLeaveGame();
 }

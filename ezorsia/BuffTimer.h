@@ -21,6 +21,7 @@ public:
 	// Called from the file-scope __fastcall thunks that Memory::SetHook installs.
 	static void CaptureDurations(void* pPacket);
 	static void Tick(void* pWvsContext);
+	static void ForgetAll(); // the client emptied the whole buff row: drop every label with it
 
 private:
 	// The three fonts the label draws with. The table's slots are not enough on their own (see
@@ -30,6 +31,7 @@ private:
 	static void ParseDurations(void* pPacket);
 	static void HookTemporaryStatSet();
 	static void HookWvsContextUpdate();
+	static void HookWvsContextLeaveGame();
 	//
 	static void RememberBuff(unsigned int dwId, unsigned int dwDurationMs);
 	static void ForgetBuff(unsigned int dwId);

@@ -27,6 +27,11 @@
 | `0x007B4819` | 单图标数值写入 | `void __thiscall(int value)` | 写 `entry+0x38`，并调 `sub_7B44F4` |
 | `0x007B4D1D` | `ZList<ZRef<TEMPORARY_STAT>>::FindIndex` | `__POSITION* __thiscall(unsigned int) const` | 取第 n 个图标节点 |
 | `0x004374CB` | `IWzGr2D::GetCenter` | `_com_ptr_t<IWzVector2D> __thiscall(void)` | Gr2D 中心向量：**图标层的 origin 就是它**（条目构造调用） |
+| `0x00A041FF` | `CWvsContext::OnLeaveGame` | `void __thiscall(void)` | 离开游戏（回登录界面）的唯一出口；**本特性在此交还标签层攥着的图标层引用**（hook 点） |
+| `0x00A04695` | └ `CTemporaryStatView::Clear` 的调用点 | — | `OnLeaveGame` 内整行 buff 的释放点 |
+| `0x007B24CD` | `CTemporaryStatView::Clear` | `void __thiscall(void)` | 逐条释放整行条目（`add ecx,4` + 尾跳 `sub_7B4CE3`）；调用方 = `OnLeaveGame` `0xA04695`、`OnEnterGame` `0xA039EF`、`OnRevive` `0xA2277D`、析构 `sub_A023F8` `0xA02413` |
+| `0x00777347` | `set_stage` | `void __cdecl(CStage*, void*)` | 目标阶段不是 field 阶段时调 `OnLeaveGame`（站点 `0x777494`）——所有"回登录界面"路径（`UI_Menu` `0xA0680F`、`ReturnToTitle` `0xA246AB`、商城/ITC 切阶段）都经此 |
+| `0x00531B8D` | `CField::Update` | — | `CWvsContext::Update` 的**唯一**调用者：登录界面没有 field ⇒ `Tick` 不再运行（§6.6） |
 
 ### 1.2 Gr2D / 画布 / 字体（本特性的绘制口）
 
@@ -174,7 +179,8 @@ IWzGr2DLayer::Putcolor   (+224)  <- 0xFFFFFFFF                     ← 新层不
 ```
 
 - **origin = 图标层**（不是 Gr2D 中心）：这样客户端 `AdjustPosition` 每次重排整行时，标签自动跟着走，
-  插件不需要自己算坐标。代价是 origin 会持有图标层的 COM 引用，**必须在 buff 消失时交还**（§6.3）。
+  插件不需要自己算坐标。代价是 origin 会持有图标层的 COM 引用，**必须在 buff 消失时交还**（§6.3）；
+  整个 buff 行被客户端一次性清掉时（离开游戏）由 §6.6 的 `OnLeaveGame` 挂钩统一交还。
 - **换数字 = 换图层**：图层的画布**没法擦**（§6.2），所以数字一变就 `ClearLabelLayer`
   旧的（交还 origin → `Putcolor(0)` → 释放引用）再建一个新的、重绑到同一个图标层，然后画字。
   新建图层的画布天然是空的，`10 → 9` 不会残留 `0`。代价是每秒一次 `CreateLayer`（秒级档）/ 每分钟一次（分钟档），
@@ -263,6 +269,48 @@ IWzGr2DLayer::Putcolor   (+224)  <- 0xFFFFFFFF                     ← 新层不
 （`0x80004003`）。客户端自己的淡入是另一条路：`OnEnterField` 对图标层 `GetAlpha` + `raw_RelMove(210,0)`，
 条目构造里再用 `Animate(64, 210, 500)`。本插件**不用 alpha**：`Putcolor(0xFFFFFFFF)` 才是让层可见的调用，
 alpha 只影响淡入。同理 `Putcolor` 的 alpha 位有效（条目构造用 `0xD30000FF`），所以 `Putcolor(0)` = 隐藏。
+
+### 6.6 离开游戏时不交还 origin ⇒ buff 图标留在登录界面
+
+**现象**：身上挂着若干带倒计时的 buff 时点「结束游戏」，人回到了登录界面，右上角那一排 buff 图标
+（连数字）**还在**，而且不会自己消失。
+
+**根因是 §6.3 那条引用的另一半**：每个标签层的 origin 被 `put_origin` 设成它所属的图标层，
+`put_origin` 自己 AddRef ⇒ 标签层一直攥着图标层的一份引用。离开游戏时客户端是这样收尾的：
+
+```
+set_stage(0x00777347)  ── 目标阶段不是 field 阶段 ──►  CWvsContext::OnLeaveGame(0x00A041FF)
+                                                        └─ CTemporaryStatView::Clear(0x00A04695)
+                                                             └─ sub_7B4CE3(0x007B4CE3) 逐条释放条目
+```
+
+`Clear` 只释放**条目自己**那份引用（`entry+0x28` 的 com_ptr）：因为标签层那一份还在，
+图标层引用计数永远不归零 ⇒ 图层不被析构、不从渲染树里摘掉 ⇒ 图标继续画在屏幕上。
+
+**为什么 Tick 的清扫救不回来**：`Tick` 挂在 `CWvsContext::Update`（`0x00A03350`）上，
+而它**唯一的调用者是 `CField::Update`（`0x00531B8D`）**。登录界面没有 field ⇒ `Update` 不再被调用
+⇒ `Tick` 尾部那段"这一拍没看见的条目就清标签"（§5 的收尾扫）根本没有机会跑。
+所以不是"慢一拍才消失"，是永远不消失。
+
+**改法**：hook `CWvsContext::OnLeaveGame`，**在原函数之前** `ForgetAll()`——把每个标签层的 origin
+交还给 `IWzGr2D::GetCenter()`、`Putcolor(0)`、释放本插件那一份引用（走的就是 `ClearLabelLayer`），
+再照原样调原函数。此时标签层是图标层唯一的多余引用，交还之后 `Clear` 释放条目就能把图标层一起带走。
+顺带清空 `aTracked`（记忆的到期时刻属于刚没的那批 buff，留着会让重进游戏后同一个 buff 从旧残留接着倒数）。
+
+`OnLeaveGame` 一次退出可能被调两次（`UI_Menu` `0xA0680F` 先经 `set_stage`、再自己直接调一次），
+所以 `ForgetAll` 必须可重复调用（只对指针做判空与清零，天然满足）。
+
+**已验 / 未验**：
+
+- 调用链、"`Update` 唯一调用者是 `CField::Update`"、"回登录界面只有 `ReturnToTitle` / `CLogo::LogoEnd`
+  两条入口（`CLogin` 构造函数的全部 xref）"均为 IDA 实读；新地址已补 IDA 书签（§1.1 三行新增）。
+- **地址族在发布客户端上证过**：`BeiDou.exe`（`E:\learn\ms\BeiDou-Client`）在 VA `0x00A041FF` 处的
+  32 字节与 `Angel.exe` 逐字节相同（`53 56 8B F1 8B 0D F8 C1 BE 00 33 DB 3B CB 74 05 E8 36 69 D4 FF …`），
+  且 `0x00A04695` 处正是 `E8 33 DE DA FF`（= `call 0x007B24CD`，即 `CTemporaryStatView::Clear`）。
+  front prologue 全是无分支指令（`push/push/mov/mov`，共 10 字节）⇒ Detours 的 5 字节跳转重定位安全。
+- 源码在本机用 VS2026 `v145` 工具集编译通过（本机未装工程声明的 v142），
+  产物 `out/Release/ijl15.dll` 里三个 hook 目标地址（`0xA041FF`/`0xA202BE`/`0xA03350`）在指针表内相邻落位。
+- **实机未验**：需要客户端里挂上带倒计时的 buff 再点结束游戏，看图标是否随登录界面一起清掉。
 
 ## 7. 已知风险与未验证点
 
