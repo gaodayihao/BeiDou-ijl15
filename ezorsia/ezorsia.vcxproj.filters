@@ -159,6 +159,9 @@
     <ClInclude Include="SelectCharMacFix.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="NewCharEquipFix.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -195,6 +198,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="SelectCharMacFix.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="NewCharEquipFix.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
