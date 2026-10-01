@@ -22,6 +22,14 @@
 static const DWORD ADDR_ClientSocket = 0x00BE7914;
 static const DWORD ADDR_ClientSocket_SendPacket = 0x0049637B;
 static const DWORD ADDR_ClientSocket_ProcessPacket = 0x004965F1;
+static const DWORD ADDR_CInPacket_Decode1 = 0x004065F3;
+static const DWORD ADDR_CInPacket_Decode2 = 0x0042470C;
+static const DWORD ADDR_CInPacket_Decode4 = 0x00406629;
+
+// The packet's read cursor, the one field Decode2 itself uses (`*(this + 5)` there). A live packet
+// dump showed it at 4 on every received packet -- right after AppendBuffer consumed the 4-byte frame
+// header (RawSeq | DataLen) -- which is also why the opcode sits at Data + 4.
+static const int OFF_CInPacket_Position = 0x14;
 
 static const int nOpcodePetBuffConfig = 0x1001;
 static const unsigned char nConfigVersion = 1;
@@ -49,31 +57,36 @@ struct COutPacket
     int EncryptedByShanda;
 };
 
-// The receive view, with the field offsets the client itself uses -- read off CInPacket::Decode2
-// (0x0042470C: base at +0x08, cursor at +0x14, length at +0x18) and the copy constructor
-// CClientSocket::ManipulatePacket calls (0x006EC39F: `memcpy(newBuf, src + 0x08, src + 0x18)`).
-// Do NOT copy HpMpAlert.cpp's declaration here: it puts Data at +0x04, which is a flag (2 when the
-// packet copy is built), so every read goes to address 6 -- an access violation that its own __try
-// swallows, leaving that module's receive path silently dead.
-//
-// The buffer keeps the wire framing AppendBuffer consumed: RawSeq(2) | DataLen(2) | opcode(2) |
-// payload, so the first Decode2 in ProcessPacket reads the opcode at Data + 4 (cursor starts at 4)
-// and the payload starts at Data + 6. Size = 4 + DataLen (the whole buffer, header included).
+// The receive view: only the buffer pointer and the read cursor are used, and both were confirmed
+// against a live dump (`Data` = the dword at +0x08, cursor = 4 at +0x14 on every packet). The length
+// is deliberately NOT modelled: the copy ManipulatePacket builds carries 0 at +0x18, and the buffer's
+// first four bytes are the shuffled frame header -- reading the payload through the client's own
+// Decode1/Decode2/Decode4 is what keeps this module out of that guessing game (they hook the real
+// bounds check and throw when the packet is short).
+// Do NOT copy HpMpAlert.cpp's declaration: it puts Data at +0x04, which is a flag (2 when the copy is
+// built), so every read goes to address 6 -- an access violation that its own __try swallows,
+// leaving that module's receive path silently dead.
 struct CInPacket
 {
     void* Vtbl;                     // +0x00
-    int Flags;                      // +0x04
+    int Flags;                      // +0x04  (2 on the copy ProcessPacket gets)
     unsigned char* Data;            // +0x08
     int Unk0C;                      // +0x0C
     int Unk10;                      // +0x10
-    int Position;                   // +0x14
-    int Size;                       // +0x18
+    int Position;                   // +0x14  (4: right past the frame header)
+    int Unk18;                      // +0x18  (0 on the copy -- NOT the length)
 };
 
 typedef void(__fastcall* SendPacket_t)(void* pSocket, void* edx, void* pPacket);
 typedef void(__fastcall* ProcessPacket_t)(void* pThis, void* edx, CInPacket* pPacket);
+typedef unsigned char(__fastcall* Decode1_t)(void* pPacket, void* edx);
+typedef unsigned short(__fastcall* Decode2_t)(void* pPacket, void* edx);
+typedef unsigned int(__fastcall* Decode4_t)(void* pPacket, void* edx);
 
 static auto _send_packet = reinterpret_cast<SendPacket_t>(ADDR_ClientSocket_SendPacket);
+static auto _decode1 = reinterpret_cast<Decode1_t>(ADDR_CInPacket_Decode1);
+static auto _decode2 = reinterpret_cast<Decode2_t>(ADDR_CInPacket_Decode2);
+static auto _decode4 = reinterpret_cast<Decode4_t>(ADDR_CInPacket_Decode4);
 
 static void LogLine(const char* sFormat, ...)
 {
@@ -161,66 +174,110 @@ void PetBuffConfig_Send()
     }
 }
 
-// True when this packet is the configuration push. Reads nothing but the buffer header, and on true
-// also applies it: the caller must NOT forward such a packet (v83 has no dispatcher case for 0x1001).
-static bool TryConsumeConfigPacket(CInPacket* packet)
+// Reads the packet with the CLIENT'S OWN readers (Decode1/2/4). The cursor is saved and put back, so
+// when this is not our packet the client's own ProcessPacket still sees the opcode where it expects
+// it. C++ EH rather than SEH: those readers throw a ZException on a short packet, and an escaping
+// C++ exception would unwind into the client's frames (the SEH wrapper outside only has to catch a
+// bad pointer). Returns true when the packet is ours -- the caller must then consume it (v83 has no
+// dispatcher case for 0x1001), whether or not the payload was applied.
+static bool ReadConfigPacketRaw(CInPacket* packet, int* pSlots, bool* pbApplied)
 {
-    if (packet == nullptr || packet->Data == nullptr)
-    {
-        return false;
-    }
+    *pbApplied = false;
 
-    if (packet->Size < nReceivePrefix + nPayloadSize)
-    {
-        return false;
-    }
+    auto* pBase = reinterpret_cast<unsigned char*>(packet);
+    int* pCursor = reinterpret_cast<int*>(pBase + OFF_CInPacket_Position);
+    const int nSavedCursor = *pCursor;
 
-    const unsigned char* data = packet->Data;
-    const unsigned short opcode = static_cast<unsigned short>(data[4] | (data[5] << 8));
-    if (opcode >= 0x1000)
+    try
     {
-        // Every opcode in this range is a candidate for "what the server just sent us"; the raw dump
-        // is what pinned the field offsets down, so keep it (rare: 0x1000 / 0x1001 / 0x3713 / 0xFFFE).
-        LogLine("  recv: op=0x%04X size=%d payload0=%d", opcode, packet->Size, data[6]);
-    }
-
-    if (opcode != nOpcodePetBuffConfig)
-    {
-        return false;
-    }
-
-    if (data[6] != nConfigVersion)
-    {
-        LogLine("  config: version %d unknown, ignored", static_cast<int>(data[6]));
-        return true;                       // ours, but a version we cannot read: still consumed
-    }
-
-    for (int nPet = 0; nPet < kPetCount; ++nPet)
-    {
-        for (int nSlot = 0; nSlot < kSlotCount; ++nSlot)
+        const int nOpcode = _decode2(packet, nullptr);
+        if (nOpcode != nOpcodePetBuffConfig)
         {
-            int nSkillId = 0;
-            memcpy(&nSkillId, data + nReceivePrefix + 1 + 4 * SlotIndex(nPet, nSlot), sizeof(int));
-            PetSkillSlot::SetSkill(nPet, nSlot, nSkillId);
+            *pCursor = nSavedCursor;                       // not ours: hand it back untouched
+            if (nOpcode >= 0x1000)
+            {
+                LogLine("  recv: op=0x%04X (not ours)", nOpcode);
+            }
+            return false;
+        }
+
+        if (_decode1(packet, nullptr) != nConfigVersion)
+        {
+            LogLine("  config: version != %d, ignored", static_cast<int>(nConfigVersion));
+            return true;                                   // ours, but a version we cannot read
+        }
+
+        for (int i = 0; i < kValueCount; ++i)
+        {
+            pSlots[i] = static_cast<int>(_decode4(packet, nullptr));
+        }
+
+        *pbApplied = true;
+        return true;
+    }
+    catch (...)
+    {
+        *pCursor = nSavedCursor;                           // short/garbled: leave it to the client
+        LogLine("  recv: decode raised, packet left alone");
+        return false;
+    }
+}
+
+static bool TryConsumeConfigPacket(CInPacket* packet, bool* pbApplied)
+{
+    *pbApplied = false;
+    if (packet == nullptr)
+    {
+        return false;
+    }
+
+    bool bMine = false;
+    __try
+    {
+        int aSlots[kValueCount] = {};
+        bMine = ReadConfigPacketRaw(packet, aSlots, pbApplied);
+        if (*pbApplied)
+        {
+            for (int nPet = 0; nPet < kPetCount; ++nPet)
+            {
+                for (int nSlot = 0; nSlot < kSlotCount; ++nSlot)
+                {
+                    PetSkillSlot::SetSkill(nPet, nSlot, aSlots[SlotIndex(nPet, nSlot)]);
+                }
+            }
+
+            LogLine("  config: loaded %d/%d/%d/%d/%d/%d",
+                PetSkillSlot::GetSkill(0, 0), PetSkillSlot::GetSkill(0, 1),
+                PetSkillSlot::GetSkill(1, 0), PetSkillSlot::GetSkill(1, 1),
+                PetSkillSlot::GetSkill(2, 0), PetSkillSlot::GetSkill(2, 1));
         }
     }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        bMine = false;                                     // unreadable packet: client's business
+        *pbApplied = false;
+    }
 
-    LogLine("  config: loaded %d/%d/%d/%d/%d/%d",
-        PetSkillSlot::GetSkill(0, 0), PetSkillSlot::GetSkill(0, 1),
-        PetSkillSlot::GetSkill(1, 0), PetSkillSlot::GetSkill(1, 1),
-        PetSkillSlot::GetSkill(2, 0), PetSkillSlot::GetSkill(2, 1));
-    return true;
+    return bMine;
 }
 
 static ProcessPacket_t g_origProcessPacket = nullptr;
+static unsigned long g_nHookCalls = 0;
 
 static void __fastcall ProcessPacket_Hook(void* pThis, void* edx, CInPacket* packet)
 {
     bool bConsumed = false;
+    bool bApplied = false;
 
     __try
     {
-        bConsumed = TryConsumeConfigPacket(packet);
+        ++g_nHookCalls;
+        if (PetBuffConfig::bDebug && g_nHookCalls == 1)
+        {
+            LogLine("--- packet hook live (orig=%p) ---", g_origProcessPacket);
+        }
+
+        bConsumed = TryConsumeConfigPacket(packet, &bApplied);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
