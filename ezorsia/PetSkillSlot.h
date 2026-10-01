@@ -27,9 +27,10 @@ public:
     static bool bEnabled;   // petBuff      : the whole feature
     static bool bDebug;     // petBuffDebug : append every drop decision to petbuff.log
 
-    // FONT_TYPE of the label over the two cells, 0..55 as get_basic_font has them. Its 56 cases are
-    // the same font in different COLOURS (all of them create it from one face and size) -- 0 = white,
-    // 1 = black, 2 = grey, 26 = another grey, 30/31 = orange/red.
+    // FONT_TYPE of the label drawn in the two cells, 0..55 as get_basic_font has them. The cases are
+    // the same face in different SIZES and COLOURS: 43..49 are size 9 (white / black / red / orange /
+    // cream), 34 and 36 are size 11, 35 is size 15, everything else is size 12. The default 43 is
+    // 9px white. The label's centring follows the size, so any of them can be picked.
     static int nLabelFont;  // petSkillSlotFont
 
     // Skill id in slot (nPet 0..2, nSlot 0..1); 0 = empty. Used by the auto-refresh step and by the
