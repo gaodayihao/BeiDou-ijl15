@@ -40,6 +40,7 @@
 - 免密模式（须服务端支持，客户端仅解除密码限制）
 - 调整聊天框文字位置
 - 背包默认展平：客户端自带的 Item 宽窗模式（5 个分页并排）改为没表过态时默认打开，并修掉"按钮切换活不过一次退出"——客户端保存角色设置时会把 GameOption 键整个擦掉再写回它自己那份选项表，InventoryExpanded 不在表里（见 config.ini 的 itemWndExpanded / itemWndRemember；逆向记录见 docs/客户端逆向-背包默认展平.md）
+- 宠物装备窗的 buff 技能格：那个窗口第二排有 4 格，前两格是拾取袋 / 吸金磁铁，后两格客户端的矩形表里根本没登记（sub_8011FA 在那里返回 0、点击穿透）——把它们用作 buff 技能格，从技能窗把 buff 技能拖进去即被记住，按宠物页签各一套（3 × 2 = 6）。只认 buff 技能（白名单 PetBuffWhitelist.h 由服务端同源生成），红蓝药那两格与第一排的药水包装备一律不动，配置只在客户端内存、不发报文（见 config.ini 的 petBuff / petBuffDebug；设计与逆向记录见 Ursa-Server 的 docs/client/003-宠物自动续增益.md）
 
 针对中文环境的一些调整：
 

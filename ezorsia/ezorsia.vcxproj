@@ -206,6 +206,7 @@
     <ClInclude Include="LatchFix.h" />
     <ClInclude Include="NewCharEquipFix.h" />
     <ClInclude Include="ItemWndExpanded.h" />
+    <ClInclude Include="PetSkillSlot.h" />
     <ClInclude Include="Memory.h" />
     <ClInclude Include="NMCO.h" />
     <ClInclude Include="SelectCharMacFix.h" />
@@ -227,6 +228,7 @@
     <ClCompile Include="LatchFix.cpp" />
     <ClCompile Include="NewCharEquipFix.cpp" />
     <ClCompile Include="ItemWndExpanded.cpp" />
+    <ClCompile Include="PetSkillSlot.cpp" />
     <ClCompile Include="Memory.cpp" />
     <ClCompile Include="NMCO.cpp" />
     <ClCompile Include="SelectCharMacFix.cpp" />

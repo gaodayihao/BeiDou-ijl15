@@ -13,6 +13,7 @@
 #include "BuffTimer.h"
 #include "NewCharEquipFix.h"
 #include "ItemWndExpanded.h"
+#include "PetSkillSlot.h"
 #pragma comment(lib, "ws2_32.lib")
 
 // config.ini can use IP or hostname (ServerIP_Address=...).
@@ -110,6 +111,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			fixNewCharEquipNull = reader.GetBoolean("optional", "fixNewCharEquipNull", true);
 			itemWndExpanded = reader.GetBoolean("optional", "itemWndExpanded", true);
 			itemWndRemember = reader.GetBoolean("optional", "itemWndRemember", true);
+			PetSkillSlot::bEnabled = reader.GetBoolean("optional", "petBuff", true);
+			PetSkillSlot::bDebug = reader.GetBoolean("optional", "petBuffDebug", true);
 			BossHP::bShowPercent = reader.GetBoolean("optional", "bossHpPercent", true);
 			BossHP::bShowText = reader.GetBoolean("optional", "bossHpText", true);
 			BossHP::bShowTextName = reader.GetBoolean("optional", "bossHpTextShowName", true);
@@ -172,6 +175,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		BossHP::Hook();
 		BuffTimer::Hook(); // countdown under each buff icon (buffTimer=true)
 		QuestBulb::Hook(); // pin the auto-quest light bulb to the left edge of the screen
+		PetSkillSlot::Hook(); // pet auto-buff slots: buff skills dropped into the pet equip window
 		Client::WorldMap();
 		Client::RefreshRate(); 
 		Client::DeleteChar();
