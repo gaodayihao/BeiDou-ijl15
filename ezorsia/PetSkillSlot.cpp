@@ -4,124 +4,136 @@
 #include "PetBuffWhitelist.h"
 #include <stdio.h>
 #include <stdarg.h>
-#include <oleauto.h> // VARIANTARG / VT_UNKNOWN (the Gr2D wrappers take Ztl_variant_t by reference)
+#include <oleauto.h> // VARIANTARG (the WzGr2D / WzCanvas wrappers take Ztl_variant_t by value)
 #include <comdef.h>
 
 // ===== Reverse-engineering anchors (Angel.exe / BeiDou.exe, v83; bookmarks prefixed "PETBUFF:") ====
 //
-// --- where the drop lands --------------------------------------------------
-//   CDraggableSkill::OnDropped       0x004FAA22  (pFrom, pTo, x, y) -> int, __thiscall
-//     the skill id sits at *(this + 6)  -- the original reads it as
-//     `CSkillInfo::GetSkillLevel(cd, *(this + 6), 0) <= 0 -> return 0`, i.e. "not learned, refuse"
-//     the drop coordinates are WINDOW-LOCAL (verified in game: a drop on cell #3 logged x=88 y=58)
-//   CWndMan::EndDragDrop             0x009E37C2  calls the draggable's vtable+4 (OnDropped) with
-//     (pFrom, pTo, x, y) directly -- the target window's HitTest is NOT consulted, so accepting a
-//     drop here needs no patch to sub_8011FA at all.
-//
-// --- telling the pet equip window apart ------------------------------------
-//   ctor sub_7FE299 writes *obj = off_B38A70 (primary vtable), obj[1] = off_B38A24, obj[2] =
-//   off_B38A20, then CWnd::CreateWnd(id = 0xB1, w = 181). Drag-context window pointers are
-//   `obj + 4` (verified: the log shows to = obj + 4), so the window is recognised by comparing
-//   the pointer's own vtable with off_B38A24, or the dword just before it with off_B38A70.
-//   A drop through the primary vtable arrives with `this == obj`, which is also the base the tab
-//   field and the rect table are relative to.
-//
 // --- the cells -------------------------------------------------------------
-//   the window's rect table (0x00BE2260, interleaved x/y, 50 entries) has, at y = 44, only
-//   x = 13 (item pouch, index 21) and x = 46 (meso magnet, index 22). Cells #3/#4 (x = 79 and
-//   x = 112) are absent -> this module owns them. Geometry (32x32, pitch 33), verified in game.
+//   the window's rect table (0x00BE2260, interleaved x/y, 50 entries) registers, at y = 44, only
+//   x = 13 (item pouch) and x = 46 (meso magnet). Cells #3/#4 (x = 79 and x = 112) are painted by
+//   the window background but registered nowhere: sub_8011FA answers 0 there and a click falls
+//   through. Those two are this feature's slots (32x32, pitch 33, verified in game).
 //
-// --- painting the skill icon ----------------------------------------------
-//   the client resolves a skill's icon as `*(SKILLENTRY + 0xAC)` from
-//   `CSkillInfo::GetSkill(skillId)` (0x0075C755, singleton pointer at 0x00BE78DC -- the client
-//   loads ecx from there right before the call). Its own buff row paints exactly that canvas:
-//   the CTemporaryStatView entry ctor (0x007B3176) takes the nType == 2 branch, assigns the icon
-//   through the com-ptr helper 0x004051E5, then hands it to a layer.
+// --- where the drop lands --------------------------------------------------
+//   CDraggableSkill::OnDropped  0x004FAA22  (pFrom, pTo, x, y) -> int, __thiscall
+//     the skill id sits at *(this + 6); the drop coordinates are WINDOW-LOCAL, the same frame the
+//     rect table and sub_8011FA use.
+//   CWndMan::EndDragDrop        0x009E37C2  calls the draggable's vtable+4 (OnDropped) directly --
+//     the target window's HitTest is NOT consulted -- and treats a NON-ZERO result as "the target
+//     accepted the drop", forwarding it to the status bar's drop handler
+//     (`if (v31) sub_8D63EC(CUIStatusBar::ms_pInstance, x, y, dragCtx + 4)`, the drop-into-the-world
+//     path). For a skill that leaves the whole UI unresponsive and unclosable, so this hook stores
+//     the slot and returns 0.
 //
-//   "show a canvas on a layer" is IWzGr2DLayer::Animate (0x00426BAB). It is a thunk that ends in
-//   `retn 1Ch` -- 7 stack dwords -- and forwards to its object's vtable+260, expanding five
-//   Ztl_variant_t BY VALUE. Both call sites that matter agree on the shape:
-//     0x007B3176 (buff entry ctor): Animate(layer, &retbuf, canvas, 500, 210, 64, empty, empty)
-//     0x00800214 (drag ghost)     : Animate(layer, &retbuf, canvas, empty, empty, empty, empty, empty)
-//   so this module calls it as (layer, retbuf16, canvas, empty x5) -- and it never spends an icon
-//   canvas of its own, it reuses the one the client cached in SKILLENTRY.
+// --- the window, and which pointer is which ---------------------------------
+//   ctor sub_7FE299 writes *obj = off_B38A70 (primary vtable), obj[1] = off_B38A24, obj[2] =
+//   off_B38A20, then CWnd::CreateWnd(id = 0xB1, w = 177, h = 181, z = 10). Drag targets and
+//   CUIPetEquip::OnMouseMove (0x00800F7B) both receive `obj + 4`; CWnd::Destroy (0x009E00AF)
+//   receives `obj`. The tab field (this+360), the layer field (this+0x18) and the tooltip
+//   (this+108) all live on the CWnd base, so both hooks normalise with IsPetEquipWindow.
 //
-// --- where a slot layer hangs ----------------------------------------------
-//   CWnd::CreateWnd (0x009DE4D2) keeps the window's own Gr2D layer at *(CWnd + 0x18)
-//   (CWnd::GetLayer 0x00426604 is literally `return *(this + 6)`), and 0x00800214 -- the window's
-//   own mouse-down handler, drawing the drag ghost over a potion cell -- shows the shape a child
-//   layer must take:
-//       CreateLayer(gr2d, &layer, 0, 0, 0, 0, 0, empty, empty)
-//       Animate(layer, &retbuf, canvas, empty x5)
-//       Putcolor(layer, 0x80FFFFFF)                      vtable+224; CreateLayer leaves it 0
-//       put_origin(layer, CWnd::GetLayer(this - 4))      hang it on the window's own layer
-//       raw_RelMove(layer, x, y, empty, empty)           the same frame as its own mouse coords
-//   So the slot layers hang on that layer and move in WINDOW-LOCAL pixels: no screen position is
-//   needed anywhere, and the icons follow the window while it is dragged.
+// --- drawing the icon: the window's own canvas, exactly like the potion icons ---
+//   CUIPetEquip::Draw (0x00801474) is the window's draw override. It calls CWnd::Draw (the window
+//   background) and then draws every registered cell into the window's canvas:
+//       CWnd::GetCanvas(this, &canvas)                                  0x00425C4C
+//       sub_5D6458(ctx, itemId, rect.x, rect.y + 32, iconCanvas, ...)  per cell
+//       ... and the two auto-potion icons explicitly at (46, 43) and (112, 43)
+//   (the +32 and the 43 are the cell's BOTTOM edge: those helpers position by the canvas's bottom
+//   left, the same asymmetry IWzVector2D::raw_RelMove shows).
 //
-//   CWnd::GetAbsLeft (0x009E03C5) must NOT be used for this: it dereferences *(CWnd + 0x14), which
-//   CreateWnd writes as `*(this + 5) = ++dword_BF1604` -- a window sequence number -- so Getx()
-//   runs on a small integer. Every drop took an access violation there (petbuff.log).
+//   The primitive underneath is IWzCanvas vtable+128 -- draw a canvas at (x, y) -- used by
+//   CWnd::Draw 0x009E0502 for the window background, where (x, y) is the window's own origin, i.e.
+//   the LEFT-TOP. So the slot icons are drawn the same way, into the window's canvas, at the cell's
+//   left-top.
 //
-// --- layer lifecycle -------------------------------------------------------
-//   the window is created and destroyed on every toggle of the 宠物装备 button
-//   (CUIEquip::TogglePetEquip 0x007FFA84 -> ctor sub_7FE299 / destroy), so the layers are
-//   re-positioned on each CUIPetEquip::OnMouseMove (that is also what picks up a tab switch) and
-//   released from CWnd::Destroy (0x009E00AF) when the window goes away. Release is not enough on
-//   its own: put_origin holds the window's layer, so the origin is handed back to the Gr2D centre
-//   first, the way BuffTimer::ClearLabelLayer does it -- otherwise the window's graphics outlive
-//   the window.
+//   This is deliberately the client's own mechanism rather than a layer of our own: the window's
+//   tooltip is painted after the window's Draw, so it covers a cell icon for free, and the window
+//   moving, closing or switching pet tabs repaints the canvas and carries the icons along with no
+//   extra hooks. A separate Gr2D layer cannot reproduce that: the tooltip is not a layer of its own
+//   (nothing in 0x8E49B5..0x8F6000 creates one), so any depth that keeps a layer above the window's
+//   canvas keeps it above the tooltip too.
+//
+// --- the skill tooltip -----------------------------------------------------
+//   the window's embedded CUIToolTip sits at obj + 108 (its ctor: CUIToolTip::CUIToolTip(a1 + 27)).
+//   CTemporaryStatView::ShowToolTip 0x007B2FD5 shows a buff icon's tooltip with exactly:
+//       ClearToolTip(0x008E6E23)
+//       SetToolTip_Skill(tooltip, x, y, CSkillInfo::GetSkill(id), 0)     0x008F25D0
+//   with x/y in SCREEN pixels (the tooltip is positioned absolutely), which is why this module asks
+//   CWndMan::GetCursorPos (0x009E311B) instead of passing the window-local mouse position.
 //
 // =================================================================================================
 
 static const DWORD ADDR_DraggableSkill_OnDropped = 0x004FAA22;
+static const DWORD ADDR_CUIPetEquip_OnMouseButton = 0x00800214;
+static const DWORD ADDR_CUIPetEquip_Draw = 0x00801474;
 static const DWORD ADDR_CUIPetEquip_OnMouseMove = 0x00800F7B;
-static const DWORD ADDR_CWnd_Destroy = 0x009E00AF;
+static const DWORD ADDR_CUIPetEquip_HitTest = 0x008011FA;
+static const DWORD ADDR_CWnd_GetCanvas = 0x00425C4C;
+static const DWORD ADDR_CWnd_InvalidateRect = 0x009E04C9;
 static const DWORD ADDR_CSkillInfo_GetSkill = 0x0075C755;
 static const DWORD ADDR_SkillInfoInstance = 0x00BE78DC;
-static const DWORD ADDR_IWzGr2DLayer_Animate = 0x00426BAB;
+static const DWORD ADDR_CWndMan_Instance = 0x00BEC20C;
+static const DWORD ADDR_CWndMan_GetCursorPos = 0x009E311B;
+static const DWORD ADDR_CInputSystem_SetCursorState = 0x0059A6D9;
+static const DWORD ADDR_CInputSystem_Instance = 0x00BEC33C;
+static const DWORD ADDR_CUIToolTip_ClearToolTip = 0x008E6E23;
+static const DWORD ADDR_CUIToolTip_SetToolTip_Skill = 0x008F25D0;
+static const DWORD ADDR_CWvsContext_OnLeaveGame = 0x00A041FF;
+static const DWORD ADDR_EmptyVariant = 0x00BF6300;
+
+// Picking a slot up again uses the client's own draggable, so the drag ghost, the cursor and the
+// drop handling are all its. CDraggableSkill's vtable is 0x00B39810 (OnDropped sits at +4, the slot
+// EndDragDrop calls), and CUIMacroSys::OnMouseButton (0x008B9488) builds one exactly like this:
+//   ZAllocEx<ZAllocAnonSelector>::Alloc(0x2C)         0x00403065 on the static at 0x00BF0B00
+//   CDraggable base ctor(sourceWindow)                0x006FFDA3
+//   [+0x18] = skill id, [+0x1C] = 1                    OnDropped reads exactly these two
+//   [0x00]  = the vtable
+//   CWndMan::BeginDragDrop(source, draggable)         0x009E353D, two arguments
+static const DWORD ADDR_CDraggableSkill_Vtbl = 0x00B39810;
+static const DWORD ADDR_CDraggable_BaseCtor = 0x006FFDA3;
+static const DWORD ADDR_ZAllocEx_Alloc = 0x00403065;
+static const DWORD ADDR_ZAllocEx_s_alloc = 0x00BF0B00;
+static const DWORD ADDR_CWndMan_BeginDragDrop = 0x009E353D;
 static const DWORD ADDR_IWzGr2D_CreateLayer = 0x00426C7E;
 static const DWORD ADDR_IWzGr2D_GetCenter = 0x004374CB;
+static const DWORD ADDR_IWzGr2DLayer_Animate = 0x00426BAB;
 static const DWORD ADDR_IWzGr2DLayer_Putcolor = 0x0045144A;
-static const DWORD ADDR_IWzGr2DLayer_GetZ = 0x0044337D;
 static const DWORD ADDR_IWzGr2DLayer_GetWidth = 0x00440C00;
 static const DWORD ADDR_IWzGr2DLayer_GetHeight = 0x00440C2A;
-static const DWORD ADDR_IWzCanvas_Getcx = 0x0040F09B;
-static const DWORD ADDR_IWzCanvas_Getcy = 0x0040F0C2;
+static const DWORD ADDR_IWzGr2DLayer_GetZ = 0x0044337D;
 static const DWORD ADDR_Gr2DInstance = 0x00BF14EC;
-static const DWORD ADDR_EmptyVariant = 0x00BF6300;
+static const int nVtbl_IWzVector2D__put_origin = 100;
+static const int nVtbl_IWzVector2D__raw_RelMove = 144;
+
+// The drag ghost is drawn at the cursor, semi-transparent -- the alpha the client's own item ghost
+// uses (Putcolor(0x80FFFFFF) in 0x00800214).
+static const unsigned long kGhostColor = 0x80FFFFFFu;
+static const int nGhostOffsetX = -16;
+static const int nGhostOffsetY = -16;
+
+// The depth the client pushes its drag ghost to (sub_61738F(layer, 0x7FFFFFFD) inside BeginDragDrop).
+static const int nGhostLayerZ = 0x7FFFFFFD;
+static const int nCDraggableSkill_Size = 0x2C;
+static const int OFF_CDraggableSkill_SkillId = 0x18;
+static const int OFF_CDraggableSkill_Validated = 0x1C;
+
+static const unsigned int nMsgLButtonDown = 513; // WM_LBUTTONDOWN
+
+// The cursor state the window's own OnMouseMove sets over a cell that holds something -- the grab
+// hand. Its own default is 0, which is what it leaves over our cells (it knows nothing about them).
+static const long nCursorGrab = 5;
 
 static const DWORD VTBL_CUIPetEquip_Primary = 0x00B38A70; // *(void**)obj
 static const DWORD VTBL_CUIPetEquip_Second = 0x00B38A24;  // *(void**)(obj + 4)
 
 static const int OFF_DraggableSkill_SkillId = 6 * 4;    // *(this + 6)
 static const int OFF_CUIPetEquip_Tab = 360 * 4;         // *(this + 360), 0..2
+static const int OFF_CUIPetEquip_ToolTip = 108;         // the window's embedded CUIToolTip
 static const int OFF_SKILLENTRY_Icon = 0xAC;            // *(SKILLENTRY + 0xAC) = 32x32 canvas
-static const int OFF_CWnd_Layer = 0x18;                 // *(CWnd + 6), the window's own Gr2D layer
 
-static const int nVtbl_IWzVector2D__get_x = 32;
-static const int nVtbl_IWzVector2D__get_y = 40;
-static const int nVtbl_IWzVector2D__put_origin = 100;
-static const int nVtbl_IWzVector2D__raw_RelMove = 144;
-static const int nVtbl_IWzGr2DLayer__PutZ = 180;
-
-// Visible / invisible alpha for a slot layer (Putcolor is ARGB).
-static const unsigned long kLayerVisible = 0xFFFFFFFFu;
-static const unsigned long kLayerHidden = 0x00000000u;
-
-// The pet equip window's own layer is created at depth 10: its ctor sub_7FE299 calls
-// CWnd::CreateWnd(nLeft, nTop, /*w*/ 0xB1 = 177, /*h*/ 181, /*z*/ 10, /*bScreenCoord*/ 1, 0, 1),
-// and the layer measures 177x181 at runtime, which pins the argument positions.
-//
-// The slot layers sit ONE ABOVE that, in their own depth group. Larger depths draw in front
-// (measured: depth 0 put the icon behind the window, depth 10 in front of it), and a same-depth
-// layer only wins on creation order -- which the window takes back every time it is dragged:
-// CWndMan::UpdateWindowPosition (0x009E03A6) removes and re-inserts the window's own layer, so the
-// icon was buried by the window's canvas as soon as the window moved. A depth of its own cannot be
-// overtaken that way. Reading the depth off the parent is not an option either:
-// IWzGr2DLayer::GetZ (0x0044337D) answers 0xFFFFFFFF for the window's own layer, not the 10 that
-// CreateWnd set.
-static const int kSlotLayerZ = 11;
+// IWzCanvas vtable+128 = "draw this canvas at (x, y)", the call CWnd::Draw makes for a background.
+static const int nVtbl_IWzCanvas__DrawCanvas = 128;
 
 // Window-local pixels of the two free cells in the second row (verified in game).
 struct SlotRect
@@ -143,46 +155,66 @@ static const int kSlotCount = 2;
 // The remembered configuration. Client-side only, lost when the client closes.
 static int g_anSlots[kPetCount][kSlotCount] = {};
 
-// The pet equip window the layers belong to, the window layer they hang on, and one layer per slot.
-static void* g_pWindow = nullptr;
-static void* g_pParentLayer = nullptr;
-static void* g_apLayers[kPetCount][kSlotCount] = {};
-static int g_anDrawn[kPetCount][kSlotCount] = {};
+// The slot the drag in flight was started from, so a drop that lands anywhere else takes the skill
+// out of it. Reset on every mouse-down and after every drop.
+static int g_nDragFromPet = -1;
+static int g_nDragFromSlot = -1;
+static void* g_pDragFromWindow = nullptr;
 
 bool PetSkillSlot::bEnabled = true;
 bool PetSkillSlot::bDebug = true;
 
+typedef void* (__thiscall* CWndGetCanvas_t)(void* pWnd, void* pRetBuf);
+typedef void (__thiscall* CWndInvalidateRect_t)(void* pWnd, const void* pRect);
+typedef long(__stdcall* CanvasDrawCanvas_t)(void* pCanvas, long nX, long nY, void* pSrcCanvas,
+    VARIANTARG vAttr);
+typedef void (__thiscall* CWndManGetCursorPos_t)(void* pWndMan, POINT* pOut, int nFlag);
+typedef void (__thiscall* CInputSystemSetCursorState_t)(void* pInputSystem, long nState);
+typedef int(__fastcall* CWvsContextOnLeaveGame_t)(void* pThis, void* edx);
+typedef void (__thiscall* ToolTipClear_t)(void* pToolTip);
+typedef void (__fastcall* ToolTipSetSkill_t)(void* pToolTip, void* edx, int nX, int nY,
+    void* pSkillEntry, int nFlag);
+typedef int(__fastcall* PetEquipHitTest_t)(void* pWindow, void* edx, int nX, int nY);
+typedef int(__thiscall* PetEquipDraw_t)(void* pThis, const void* pRect);
+typedef void (__thiscall* PetEquipOnMouseButton_t)(void* pThis, unsigned int nMsg, unsigned int nParam,
+    long nX, long nY);
+typedef void* (__thiscall* ZAllocExAlloc_t)(void* pThis, unsigned int nSize);
+typedef void (__thiscall* CDraggableBaseCtor_t)(void* pThis, void* pSourceWindow);
+typedef void (__thiscall* CWndManBeginDragDrop_t)(void* pWndMan, void* pSource, void* pDraggable);
 typedef void* (__fastcall* Gr2DCreateLayer_t)(void* pGr2D, void* edx, void** ppLayer, int nX, int nY,
     unsigned long nWidth, unsigned long nHeight, int nZ, const void* pV1, const void* pV2);
 typedef void* (__fastcall* Gr2DGetCenter_t)(void* pGr2D, void* edx, void** ppCenter);
 typedef long(__stdcall* VectorPutOrigin_t)(void* pVector, VARIANTARG vOrigin);
 typedef long(__stdcall* VectorRawRelMove_t)(void* pVector, long nX, long nY, VARIANTARG v1, VARIANTARG v2);
-typedef long(__stdcall* LayerPutZ_t)(void* pLayer, int nZ);
-typedef int(__fastcall* LayerGetInt_t)(void* pLayer, void* edx);
 typedef void (__fastcall* LayerPutColor_t)(void* pLayer, void* edx, unsigned long nColor);
-// The client's property-get convention is COM-style: __stdcall long get_x(long* pOut) (QuestBulb).
-typedef long(__stdcall* VectorGetLong_t)(void* pVector, long* pnOut);
 typedef void* (__thiscall* LayerAnimate_t)(void* pLayer, void* pRetBuf, void* pCanvas,
     const void* pV1, const void* pV2, const void* pV3, const void* pV4, const void* pV5);
-typedef void (__thiscall* CWndDestroy_t)(void* pWnd);
+typedef int(__fastcall* LayerGetInt_t)(void* pLayer, void* edx);
 typedef int(__thiscall* PetEquipOnMouseMove_t)(void* pThis, int nX, int nY);
 typedef void* (__thiscall* SkillInfoGetSkill_t)(void* pSkillInfo, int nSkillId);
 typedef int(__thiscall* DraggableSkillOnDropped_t)(void* pThis, void* pFrom, void* pTo, int nX, int nY);
 
+static auto _wnd_get_canvas = reinterpret_cast<CWndGetCanvas_t>(ADDR_CWnd_GetCanvas);
+static auto _wnd_invalidate = reinterpret_cast<CWndInvalidateRect_t>(ADDR_CWnd_InvalidateRect);
+static auto _wndman_get_cursor_pos = reinterpret_cast<CWndManGetCursorPos_t>(ADDR_CWndMan_GetCursorPos);
+static auto _input_set_cursor_state = reinterpret_cast<CInputSystemSetCursorState_t>(ADDR_CInputSystem_SetCursorState);
+static auto _tooltip_clear = reinterpret_cast<ToolTipClear_t>(ADDR_CUIToolTip_ClearToolTip);
+static auto _tooltip_set_skill = reinterpret_cast<ToolTipSetSkill_t>(ADDR_CUIToolTip_SetToolTip_Skill);
+static auto _hit_test = reinterpret_cast<PetEquipHitTest_t>(ADDR_CUIPetEquip_HitTest);
+static auto _skill_get = reinterpret_cast<SkillInfoGetSkill_t>(ADDR_CSkillInfo_GetSkill);
 static auto _create_layer = reinterpret_cast<Gr2DCreateLayer_t>(ADDR_IWzGr2D_CreateLayer);
 static auto _gr2d_get_center = reinterpret_cast<Gr2DGetCenter_t>(ADDR_IWzGr2D_GetCenter);
+static auto _layer_animate = reinterpret_cast<LayerAnimate_t>(ADDR_IWzGr2DLayer_Animate);
 static auto _layer_put_color = reinterpret_cast<LayerPutColor_t>(ADDR_IWzGr2DLayer_Putcolor);
-static auto _layer_get_z = reinterpret_cast<LayerGetInt_t>(ADDR_IWzGr2DLayer_GetZ);
 static auto _layer_get_width = reinterpret_cast<LayerGetInt_t>(ADDR_IWzGr2DLayer_GetWidth);
 static auto _layer_get_height = reinterpret_cast<LayerGetInt_t>(ADDR_IWzGr2DLayer_GetHeight);
-static auto _canvas_get_cx = reinterpret_cast<LayerGetInt_t>(ADDR_IWzCanvas_Getcx);
-static auto _canvas_get_cy = reinterpret_cast<LayerGetInt_t>(ADDR_IWzCanvas_Getcy);
-static auto _layer_animate = reinterpret_cast<LayerAnimate_t>(ADDR_IWzGr2DLayer_Animate);
-static auto _skill_get = reinterpret_cast<SkillInfoGetSkill_t>(ADDR_CSkillInfo_GetSkill);
+static auto _layer_get_z = reinterpret_cast<LayerGetInt_t>(ADDR_IWzGr2DLayer_GetZ);
 
 static DraggableSkillOnDropped_t g_origOnDropped = nullptr;
+static PetEquipDraw_t g_origDraw = nullptr;
 static PetEquipOnMouseMove_t g_origOnMouseMove = nullptr;
-static CWndDestroy_t g_origDestroy = nullptr;
+static PetEquipOnMouseButton_t g_origOnMouseButton = nullptr;
+static CWvsContextOnLeaveGame_t g_origOnLeaveGame = nullptr;
 
 // petbuff.log in the client directory: the drop path was calibrated from it (window pointer, tab,
 // skill id and the drop coordinates as the client reports them).
@@ -207,169 +239,6 @@ static void LogLine(const char* sFormat, ...)
     fclose(pFile);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Gr2D plumbing (same shape as BuffTimer.cpp / QuestBulb.cpp)
-// ---------------------------------------------------------------------------------------------
-
-static void CopyEmptyVariant(void* pOut)
-{
-    memcpy(pOut, reinterpret_cast<const void*>(ADDR_EmptyVariant), 16);
-}
-
-static void ReleaseComPtr(void* pUnknown)
-{
-    if (pUnknown == nullptr)
-    {
-        return;
-    }
-
-    __try
-    {
-        void** pVtbl = *reinterpret_cast<void***>(pUnknown);
-        if (pVtbl != nullptr && !IsBadReadPtr(pVtbl, 12))
-        {
-            reinterpret_cast<void(__stdcall*)(void*)>(pVtbl[2])(pUnknown);
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
-}
-
-// IUnknown::AddRef answers with the resulting count, so an AddRef immediately followed by a Release
-// reports the current reference count without changing it. Used to tell "my layer still holds the
-// window's layer" apart from "the window's own release is the one that matters".
-static unsigned ProbeRefCount(void* pUnknown)
-{
-    if (pUnknown == nullptr)
-    {
-        return 0;
-    }
-
-    __try
-    {
-        void** pVtbl = *reinterpret_cast<void***>(pUnknown);
-        if (pVtbl != nullptr && !IsBadReadPtr(pVtbl, 12))
-        {
-            const unsigned nCount = reinterpret_cast<unsigned(__stdcall*)(void*)>(pVtbl[1])(pUnknown);
-            reinterpret_cast<unsigned(__stdcall*)(void*)>(pVtbl[2])(pUnknown);
-            return nCount - 1;
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
-
-    return 0;
-}
-
-static bool SetLayerOrigin(void* pLayer, void* pOrigin)
-{
-    void** pVtbl = *reinterpret_cast<void***>(pLayer);
-    if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__put_origin + sizeof(void*)))
-    {
-        return false;
-    }
-
-    VARIANTARG vOrigin;
-    memset(&vOrigin, 0, sizeof(vOrigin));
-    vOrigin.vt = VT_UNKNOWN;
-    vOrigin.punkVal = reinterpret_cast<IUnknown*>(pOrigin);
-
-    __try
-    {
-        reinterpret_cast<VectorPutOrigin_t>(pVtbl[nVtbl_IWzVector2D__put_origin / sizeof(void*)])
-            (pLayer, vOrigin);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
-static bool MoveLayer(void* pLayer, long nX, long nY)
-{
-    void** pVtbl = *reinterpret_cast<void***>(pLayer);
-    if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__raw_RelMove + sizeof(void*)))
-    {
-        return false;
-    }
-
-    // Both variants must be spelled out: calling with x/y alone leaves 32 bytes of arguments
-    // missing and the callee pops its own count, which corrupts the stack further out
-    // (QuestBulb.cpp §7 hit exactly this).
-    VARIANTARG v1;
-    VARIANTARG v2;
-    CopyEmptyVariant(&v1);
-    CopyEmptyVariant(&v2);
-
-    __try
-    {
-        reinterpret_cast<VectorRawRelMove_t>(pVtbl[nVtbl_IWzVector2D__raw_RelMove / sizeof(void*)])
-            (pLayer, nX, nY, v1, v2);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
-static bool LayerPutZ(void* pLayer, int nZ)
-{
-    void** pVtbl = *reinterpret_cast<void***>(pLayer);
-    if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzGr2DLayer__PutZ + sizeof(void*)))
-    {
-        return false;
-    }
-
-    __try
-    {
-        reinterpret_cast<LayerPutZ_t>(pVtbl[nVtbl_IWzGr2DLayer__PutZ / sizeof(void*)])(pLayer, nZ);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
-static void SetLayerVisible(void* pLayer, bool bVisible)
-{
-    __try
-    {
-        _layer_put_color(pLayer, nullptr, bVisible ? kLayerVisible : kLayerHidden);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
-}
-
-// The layer the window draws itself into (CWnd::GetLayer 0x00426604: `return *(this + 6)`).
-// Borrowed: the window owns it, so this side never AddRefs or Releases it.
-static void* GetWindowLayer(void* pWindow)
-{
-    if (pWindow == nullptr)
-    {
-        return nullptr;
-    }
-
-    __try
-    {
-        void* pLayer = *reinterpret_cast<void**>(reinterpret_cast<char*>(pWindow) + OFF_CWnd_Layer);
-        if (pLayer != nullptr && !IsBadReadPtr(pLayer, sizeof(void*)))
-        {
-            return pLayer;
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
-
-    return nullptr;
-}
-
 // Reports a structured exception through the log. Only ever used from an __except filter, so it
 // must not throw and must not build anything that needs unwinding. A C++ exception surfaces here as
 // code 0xE06D7363 with the faulting address inside the CRT, an access violation as 0xC0000005.
@@ -387,502 +256,28 @@ static int LogSehFilter(EXCEPTION_POINTERS* pInfo)
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// CreateLayer's first variant is a VT_I4 canvas id, not an empty variant: the client builds it with
-// sub_402FAB(&v, 0, 3) in both CWnd::CreateWnd and 0x00800214, and the second variant is a copy of
-// the global empty variant. Passing two empty variants makes the w = h = 0 shape fail with
-// E_INVALIDARG (0x80070057).
-static void MakeIntVariant(void* pOut, long nValue)
+static void ReleaseComPtr(void* pUnknown)
 {
-    memset(pOut, 0, 16);
-    *reinterpret_cast<unsigned short*>(pOut) = VT_I4;
-    *reinterpret_cast<long*>(reinterpret_cast<char*>(pOut) + 8) = nValue;
-}
-
-static void GetVectorPos(void* pVector, long* pnX, long* pnY)
-{
-    *pnX = 0;
-    *pnY = 0;
-    if (pVector == nullptr)
+    if (pUnknown == nullptr)
     {
         return;
     }
 
     __try
     {
-        void** pVtbl = *reinterpret_cast<void***>(pVector);
-        if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__get_y + sizeof(void*)))
+        void** pVtbl = *reinterpret_cast<void***>(pUnknown);
+        if (pVtbl != nullptr && !IsBadReadPtr(pVtbl, 12))
         {
-            return;
+            reinterpret_cast<unsigned long(__stdcall*)(void*)>(pVtbl[2])(pUnknown); // IUnknown::Release
         }
-        reinterpret_cast<VectorGetLong_t>(pVtbl[nVtbl_IWzVector2D__get_x / sizeof(void*)])(pVector, pnX);
-        reinterpret_cast<VectorGetLong_t>(pVtbl[nVtbl_IWzVector2D__get_y / sizeof(void*) ])(pVector, pnY);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
 }
 
-// Everything that decides whether a layer can be seen at all: size (a layer without a canvas draws
-// nothing), depth (behind the window's own canvas) and where it actually sits in its frame.
-// GetAlpha is deliberately not read: its prototype is not the (this, edx) shape GetWidth/GetHeight
-// use, and calling it that way faults inside it at 0x004143F4.
-static void DumpLayer(const char* sTag, void* pLayer)
-{
-    if (pLayer == nullptr)
-    {
-        LogLine("  %s: null", sTag);
-        return;
-    }
-
-    __try
-    {
-        long nX = 0;
-        long nY = 0;
-        GetVectorPos(pLayer, &nX, &nY);
-        LogLine("  %s %p: w=%d h=%d z=0x%08X pos=(%d,%d)", sTag, pLayer,
-            _layer_get_width(pLayer, nullptr), _layer_get_height(pLayer, nullptr),
-            static_cast<unsigned>(_layer_get_z(pLayer, nullptr)),
-            static_cast<int>(nX), static_cast<int>(nY));
-    }
-    __except (LogSehFilter(GetExceptionInformation()))
-    {
-    }
-}
-
-// Logs the binding only when it actually changes. Mouse moves drive this many times a second, so an
-// unconditional line would drown the log; a change is exactly what "the icon vanished" looks like.
-static void LogRefreshState(void* pParent, void* pLayer)
-{
-    static void* s_pParent = nullptr;
-    static void* s_pLayer = nullptr;
-    static long s_nParentX = 0;
-    static long s_nParentY = 0;
-    static long s_nLayerX = 0;
-    static long s_nLayerY = 0;
-
-    long nParentX = 0;
-    long nParentY = 0;
-    long nLayerX = 0;
-    long nLayerY = 0;
-    GetVectorPos(pParent, &nParentX, &nParentY);
-    GetVectorPos(pLayer, &nLayerX, &nLayerY);
-
-    if (pParent == s_pParent && pLayer == s_pLayer &&
-        nParentX == s_nParentX && nParentY == s_nParentY &&
-        nLayerX == s_nLayerX && nLayerY == s_nLayerY)
-    {
-        return;
-    }
-
-    s_pParent = pParent;
-    s_pLayer = pLayer;
-    s_nParentX = nParentX;
-    s_nParentY = nParentY;
-    s_nLayerX = nLayerX;
-    s_nLayerY = nLayerY;
-
-    __try
-    {
-        LogLine("  state: parent=%p(%d,%d) layer=%p(%d,%d) rel=(%d,%d) z=0x%08X",
-            pParent, static_cast<int>(nParentX), static_cast<int>(nParentY),
-            pLayer, static_cast<int>(nLayerX), static_cast<int>(nLayerY),
-            static_cast<int>(nLayerX - nParentX), static_cast<int>(nLayerY - nParentY),
-            static_cast<unsigned>(pLayer != nullptr ? _layer_get_z(pLayer, nullptr) : 0));
-    }
-    __except (LogSehFilter(GetExceptionInformation()))
-    {
-    }
-}
-
-static void DumpCanvas(const char* sTag, void* pCanvas)
-{
-    if (pCanvas == nullptr)
-    {
-        LogLine("  %s: null", sTag);
-        return;
-    }
-
-    __try
-    {
-        LogLine("  %s %p: cx=%d cy=%d", sTag, pCanvas,
-            _canvas_get_cx(pCanvas, nullptr), _canvas_get_cy(pCanvas, nullptr));
-    }
-    __except (LogSehFilter(GetExceptionInformation()))
-    {
-    }
-}
-
-// Runs CreateLayer once, reporting a _com_error with its HRESULT. Separate function from the
-// __try/__except wrapper below on purpose: MSVC allows only one form of exception handling per
-// function, and these wrappers throw _com_error while a bad pointer raises a structured exception.
-static bool CreateLayerRaw(void* pGr2D, void** ppLayer, unsigned long nWidth, unsigned long nHeight,
-    int nZ, void* pV1, void* pV2)
-{
-    try
-    {
-        _create_layer(pGr2D, nullptr, ppLayer, 0, 0, nWidth, nHeight, nZ, pV1, pV2);
-        return true;
-    }
-    catch (const _com_error& e)
-    {
-        LogLine("  create: _com_error hr=0x%08X w=%u h=%u z=0x%08X",
-            static_cast<unsigned>(e.Error()), nWidth, nHeight, static_cast<unsigned>(nZ));
-        return false;
-    }
-    catch (...)
-    {
-        LogLine("  create: unknown C++ exception w=%u h=%u z=0x%08X", nWidth, nHeight, static_cast<unsigned>(nZ));
-        return false;
-    }
-}
-
-static bool CreateLayerAttempt(void* pGr2D, void** ppLayer, unsigned long nWidth, unsigned long nHeight,
-    int nZ, void* pV1, void* pV2)
-{
-    __try
-    {
-        return CreateLayerRaw(pGr2D, ppLayer, nWidth, nHeight, nZ, pV1, pV2);
-    }
-    __except (LogSehFilter(GetExceptionInformation()))
-    {
-        return false;
-    }
-}
-
-// One fresh layer hung on the window's own layer, so raw_RelMove takes WINDOW-LOCAL pixels and the
-// engine carries the icon along when the window is dragged. Every step is traced (bVerbose) and
-// guarded: a fault here must not escape into the drop handler, which would leave the drop
-// unconsumed.
-static void* CreateSlotLayer(void* pParentLayer, bool bVerbose)
-{
-    __try
-    {
-        void* pGr2D = *reinterpret_cast<void**>(ADDR_Gr2DInstance);
-        if (pGr2D == nullptr || IsBadReadPtr(pGr2D, sizeof(void*)))
-        {
-            if (bVerbose) LogLine("  create: no Gr2D instance");
-            return nullptr;
-        }
-
-        unsigned char aCanvasId[16];
-        unsigned char aEmpty[16];
-        MakeIntVariant(aCanvasId, 0);
-        CopyEmptyVariant(aEmpty);
-
-        if (bVerbose)
-        {
-            LogLine("  create: gr2d=%p gr2d_vtbl=%p parent=%p", pGr2D, *reinterpret_cast<void**>(pGr2D), pParentLayer);
-            DumpLayer("  parent", pParentLayer);
-        }
-
-        // The client's own layers are created with width = height = 0 (CWnd::CreateWnd, 0x00800214);
-        // BuffTimer's come out 32x32 at depth 0xC006156C. Try the client's shape, fall back to the
-        // one that is proven to work in this plugin.
-        void* pLayer = nullptr;
-        if (!CreateLayerAttempt(pGr2D, &pLayer, 0, 0, kSlotLayerZ, aCanvasId, aEmpty))
-        {
-            LogLine("  create: retrying with BuffTimer's parameters");
-            if (!CreateLayerAttempt(pGr2D, &pLayer, 32, 32, kSlotLayerZ, aCanvasId, aEmpty))
-            {
-                return nullptr;
-            }
-        }
-
-        if (bVerbose)
-        {
-            LogLine("  create: layer=%p", pLayer);
-            DumpLayer("  created", pLayer);
-        }
-        if (pLayer == nullptr)
-        {
-            return nullptr;
-        }
-
-        if (bVerbose) LogLine("  create: put_origin=%d", SetLayerOrigin(pLayer, pParentLayer) ? 1 : 0);
-        if (bVerbose) LogLine("  create: putz=%d", LayerPutZ(pLayer, kSlotLayerZ) ? 1 : 0);
-
-        // CreateLayer leaves the layer colour at zero and a zero-alpha layer is not drawn at all
-        // (CUIToolTip::MakeLayer ends with exactly this call, 0x00800214 does it with 0x80FFFFFF).
-        _layer_put_color(pLayer, nullptr, kLayerVisible);
-        return pLayer;
-    }
-    __except (LogSehFilter(GetExceptionInformation()))
-    {
-        return nullptr;
-    }
-}
-
-// Takes a slot layer off the screen for good. The order matters: put_origin holds the window's
-// layer, so handing the origin back to the Gr2D centre is what releases it -- without that, the
-// window's own Destroy cannot free its layer and its graphics stay on screen after it is gone
-// (BuffTimer::ClearLabelLayer hit the same thing). Only then does dropping our reference free the
-// slot layer itself.
-static void DestroySlotLayer(void* pLayer)
-{
-    if (pLayer == nullptr)
-    {
-        return;
-    }
-
-    __try
-    {
-        void* pGr2D = *reinterpret_cast<void**>(ADDR_Gr2DInstance);
-        void* pCenter = nullptr;
-        if (pGr2D != nullptr && !IsBadReadPtr(pGr2D, sizeof(void*)))
-        {
-            _gr2d_get_center(pGr2D, nullptr, &pCenter);
-        }
-        if (pCenter != nullptr)
-        {
-            LogLine("  destroy %p: origin back to the centre=%d", pLayer, SetLayerOrigin(pLayer, pCenter) ? 1 : 0);
-            ReleaseComPtr(pCenter); // ours; the layer kept its own
-        }
-        else
-        {
-            LogLine("  destroy %p: no Gr2D centre to hand the origin back to", pLayer);
-        }
-        _layer_put_color(pLayer, nullptr, kLayerHidden);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
-
-    ReleaseComPtr(pLayer);
-}
-
-// Hands the skill's own icon canvas to the layer: Animate(layer, retbuf, canvas, v1..v5).
-// The five variants are the SKILL ICON recipe, not empty ones: the CTemporaryStatView entry tail
-// (0x007B3176, reached from its nType == 2 branch) passes VT_I4 500, VT_I4 210, VT_I4 64, empty,
-// empty. The all-empty shape belongs to the drag ghost at 0x00800214, and a layer animated that way
-// stays blank -- which is exactly how this module first came out invisible.
-static bool AnimateIcon(void* pLayer, void* pCanvas)
-{
-    if (pLayer == nullptr || pCanvas == nullptr)
-    {
-        return false;
-    }
-
-    unsigned char aRetBuf[16];
-    memset(aRetBuf, 0, sizeof(aRetBuf));
-
-    unsigned char aVariants[5][16];
-    MakeIntVariant(aVariants[0], 500);
-    MakeIntVariant(aVariants[1], 210);
-    MakeIntVariant(aVariants[2], 64);
-    CopyEmptyVariant(aVariants[3]);
-    CopyEmptyVariant(aVariants[4]);
-
-    __try
-    {
-        _layer_animate(pLayer, aRetBuf, pCanvas,
-            aVariants[0], aVariants[1], aVariants[2], aVariants[3], aVariants[4]);
-        return true;
-    }
-    __except (LogSehFilter(GetExceptionInformation()))
-    {
-        return false;
-    }
-}
-
-static void* GetSkillIconCanvas(int nSkillId)
-{
-    void* pInfo = *reinterpret_cast<void**>(ADDR_SkillInfoInstance);
-    if (pInfo == nullptr || nSkillId <= 0)
-    {
-        return nullptr;
-    }
-
-    __try
-    {
-        void* pEntry = _skill_get(pInfo, nSkillId);
-        if (pEntry == nullptr)
-        {
-            return nullptr;
-        }
-
-        return *reinterpret_cast<void**>(reinterpret_cast<char*>(pEntry) + OFF_SKILLENTRY_Icon);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return nullptr;
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Slot layers
-// ---------------------------------------------------------------------------------------------
-
-static void DestroyAllLayers()
-{
-    if (g_pParentLayer != nullptr)
-    {
-        LogLine("  teardown: window layer %p refs=%u", g_pParentLayer, ProbeRefCount(g_pParentLayer));
-    }
-
-    for (int nPet = 0; nPet < kPetCount; ++nPet)
-    {
-        for (int nSlot = 0; nSlot < kSlotCount; ++nSlot)
-        {
-            DestroySlotLayer(g_apLayers[nPet][nSlot]);
-            g_apLayers[nPet][nSlot] = nullptr;
-            g_anDrawn[nPet][nSlot] = 0;
-        }
-    }
-
-    if (g_pParentLayer != nullptr)
-    {
-        LogLine("  teardown: window layer refs after=%u", ProbeRefCount(g_pParentLayer));
-    }
-
-    g_pParentLayer = nullptr;
-}
-
-// Puts every configured slot on the window and (re)paints the ones whose skill changed.
-// bVerbose traces every step; it is only set on the drop path so mouse-move churn stays quiet.
-static void RefreshLayers(bool bVerbose)
-{
-    if (g_pWindow == nullptr)
-    {
-        return;
-    }
-
-    void* pParentLayer = GetWindowLayer(g_pWindow);
-    if (pParentLayer == nullptr)
-    {
-        return;
-    }
-
-    // The window rebuilds its layer if it is re-created behind our back; a layer we hung on the old
-    // one would be orphaned, so start over rather than move a layer that no longer follows.
-    if (g_pParentLayer != pParentLayer)
-    {
-        if (bVerbose)
-        {
-            LogLine("  window layer %p -> %p: rebuilding", g_pParentLayer, pParentLayer);
-        }
-        DestroyAllLayers();
-        g_pParentLayer = pParentLayer;
-    }
-
-    int nPet = -1;
-    __try
-    {
-        nPet = *reinterpret_cast<int*>(reinterpret_cast<char*>(g_pWindow) + OFF_CUIPetEquip_Tab);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return;
-    }
-
-    if (bVerbose)
-    {
-        LogLine("  refresh win=%p parent=%p tab=%d", g_pWindow, pParentLayer, nPet);
-    }
-
-    if (nPet < 0 || nPet >= kPetCount)
-    {
-        return;
-    }
-
-    for (int nSlot = 0; nSlot < kSlotCount; ++nSlot)
-    {
-        const int nSkillId = g_anSlots[nPet][nSlot];
-        void* pLayer = g_apLayers[nPet][nSlot];
-
-        if (bVerbose)
-        {
-            LogLine("  slot %d: skill=%d layer=%p drawn=%d", nSlot, nSkillId, pLayer, g_anDrawn[nPet][nSlot]);
-        }
-
-        if (nSkillId == 0)
-        {
-            if (pLayer != nullptr)
-            {
-                SetLayerVisible(pLayer, false);
-            }
-            g_anDrawn[nPet][nSlot] = 0;
-            continue;
-        }
-
-        bool bCreated = false;
-        if (pLayer == nullptr)
-        {
-            pLayer = CreateSlotLayer(pParentLayer, bVerbose);
-            g_apLayers[nPet][nSlot] = pLayer;
-            g_anDrawn[nPet][nSlot] = 0;
-            if (pLayer == nullptr)
-            {
-                LogLine("  layer create failed pet=%d slot=%d", nPet, nSlot);
-                continue;
-            }
-
-            bCreated = true;
-        }
-
-        if (g_anDrawn[nPet][nSlot] != nSkillId)
-        {
-            void* pCanvas = GetSkillIconCanvas(nSkillId);
-            if (bVerbose)
-            {
-                LogLine("  icon canvas=%p for skill=%d", pCanvas, nSkillId);
-                DumpCanvas("  icon", pCanvas);
-            }
-            if (pCanvas == nullptr)
-            {
-                LogLine("  no icon canvas for skill=%d", nSkillId);
-                continue;
-            }
-
-            if (AnimateIcon(pLayer, pCanvas))
-            {
-                g_anDrawn[nPet][nSlot] = nSkillId;
-                LogLine("  painted pet=%d slot=%d skill=%d", nPet, nSlot, nSkillId);
-            }
-            else
-            {
-                LogLine("  animate failed pet=%d slot=%d skill=%d", nPet, nSlot, nSkillId);
-                continue;
-            }
-        }
-
-        if (bCreated)
-        {
-            if (bVerbose) LogLine("  slot %d created", nSlot);
-        }
-
-        // Re-bind the layer on EVERY refresh, the way BuffTimer::BindLabelLayer re-binds its labels
-        // each tick. Moving the window re-hangs the window's own layer (CWndMan::UpdateWindowPosition
-        // 0x009E03A6 -> RemoveWindow, plus the LT/origin juggling in the layout pass sub_7FFB17), and
-        // whatever that invalidates is restored here.
-        //
-        // raw_RelMove is ABSOLUTE and, once the layer has its canvas, it sets the layer's left-top
-        // directly: measured with a canvas attached, asking for y = 76 reported 76; issued before
-        // Animate (a 0x0 layer with no canvas) the same call came back 32 short, because the engine
-        // then treats the value as the canvas's bottom edge. Hence: move after Animate, ask for the
-        // cell's own top. Repeated calls are idempotent, so re-issuing costs nothing.
-        SetLayerOrigin(pLayer, pParentLayer);
-        MoveLayer(pLayer, kSlotRects[nSlot].nLeft, kSlotRects[nSlot].nTop);
-
-        // PutZ re-inserts the layer at the end of its depth group, so this is also what keeps the
-        // icon above the window's own canvas after the window re-fronts itself.
-        LayerPutZ(pLayer, kSlotLayerZ);
-        SetLayerVisible(pLayer, true);
-
-        LogRefreshState(pParentLayer, pLayer);
-
-        if (bVerbose)
-        {
-            DumpLayer("  painted", pLayer);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Hooks
-// ---------------------------------------------------------------------------------------------
-
-// True when pTo is the pet equip window; *ppObject receives the object base the offsets are
-// relative to (the client's own convention is `interface - 4`, see OnDropped's `a3 - 4`).
+// True when pTo is the pet equip window; *ppObject receives the CWnd base the offsets are relative
+// to. Drag targets and CUIPetEquip::OnMouseMove hand out `obj + 4`; CWnd::Destroy hands out `obj`.
 static bool IsPetEquipWindow(void* pTo, void** ppObject)
 {
     *ppObject = nullptr;
@@ -900,8 +295,7 @@ static bool IsPetEquipWindow(void* pTo, void** ppObject)
             return true;
         }
 
-        void* pPrev = *reinterpret_cast<void**>(reinterpret_cast<char*>(pTo) - 4);
-        if (pPrev == reinterpret_cast<void*>(VTBL_CUIPetEquip_Primary))
+        if (pVtbl == reinterpret_cast<void*>(VTBL_CUIPetEquip_Primary))
         {
             *ppObject = pTo;
             return true;
@@ -916,6 +310,414 @@ static bool IsPetEquipWindow(void* pTo, void** ppObject)
     return false;
 }
 
+// CSkillInfo::GetSkill(id), the lookup both the icon and the tooltip go through.
+static void* GetSkillEntry(int nSkillId)
+{
+    void* pInfo = *reinterpret_cast<void**>(ADDR_SkillInfoInstance);
+    if (pInfo == nullptr || nSkillId <= 0)
+    {
+        return nullptr;
+    }
+
+    __try
+    {
+        return _skill_get(pInfo, nSkillId);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+}
+
+// The skill's own 32x32 icon canvas, the same field the client's buff row paints
+// (CTemporaryStatView's entry ctor takes the nType == 2 branch straight to *(SKILLENTRY + 0xAC)).
+static void* GetSkillIconCanvas(int nSkillId)
+{
+    void* pEntry = GetSkillEntry(nSkillId);
+    if (pEntry == nullptr)
+    {
+        return nullptr;
+    }
+
+    __try
+    {
+        return *reinterpret_cast<void**>(reinterpret_cast<char*>(pEntry) + OFF_SKILLENTRY_Icon);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+}
+
+// The slot whose cell contains (nX, nY), or -1. Window-local pixels, the frame the drop coordinates
+// and the window's own rect table use.
+static int FindSlotAt(int nX, int nY)
+{
+    for (int i = 0; i < kSlotCount; ++i)
+    {
+        const SlotRect& r = kSlotRects[i];
+        if (nX >= r.nLeft && nX <= r.nRight && nY >= r.nTop && nY <= r.nBottom)
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static int GetTab(void* pWindow)
+{
+    int nPet = -1;
+    __try
+    {
+        nPet = *reinterpret_cast<int*>(reinterpret_cast<char*>(pWindow) + OFF_CUIPetEquip_Tab);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+
+    return nPet;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Picking a slot up: the client's own CDraggableSkill, so the ghost, the cursor and the drop
+// handling all come from the client
+// ---------------------------------------------------------------------------------------------
+
+// put_origin hands the layer its own reference to the new origin; raw_RelMove is absolute and, once
+// the layer has a canvas, sets the canvas's BOTTOM-left (measured: asking for y = 44 reported 12 on
+// a canvas-less layer, 76 for 76 on one that had its canvas).
+static bool SetLayerOrigin(void* pLayer, void* pOrigin)
+{
+    void** pVtbl = *reinterpret_cast<void***>(pLayer);
+    if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__put_origin + sizeof(void*)))
+    {
+        return false;
+    }
+
+    VARIANTARG vOrigin;
+    memset(&vOrigin, 0, sizeof(vOrigin));
+    vOrigin.vt = VT_UNKNOWN;
+    vOrigin.punkVal = reinterpret_cast<IUnknown*>(pOrigin);
+
+    __try
+    {
+        reinterpret_cast<VectorPutOrigin_t>(pVtbl[nVtbl_IWzVector2D__put_origin / sizeof(void*)])(pLayer, vOrigin);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool MoveLayer(void* pLayer, long nX, long nY)
+{
+    void** pVtbl = *reinterpret_cast<void***>(pLayer);
+    if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__raw_RelMove + sizeof(void*)))
+    {
+        return false;
+    }
+
+    // Both variants must be spelled out: calling it with x/y alone leaves 32 bytes of arguments
+    // missing and the callee pops its own count, which corrupts the stack (QuestBulb.cpp).
+    VARIANTARG v1;
+    VARIANTARG v2;
+    memcpy(&v1, reinterpret_cast<const void*>(ADDR_EmptyVariant), sizeof(v1));
+    memcpy(&v2, reinterpret_cast<const void*>(ADDR_EmptyVariant), sizeof(v2));
+
+    __try
+    {
+        reinterpret_cast<VectorRawRelMove_t>(pVtbl[nVtbl_IWzVector2D__raw_RelMove / sizeof(void*)])(pLayer, nX, nY, v1, v2);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static void ForgetDragSource()
+{
+    g_nDragFromPet = -1;
+    g_nDragFromSlot = -1;
+    g_pDragFromWindow = nullptr;
+}
+
+// Takes the skill out of the slot a drag started from, and repaints that window. Called when the
+// drop lands anywhere other than the cell it came from -- which is how the client's own equipment
+// slots are emptied.
+static void ClearDragSourceSlot()
+{
+    const int nPet = g_nDragFromPet;
+    const int nSlot = g_nDragFromSlot;
+    void* pWindow = g_pDragFromWindow;
+    ForgetDragSource();
+
+    if (nPet < 0 || nPet >= kPetCount || nSlot < 0 || nSlot >= kSlotCount || pWindow == nullptr)
+    {
+        return;
+    }
+
+    g_anSlots[nPet][nSlot] = 0;
+    LogLine("  removed pet=%d slot=%d", nPet, nSlot);
+
+    __try
+    {
+        _wnd_invalidate(pWindow, nullptr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+}
+
+// The drag ghost: a layer holding the skill's icon canvas. BeginDragDrop gives it its origin and
+// pushes it to the front itself (put_origin on CWndMan's org window, then sub_61738F with
+// 0x7FFFFFFD), so the draggable only has to hand the layer over at +0xC.
+static void* CreateGhostLayer(void* pIconCanvas, void* pWindow, int nLocalX, int nLocalY)
+{
+    if (pIconCanvas == nullptr)
+    {
+        return nullptr;
+    }
+
+    void* pGr2D = *reinterpret_cast<void**>(ADDR_Gr2DInstance);
+    if (pGr2D == nullptr || IsBadReadPtr(pGr2D, sizeof(void*)))
+    {
+        return nullptr;
+    }
+
+    // CreateLayer's first variant is a VT_I4 canvas id, the second a copy of the empty variant.
+    VARIANTARG vCanvasId;
+    memset(&vCanvasId, 0, sizeof(vCanvasId));
+    vCanvasId.vt = VT_I4;
+    vCanvasId.lVal = 0;
+
+    unsigned char aEmpty[16];
+    memcpy(aEmpty, reinterpret_cast<const void*>(ADDR_EmptyVariant), 16);
+
+    void* pLayer = nullptr;
+    _create_layer(pGr2D, nullptr, &pLayer, 0, 0, 0, 0, nGhostLayerZ, &vCanvasId, aEmpty);
+    if (pLayer == nullptr)
+    {
+        return nullptr;
+    }
+
+    // Animate's five variants are the skill-icon recipe (0x007B3176's tail), not the drag ghost's
+    // all-empty shape -- that one belongs to a static item image and leaves a canvas blank.
+    VARIANTARG aAttr[5];
+    memset(aAttr, 0, sizeof(aAttr));
+    aAttr[0].vt = VT_I4;
+    aAttr[0].lVal = 500;
+    aAttr[1].vt = VT_I4;
+    aAttr[1].lVal = 210;
+    aAttr[2].vt = VT_I4;
+    aAttr[2].lVal = 64;
+    memcpy(&aAttr[3], aEmpty, sizeof(VARIANTARG));
+    memcpy(&aAttr[4], aEmpty, sizeof(VARIANTARG));
+
+    unsigned char aRetBuf[16];
+    memset(aRetBuf, 0, sizeof(aRetBuf));
+    _layer_animate(pLayer, aRetBuf, pIconCanvas, &aAttr[0], &aAttr[1], &aAttr[2], &aAttr[3], &aAttr[4]);
+
+    // CreateLayer leaves the layer colour at 0, which is fully transparent.
+    _layer_put_color(pLayer, nullptr, kGhostColor);
+
+    // Hang it on the window's own layer and put it under the cursor IN WINDOW-LOCAL PIXELS.
+    // BeginDragDrop then re-origins the ghost onto the UI root window and converts its position with
+    // `Getx(ghost) - Getx(rootWindow)`, i.e. it carries a ghost that was positioned in the window's
+    // frame over to the screen frame. Skipping this step leaves the ghost at the layer's (0,0) and
+    // the per-frame follow only tracks the mouse DELTA, so it stays a fixed distance away.
+    void* pWindowLayer = *reinterpret_cast<void**>(reinterpret_cast<char*>(pWindow) + 0x18);
+    if (pWindowLayer != nullptr)
+    {
+        SetLayerOrigin(pLayer, pWindowLayer);
+        MoveLayer(pLayer, nLocalX + nGhostOffsetX, nLocalY + nGhostOffsetY);
+    }
+
+    LogLine("  ghost layer: w=%d h=%d z=0x%08X",
+        _layer_get_width(pLayer, nullptr), _layer_get_height(pLayer, nullptr),
+        static_cast<unsigned>(_layer_get_z(pLayer, nullptr)));
+    return pLayer;
+}
+
+// Hands the client a CDraggableSkill carrying this slot's skill and starts a drag with it.
+// pSource is the window pointer the client itself uses for a drag (`obj + 4`, the one OnDropped and
+// EndDragDrop see); pWindow is the CWnd base, which is what CWnd::InvalidateRect and the tab field
+// need. The draggable's +0xC is the ghost layer, NOT the window -- BeginDragDrop treats that field
+// as an IWzShape2D and calls put_origin / raw_RelMove on it.
+static bool StartSlotDrag(void* pSource, void* pWindow, int nPet, int nSlot, int nLocalX, int nLocalY)
+{
+    const int nSkillId = g_anSlots[nPet][nSlot];
+    if (nSkillId == 0)
+    {
+        return false;
+    }
+
+    void* pGhost = nullptr;
+
+    __try
+    {
+        pGhost = CreateGhostLayer(GetSkillIconCanvas(nSkillId), pWindow, nLocalX, nLocalY);
+        LogLine("  drag: ghost=%p", pGhost);
+        if (pGhost == nullptr)
+        {
+            return false;
+        }
+
+        void* pDraggable = reinterpret_cast<ZAllocExAlloc_t>(ADDR_ZAllocEx_Alloc)(
+            reinterpret_cast<void*>(ADDR_ZAllocEx_s_alloc), nCDraggableSkill_Size);
+        LogLine("  drag: alloc=%p", pDraggable);
+        if (pDraggable == nullptr)
+        {
+            ReleaseComPtr(pGhost);
+            return false;
+        }
+
+        memset(pDraggable, 0, nCDraggableSkill_Size);
+        reinterpret_cast<CDraggableBaseCtor_t>(ADDR_CDraggable_BaseCtor)(pDraggable, pGhost);
+        LogLine("  drag: base ctor done, p=%p", pDraggable);
+
+        *reinterpret_cast<int*>(reinterpret_cast<char*>(pDraggable) + OFF_CDraggableSkill_SkillId) = nSkillId;
+        // 1 skips OnDropped's "is this skill learned?" gate, which is the check the client's own
+        // drags from the skill window satisfy differently (they drag a skill the player has).
+        *reinterpret_cast<int*>(reinterpret_cast<char*>(pDraggable) + OFF_CDraggableSkill_Validated) = 1;
+        *reinterpret_cast<void**>(pDraggable) = reinterpret_cast<void*>(ADDR_CDraggableSkill_Vtbl);
+        LogLine("  drag: fields set");
+
+        // The base ctor took its own reference on the ghost; ours is handed back here, leaving the
+        // draggable the only owner.
+        ReleaseComPtr(pGhost);
+        pGhost = nullptr;
+
+        reinterpret_cast<CWndManBeginDragDrop_t>(ADDR_CWndMan_BeginDragDrop)(
+            *reinterpret_cast<void**>(ADDR_CWndMan_Instance), pSource, pDraggable);
+        LogLine("  drag: begun");
+    }
+    __except (LogSehFilter(GetExceptionInformation()))
+    {
+        if (pGhost != nullptr)
+        {
+            ReleaseComPtr(pGhost);
+        }
+        return false;
+    }
+
+    g_nDragFromPet = nPet;
+    g_nDragFromSlot = nSlot;
+    // The base, not the interface: this is handed to CWnd::InvalidateRect when the drop removes the
+    // skill, and the interface pointer leaves the window un-repainted (the icon then stays on screen
+    // until the window is recreated).
+    g_pDragFromWindow = pWindow;
+    LogLine("  drag start pet=%d slot=%d skill=%d", nPet, nSlot, nSkillId);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drawing: the window's own canvas, the way CUIPetEquip::Draw paints its cells
+// ---------------------------------------------------------------------------------------------
+
+// Paints the two slot icons into the pet equip window's canvas. Runs after the window's own Draw,
+// i.e. after its background and its cell icons and before the tooltip is painted over the window.
+static void DrawSlotIcons(void* pWindow)
+{
+    if (pWindow == nullptr)
+    {
+        return;
+    }
+
+    const int nPet = GetTab(pWindow);
+    if (nPet < 0 || nPet >= kPetCount)
+    {
+        return;
+    }
+
+    if (g_anSlots[nPet][0] == 0 && g_anSlots[nPet][1] == 0)
+    {
+        return;
+    }
+
+    __try
+    {
+        unsigned char aCanvasPtr[16];
+        memset(aCanvasPtr, 0, sizeof(aCanvasPtr));
+        _wnd_get_canvas(pWindow, aCanvasPtr); // com_ptr<IWzCanvas> by value
+
+        void* pCanvas = *reinterpret_cast<void**>(aCanvasPtr);
+        if (pCanvas == nullptr)
+        {
+            return;
+        }
+
+        void** pVtbl = *reinterpret_cast<void***>(pCanvas);
+        if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzCanvas__DrawCanvas + sizeof(void*)))
+        {
+            ReleaseComPtr(pCanvas);
+            return;
+        }
+
+        // DrawCanvas takes its attribute as a Ztl_variant_t BY VALUE, so it has to be a real
+        // VARIANTARG rather than the byte buffer the by-reference wrappers use.
+        VARIANTARG vAttr;
+        memset(&vAttr, 0, sizeof(vAttr));
+        memcpy(&vAttr, reinterpret_cast<const void*>(ADDR_EmptyVariant), sizeof(vAttr));
+
+        for (int nSlot = 0; nSlot < kSlotCount; ++nSlot)
+        {
+            const int nSkillId = g_anSlots[nPet][nSlot];
+            if (nSkillId == 0)
+            {
+                continue;
+            }
+
+            void* pIcon = GetSkillIconCanvas(nSkillId);
+            if (pIcon == nullptr)
+            {
+                LogLine("  draw: no icon canvas for skill=%d", nSkillId);
+                continue;
+            }
+
+            reinterpret_cast<CanvasDrawCanvas_t>(pVtbl[nVtbl_IWzCanvas__DrawCanvas / sizeof(void*)])(
+                pCanvas, kSlotRects[nSlot].nLeft, kSlotRects[nSlot].nTop, pIcon, vAttr);
+        }
+
+        ReleaseComPtr(pCanvas);
+    }
+    __except (LogSehFilter(GetExceptionInformation()))
+    {
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------------------------
+
+// The window's draw override: let it paint the background and its own cells, then add ours. Every
+// repaint -- opening the window, switching pet tabs, moving it, a tooltip coming and going -- comes
+// back through here, so the icons are never stale and never need a layer of their own.
+static int __fastcall Draw_Hook(void* pThis, void* /*edx*/, const void* pRect)
+{
+    int nResult = 0;
+    if (g_origDraw != nullptr)
+    {
+        nResult = g_origDraw(pThis, pRect);
+    }
+
+    __try
+    {
+        void* pObject = nullptr;
+        if (IsPetEquipWindow(pThis, &pObject))
+        {
+            DrawSlotIcons(pObject);
+        }
+    }
+    __except (LogSehFilter(GetExceptionInformation()))
+    {
+    }
+
+    return nResult;
+}
+
 static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, void* pTo, int nX, int nY)
 {
     int nResult = 0;
@@ -924,22 +726,27 @@ static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, vo
         nResult = g_origOnDropped(pThis, pFrom, pTo, nX, nY);
     }
 
-    // The client already consumed the drop (quickslot, macro, skill window, ...): leave it alone.
+    // The client already consumed the drop (quickslot, macro, skill window, ...). If the drag came
+    // out of one of our slots the skill has moved there, so that slot is empty now.
     if (nResult != 0)
     {
+        ClearDragSourceSlot();
         return nResult;
     }
 
     void* pObject = nullptr;
     if (!IsPetEquipWindow(pTo, &pObject))
     {
+        // Dropped somewhere other than the slot cells: taking a skill out of a slot is done by
+        // dragging it out, exactly like emptying an equipment slot.
+        ClearDragSourceSlot();
         return 0;
     }
 
     __try
     {
         const int nSkillId = *reinterpret_cast<int*>(reinterpret_cast<char*>(pThis) + OFF_DraggableSkill_SkillId);
-        const int nPet = *reinterpret_cast<int*>(reinterpret_cast<char*>(pObject) + OFF_CUIPetEquip_Tab);
+        const int nPet = GetTab(pObject);
 
         LogLine("drop to=%p obj=%p tab=%d skill=%d x=%d y=%d whitelisted=%d",
             pTo, pObject, nPet, nSkillId, nX, nY, IsPetBuffSkill(nSkillId) ? 1 : 0);
@@ -955,45 +762,158 @@ static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, vo
             return 0;
         }
 
-        int nSlot = -1;
-        for (int i = 0; i < kSlotCount; ++i)
-        {
-            const SlotRect& r = kSlotRects[i];
-            if (nX >= r.nLeft && nX <= r.nRight && nY >= r.nTop && nY <= r.nBottom)
-            {
-                nSlot = i;
-                break;
-            }
-        }
-
+        // The cell the cursor is over, if any. A release anywhere else inside the window counts as
+        // taking the skill out, the same as releasing outside it -- there is no snapping back to the
+        // nearest cell, which used to put the skill back when the drop landed on empty window space.
+        const int nSlot = FindSlotAt(nX, nY);
         if (nSlot < 0)
         {
-            nSlot = (nX >= kSlotRects[1].nLeft) ? 1 : 0;
-            LogLine("  cell fallback: slot=%d", nSlot);
+            LogLine("  dropped off the cells: removing");
+            ClearDragSourceSlot();
+            return 0;
+        }
+
+        // A skill may only occupy one of the six cells. Placing it again moves it: the later
+        // placement wins and the cell that held it is cleared, across pet tabs as well.
+        for (int nOtherPet = 0; nOtherPet < kPetCount; ++nOtherPet)
+        {
+            for (int nOtherSlot = 0; nOtherSlot < kSlotCount; ++nOtherSlot)
+            {
+                if ((nOtherPet != nPet || nOtherSlot != nSlot) &&
+                    g_anSlots[nOtherPet][nOtherSlot] == nSkillId)
+                {
+                    g_anSlots[nOtherPet][nOtherSlot] = 0;
+                    LogLine("  moved out of pet=%d slot=%d", nOtherPet, nOtherSlot);
+                }
+            }
         }
 
         g_anSlots[nPet][nSlot] = nSkillId;
         LogLine("  stored pet=%d slot=%d skill=%d", nPet, nSlot, nSkillId);
 
-        g_pWindow = pObject;
-        RefreshLayers(true);
+        // Dragging a slot onto another slot is the same case as dropping the same skill again: the
+        // dedup pass above has already emptied the cell it came from, so only the bookkeeping is
+        // left to drop.
+        ForgetDragSource();
 
-        // Return 0 even though the slot was taken: a non-zero result tells CWndMan::EndDragDrop
-        // (0x009E37C2) that the target ACCEPTED the drop, and it then runs the drop-into-the-world
-        // path -- `if (v31) sub_8D63EC(CUIStatusBar::ms_pInstance, x, y, dragCtx + 4)` -- which
-        // leaves the UI unresponsive and unclosable for a skill. The original returns 0 whenever
-        // the skill is not one it handles, so 0 is the ordinary "nobody took it" outcome.
+        // The drop itself does not repaint the window, so without this the icon only appears on the
+        // next repaint something else happens to trigger (hovering a cell and getting its tooltip,
+        // for instance). The client marks its own windows dirty the same way -- CWnd::CreateWnd ends
+        // with CWnd::InvalidateRect(this, 0).
+        _wnd_invalidate(pObject, nullptr);
+
+        // Return 0 even though the slot was taken: a non-zero result tells CWndMan::EndDragDrop that
+        // the target ACCEPTED the drop, and it then runs the drop-into-the-world path, which leaves
+        // the UI unresponsive and unclosable for a skill. The original returns 0 whenever the skill
+        // is not one it handles, so 0 is the ordinary "nobody took it" outcome.
         return 0;
     }
     __except (LogSehFilter(GetExceptionInformation()))
     {
         LogLine("  exception while reading the drop");
+        ForgetDragSource();
         return 0;
     }
 }
 
-// The window is repainted and dragged around while it is open; re-positioning on every mouse move
-// keeps the layers on their cells without needing an update hook of our own.
+// Pressing a slot picks its skill up with the client's own draggable. The window's own handler runs
+// first and handles its registered cells (the potion cells start their own drags there), so this
+// only fires for the two cells the client knows nothing about.
+static void __fastcall OnMouseButton_Hook(void* pThis, void* /*edx*/, unsigned int nMsg,
+    unsigned int nParam, long nX, long nY)
+{
+    if (g_origOnMouseButton != nullptr)
+    {
+        g_origOnMouseButton(pThis, nMsg, nParam, nX, nY);
+    }
+
+    __try
+    {
+        void* pObject = nullptr;
+        if (!IsPetEquipWindow(pThis, &pObject))
+        {
+            return;
+        }
+
+        if (nMsg != nMsgLButtonDown)
+        {
+            return;
+        }
+
+        // A fresh press: any earlier drag never completed, so drop its bookkeeping.
+        ForgetDragSource();
+
+        const int nPet = GetTab(pObject);
+        const int nSlot = FindSlotAt(nX, nY);
+
+        // Logged for every press so a drag that never starts can be told apart from a press that
+        // never reaches this window (a tooltip sitting under the cursor does exactly that).
+        LogLine("  press msg=%u x=%d y=%d tab=%d slot=%d", nMsg, nX, nY, nPet, nSlot);
+
+        if (nPet < 0 || nPet >= kPetCount || nSlot < 0)
+        {
+            return;
+        }
+
+        StartSlotDrag(pThis, pObject, nPet, nSlot, nX, nY);
+    }
+    __except (LogSehFilter(GetExceptionInformation()))
+    {
+    }
+}
+
+// The slot cells carry no id in the window's own hit test (it answers 0 there), so their tooltip is
+// ours to show -- the same two calls, in the same order, as the client's own buff icons. Screen
+// pixels: the tooltip positions itself absolutely.
+static void ShowSlotToolTip(void* pObject, int nX, int nY, bool bOnClientCell)
+{
+    const int nPet = GetTab(pObject);
+    const int nSlot = FindSlotAt(nX, nY);
+
+    void* pEntry = nullptr;
+    if (nPet >= 0 && nPet < kPetCount && nSlot >= 0)
+    {
+        const int nSkillId = g_anSlots[nPet][nSlot];
+        if (nSkillId != 0)
+        {
+            pEntry = GetSkillEntry(nSkillId);
+        }
+    }
+
+    __try
+    {
+        void* pToolTip = reinterpret_cast<char*>(pObject) + OFF_CUIPetEquip_ToolTip;
+        if (pEntry == nullptr)
+        {
+            // The window's own OnMouseMove has already run: only clear when it had nothing to show
+            // either, so its tooltip is left alone.
+            if (!bOnClientCell)
+            {
+                _tooltip_clear(pToolTip);
+            }
+            return;
+        }
+
+        POINT ptCursor;
+        ptCursor.x = 0;
+        ptCursor.y = 0;
+        _wndman_get_cursor_pos(*reinterpret_cast<void**>(ADDR_CWndMan_Instance), &ptCursor, 0);
+
+        // The window's own OnMouseMove has just set the cursor back to its default for a cell it
+        // does not know, so the grab hand has to be re-applied here -- same state value it uses.
+        _input_set_cursor_state(*reinterpret_cast<void**>(ADDR_CInputSystem_Instance), nCursorGrab);
+
+        _tooltip_clear(pToolTip);
+        // The client's own cell tooltips sit 20px below the cell's top edge (`window.y + cell.y + 20`
+        // in CUIPetEquip::OnMouseMove), which also keeps the tooltip out from under the cursor --
+        // with it centred on the cursor the press landed on the tooltip window instead of the cell.
+        _tooltip_set_skill(pToolTip, nullptr, ptCursor.x, ptCursor.y + 20, pEntry, 0);
+    }
+    __except (LogSehFilter(GetExceptionInformation()))
+    {
+    }
+}
+
 static int __fastcall OnMouseMove_Hook(void* pThis, void* /*edx*/, int nX, int nY)
 {
     int nResult = 0;
@@ -1004,17 +924,21 @@ static int __fastcall OnMouseMove_Hook(void* pThis, void* /*edx*/, int nX, int n
 
     __try
     {
-        // CUIPetEquip::OnMouseMove is called with the window's SECOND base (`obj + 4`), the same
-        // pointer CWndMan hands out as a drop target -- the destroy log caught it: `this=2422787C
-        // tracked=24227880`. The tab field, the layer field and CWnd::Destroy all live on the CWnd
-        // base, so the pointer is normalised the same way the drop path does it. Skipping the
-        // normalisation made every mouse move re-hang the icon on whatever sat at obj + 0x1C and
-        // left CWnd::Destroy unable to recognise the window at all.
         void* pObject = nullptr;
         if (IsPetEquipWindow(pThis, &pObject))
         {
-            g_pWindow = pObject;
-            RefreshLayers(false);
+            // Non-zero means the window is showing one of its own cell tooltips; that one is not ours
+            // to clear.
+            bool bOnClientCell = false;
+            __try
+            {
+                bOnClientCell = _hit_test(pObject, nullptr, nX, nY) != 0;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+
+            ShowSlotToolTip(pObject, nX, nY, bOnClientCell);
         }
     }
     __except (LogSehFilter(GetExceptionInformation()))
@@ -1024,32 +948,28 @@ static int __fastcall OnMouseMove_Hook(void* pThis, void* /*edx*/, int nX, int n
     return nResult;
 }
 
-// The pet equip window is created and destroyed on every toggle, so its layers must not outlive it.
-static void __fastcall Destroy_Hook(void* pThis, void* /*edx*/)
+// Leaving the game is also what a character switch does, and the client keeps running for the next
+// character, so the configuration has to go with it: the slots belong to the character that set
+// them. Same hook point BuffTimer uses to drop its buff labels on the way out.
+static int __fastcall OnLeaveGame_Hook(void* pThis, void* edx)
 {
-    __try
+    for (int nPet = 0; nPet < kPetCount; ++nPet)
     {
-        if (g_pWindow != nullptr)
+        for (int nSlot = 0; nSlot < kSlotCount; ++nSlot)
         {
-            LogLine("  window destroy: this=%p tracked=%p%s", pThis, g_pWindow,
-                (pThis == g_pWindow || pThis == reinterpret_cast<char*>(g_pWindow) + 4) ? " (ours)" : "");
-        }
-
-        if (g_pWindow != nullptr &&
-            (pThis == g_pWindow || pThis == reinterpret_cast<char*>(g_pWindow) + 4))
-        {
-            DestroyAllLayers();
-            g_pWindow = nullptr;
+            g_anSlots[nPet][nSlot] = 0;
         }
     }
-    __except (LogSehFilter(GetExceptionInformation()))
+
+    ForgetDragSource();
+    LogLine("  left the game: slots cleared");
+
+    if (g_origOnLeaveGame != nullptr)
     {
+        return g_origOnLeaveGame(pThis, edx);
     }
 
-    if (g_origDestroy != nullptr)
-    {
-        g_origDestroy(pThis);
-    }
+    return 0;
 }
 
 int PetSkillSlot::GetSkill(int nPet, int nSlot)
@@ -1087,6 +1007,17 @@ void Hook_PetSkillSlot(bool enable)
         }
     }
 
+    if (g_origDraw == nullptr)
+    {
+        g_origDraw = reinterpret_cast<PetEquipDraw_t>(ADDR_CUIPetEquip_Draw);
+        if (!Memory::SetHook(true, reinterpret_cast<void**>(&g_origDraw),
+            reinterpret_cast<void*>(&Draw_Hook)))
+        {
+            g_origDraw = nullptr;
+            std::cout << "pet auto-buff slots: Draw hook FAILED" << std::endl;
+        }
+    }
+
     if (g_origOnMouseMove == nullptr)
     {
         g_origOnMouseMove = reinterpret_cast<PetEquipOnMouseMove_t>(ADDR_CUIPetEquip_OnMouseMove);
@@ -1098,13 +1029,25 @@ void Hook_PetSkillSlot(bool enable)
         }
     }
 
-    if (g_origDestroy == nullptr)
+    if (g_origOnMouseButton == nullptr)
     {
-        g_origDestroy = reinterpret_cast<CWndDestroy_t>(ADDR_CWnd_Destroy);
-        if (!Memory::SetHook(true, reinterpret_cast<void**>(&g_origDestroy),
-            reinterpret_cast<void*>(&Destroy_Hook)))
+        g_origOnMouseButton = reinterpret_cast<PetEquipOnMouseButton_t>(ADDR_CUIPetEquip_OnMouseButton);
+        if (!Memory::SetHook(true, reinterpret_cast<void**>(&g_origOnMouseButton),
+            reinterpret_cast<void*>(&OnMouseButton_Hook)))
         {
-            g_origDestroy = nullptr;
+            g_origOnMouseButton = nullptr;
+            std::cout << "pet auto-buff slots: OnMouseButton hook FAILED" << std::endl;
+        }
+    }
+
+    if (g_origOnLeaveGame == nullptr)
+    {
+        g_origOnLeaveGame = reinterpret_cast<CWvsContextOnLeaveGame_t>(ADDR_CWvsContext_OnLeaveGame);
+        if (!Memory::SetHook(true, reinterpret_cast<void**>(&g_origOnLeaveGame),
+            reinterpret_cast<void*>(&OnLeaveGame_Hook)))
+        {
+            g_origOnLeaveGame = nullptr;
+            std::cout << "pet auto-buff slots: OnLeaveGame hook FAILED" << std::endl;
         }
     }
 
