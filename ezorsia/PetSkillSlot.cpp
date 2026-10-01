@@ -55,23 +55,30 @@
 //   (nothing in 0x8E49B5..0x8F6000 creates one), so any depth that keeps a layer above the window's
 //   canvas keeps it above the tooltip too.
 //
-// --- the slot bottom: a green rounded rect, in the client's own paint calls ----------------------
+// --- the slot bottom: a green rect, in the client's own paint calls -------------------------------
 //   CUIPetEquip::Draw washes a cell it cannot use with IWzCanvas vtable +140, "fill a rectangle":
 //       (*(*canvas + 140))(canvas, x, y, 32, 32, 0x40FF0000)   at (46, 11) / (112, 11) / (tbl, tbl)
 //   i.e. (left, top, width, height, 0xAARRGGBB) -- 0x40FF0000 is the semi-transparent RED of that
 //   wash, which is what makes the argument order readable. CUIToolTip::MakeLayer uses the same call
-//   for its whole background and for its 1x1 corner pixels, so a 1px-tall fill is a supported shape;
-//   the rounded corners below are cut by drawing the rect one scanline at a time (never overlapping,
-//   or a translucent colour would double-blend along the seams).
+//   for its whole background and for its 1x1 corner pixels, so a 1px-tall fill is a supported shape.
 //
 //   Text comes from IWzCanvas::DrawTextA (0x004277AD, vtable +0x98) with a font from
-//   get_basic_font (0x0098A707, global cache spFontBasic[56]). Both that wrapper and the width
-//   helper IWzFont (0x0042782E, vtable +0x1C) CONSUME the bstr they are handed -- each releases it on
-//   the way out -- so measuring and drawing need one bstr each. A bstr is made with the client's own
-//   _bstr_t(wchar_t const*) (0x00403382) into a 4-byte slot, exactly as CUIMessenger::DrawTextA and
-//   CAvatarMegaphone::Draw do (the latter centres with `78 - (width >> 1)`, the same arithmetic).
-//   Both colour arguments are left empty: the client never passes anything but an empty Ztl_variant_t
-//   there (0x00BF6300), and the colour comes from the font itself.
+//   get_basic_font (0x0098A707, global cache spFontBasic[56], whose 56 cases differ only in COLOUR --
+//   all of them create the same font). Both that wrapper and the width helper IWzFont (0x0042782E,
+//   vtable +0x1C) CONSUME the bstr they are handed: each releases it on the way out, so measuring and
+//   drawing need one bstr each. Both colour arguments are left empty -- the client never passes
+//   anything but an empty Ztl_variant_t there (0x00BF6300) -- and the colour comes from the font.
+//
+//   THE STRING IS FED AS DBCS BYTES, NOT AS A WIDE LITERAL. The font itself lives in Canvas.dll
+//   (CWzFont): that module has no TextOut/CreateFont/GetGlyphOutline import at all and only
+//   WideCharToMultiByte, i.e. it narrows the string it is handed back into MULTIBYTE codes and looks
+//   each glyph up by that code. The client's own UI strings survive that because they are narrow to
+//   begin with: _bstr_t(char const*) (0x00425ADD -> 0x00406301 -> 0x0040638C) widens them with
+//   MultiByteToWideChar(CP_ACP), and Canvas.dll narrows them with the same ACP, so the round trip
+//   returns the very bytes the glyph table is keyed by. A correct Unicode literal does NOT round
+//   trip: it narrows to whatever CP_ACP happens to be (950 on this machine), lands on codes the
+//   glyph table has no entry for, and renders as garbage -- and any character that ACP cannot
+//   represent (动 is not in Big5) degrades further. Hence the GBK byte literal below.
 //
 // --- the skill tooltip -----------------------------------------------------
 //   the window's embedded CUIToolTip sits at obj + 108 (its ctor: CUIToolTip::CUIToolTip(a1 + 27)).
@@ -161,7 +168,7 @@ static const int nVtbl_IWzCanvas__DrawRect = 140;
 static const DWORD ADDR_IWzCanvas_DrawTextA = 0x004277AD;  // IWzCanvas::DrawTextA, vtable +0x98
 static const DWORD ADDR_IWzFont_GetTextWidth = 0x0042782E; // IWzFont width, vtable +0x1C
 static const DWORD ADDR_get_basic_font = 0x0098A707;       // get_basic_font(FONT_TYPE)
-static const DWORD ADDR_bstr_t_CtorW = 0x00403382;         // _bstr_t::_bstr_t(wchar_t const*)
+static const DWORD ADDR_bstr_t_CtorA = 0x00425ADD;         // _bstr_t::_bstr_t(char const*)
 static const int nFontTypeCount = 56;                      // get_basic_font's switch covers 0..55
 
 // Window-local pixels of the two free cells in the second row (verified in game).
@@ -178,17 +185,14 @@ static const SlotRect kSlotRects[2] = {
     { 112, 44, 144, 76 },
 };
 
-// The bottom each of those two cells gets: a green rounded rect, plus one label over the pair. The
-// alpha and the "tint the cell" idea mirror the client's own red wash (0x40FF0000) at the same rects.
+// The bottom both cells get, and the label drawn across the pair. The alpha and the "tint the cell"
+// idea mirror the client's own red wash (0x40FF0000) at the same rects.
 static const unsigned long kSlotBackColor = 0x8000C000u;
-static const int nSlotRadius = 6;
 
-// Corner insets for a 6px radius: scanline i of the top edge is pulled in by
-// radius - round(sqrt(radius^2 - dy^2)), dy = radius - 1 - i. The bottom edge mirrors it.
-static const int kSlotRadiusInset[nSlotRadius] = { 3, 2, 1, 0, 0, 0 };
-
-// The label, spelled in universal character names so the source file's encoding cannot change it.
-static const wchar_t kWszSlotLabel[] = L"\u81EA\u52A8\u6280\u80FD";
+// 自动技能, as the DBCS bytes every other UI string in this client is made of (GBK: 自 D7D4, 动 B6AF,
+// 技 BCBC, 能 C4DC). Written as escapes so the source file's encoding cannot change it -- and it must
+// NOT be a wide literal, see the header block.
+static const char kszSlotLabelDbcs[] = "\xD7\xD4\xB6\xAF\xBC\xBC\xC4\xDC";
 static const int nSlotLabelOffsetY = 9;      // label top, from the cell top: 12px text centres in 32
 static const int nSlotLabelMaxWidth = 200;   // sanity bound on the measured width (see DrawSlotLabel)
 
@@ -208,6 +212,10 @@ bool PetSkillSlot::bEnabled = true;
 bool PetSkillSlot::bDebug = true;
 int PetSkillSlot::nLabelFont = 0;
 
+// One-off: the label's measured width goes into the log once, so a font that renders at an unexpected
+// size can be told apart from a font that renders the wrong glyphs.
+static bool g_bLabelLogged = false;
+
 typedef void* (__thiscall* CWndGetCanvas_t)(void* pWnd, void* pRetBuf);
 typedef void (__thiscall* CWndInvalidateRect_t)(void* pWnd, const void* pRect);
 typedef long(__stdcall* CanvasDrawCanvas_t)(void* pCanvas, long nX, long nY, void* pSrcCanvas,
@@ -221,7 +229,7 @@ typedef long(__thiscall* CanvasDrawTextA_t)(void* pCanvas, long nX, long nY, voi
     void* pFont, const VARIANTARG* pColor, const VARIANTARG* pTabOrg);
 typedef long(__thiscall* FontTextWidth_t)(void* pFont, void* pBstrSlot, const VARIANTARG* pVar);
 typedef void* (__cdecl* GetBasicFont_t)(void* pRetSlot, int nFontType);
-typedef void* (__thiscall* BstrCtorW_t)(void* pThis, const wchar_t* pszText);
+typedef void* (__thiscall* BstrCtorA_t)(void* pThis, const char* pszText);
 typedef void (__thiscall* CWndManGetCursorPos_t)(void* pWndMan, POINT* pOut, int nFlag);
 typedef void (__thiscall* CInputSystemSetCursorState_t)(void* pInputSystem, long nState);
 typedef int(__fastcall* CWvsContextOnLeaveGame_t)(void* pThis, void* edx);
@@ -672,32 +680,17 @@ static bool StartSlotDrag(void* pSource, void* pWindow, int nPet, int nSlot, int
 // Drawing: the window's own canvas, the way CUIPetEquip::Draw paints its cells
 // ---------------------------------------------------------------------------------------------
 
-// One cell's bottom: a rounded rect, drawn as one 1px scanline per row so that two fills never
-// overlap (a translucent colour would double-blend where they did).
-static void DrawRoundedRect(void* pCanvas, void** pVtbl, const SlotRect& rect, unsigned long nColor)
+// One cell's bottom: a plain filled rect, the shape CUIPetEquip::Draw uses for its own red wash (the
+// window has no rounded corner anywhere, so neither has this).
+static void DrawCellBottom(void* pCanvas, void** pVtbl, const SlotRect& rect, unsigned long nColor)
 {
-    auto drawRect = reinterpret_cast<CanvasDrawRect_t>(pVtbl[nVtbl_IWzCanvas__DrawRect / sizeof(void*)]);
-    const int nWidth = rect.nRight - rect.nLeft;
-    const int nHeight = rect.nBottom - rect.nTop;
-
-    for (int i = 0; i < nHeight; ++i)
-    {
-        int nInset = 0;
-        if (i < nSlotRadius)
-        {
-            nInset = kSlotRadiusInset[i];
-        }
-        else if (i >= nHeight - nSlotRadius)
-        {
-            nInset = kSlotRadiusInset[nHeight - 1 - i];
-        }
-
-        drawRect(pCanvas, rect.nLeft + nInset, rect.nTop + i, nWidth - 2 * nInset, 1, nColor);
-    }
+    reinterpret_cast<CanvasDrawRect_t>(pVtbl[nVtbl_IWzCanvas__DrawRect / sizeof(void*)])(
+        pCanvas, rect.nLeft, rect.nTop, rect.nRight - rect.nLeft, rect.nBottom - rect.nTop, nColor);
 }
 
-// The label, centred over the pair of cells. Its font is whichever FONT_TYPE the configuration
-// names; get_basic_font caches, but hands out a counted reference that has to be released.
+// The label, centred over the pair of cells. Its font is whichever FONT_TYPE the configuration names
+// -- the 56 cases are one font in different colours; get_basic_font caches, but hands out a counted
+// reference that has to be released.
 static void DrawSlotLabelRaw(void* pCanvas, void* pFont)
 {
     VARIANTARG vEmpty;
@@ -707,7 +700,7 @@ static void DrawSlotLabelRaw(void* pCanvas, void* pFont)
     // Measuring and drawing each consume their bstr, so each gets its own. The slot is one pointer
     // wide: that is all a Ztl_bstr_t holds, and the client's own callers keep it in a 4-byte local.
     void* aProbe[1] = {};
-    reinterpret_cast<BstrCtorW_t>(ADDR_bstr_t_CtorW)(aProbe, kWszSlotLabel);
+    reinterpret_cast<BstrCtorA_t>(ADDR_bstr_t_CtorA)(aProbe, kszSlotLabelDbcs);
     long nWidth = reinterpret_cast<FontTextWidth_t>(ADDR_IWzFont_GetTextWidth)(pFont, aProbe, &vEmpty);
     if (nWidth < 0 || nWidth > nSlotLabelMaxWidth)
     {
@@ -716,11 +709,18 @@ static void DrawSlotLabelRaw(void* pCanvas, void* pFont)
     }
 
     void* aText[1] = {};
-    reinterpret_cast<BstrCtorW_t>(ADDR_bstr_t_CtorW)(aText, kWszSlotLabel);
+    reinterpret_cast<BstrCtorA_t>(ADDR_bstr_t_CtorA)(aText, kszSlotLabelDbcs);
 
     const int nCenter = (kSlotRects[0].nLeft + kSlotRects[kSlotCount - 1].nRight) / 2;
     reinterpret_cast<CanvasDrawTextA_t>(ADDR_IWzCanvas_DrawTextA)(pCanvas,
         nCenter - nWidth / 2, kSlotRects[0].nTop + nSlotLabelOffsetY, aText, pFont, &vEmpty, &vEmpty);
+
+    if (PetSkillSlot::bDebug && !g_bLabelLogged)
+    {
+        g_bLabelLogged = true;
+        LogLine("  draw: label width=%d font=%d colour=0x%08X", nWidth, PetSkillSlot::nLabelFont,
+            kSlotBackColor);
+    }
 }
 
 // The drawing half, kept apart from the SEH guard because SEH (__try/__except) and C++ EH
@@ -751,7 +751,7 @@ static void DrawSlotsRaw(void* pWindow, int nPet)
 
         for (int nSlot = 0; nSlot < kSlotCount; ++nSlot)
         {
-            DrawRoundedRect(pCanvas, pVtbl, kSlotRects[nSlot], kSlotBackColor);
+            DrawCellBottom(pCanvas, pVtbl, kSlotRects[nSlot], kSlotBackColor);
         }
 
         int nFontType = PetSkillSlot::nLabelFont;

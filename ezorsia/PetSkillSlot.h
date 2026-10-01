@@ -27,7 +27,9 @@ public:
     static bool bEnabled;   // petBuff      : the whole feature
     static bool bDebug;     // petBuffDebug : append every drop decision to petbuff.log
 
-    // FONT_TYPE of the 「自动技能」 label over the two cells, 0..55 as get_basic_font has them.
+    // FONT_TYPE of the label over the two cells, 0..55 as get_basic_font has them. Its 56 cases are
+    // the same font in different COLOURS (all of them create it from one face and size) -- 0 = white,
+    // 1 = black, 2 = grey, 26 = another grey, 30/31 = orange/red.
     static int nLabelFont;  // petSkillSlotFont
 
     // Skill id in slot (nPet 0..2, nSlot 0..1); 0 = empty. Used by the auto-refresh step and by the
