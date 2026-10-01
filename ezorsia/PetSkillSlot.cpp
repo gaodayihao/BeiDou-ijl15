@@ -46,25 +46,44 @@
 //   so this module calls it as (layer, retbuf16, canvas, empty x5) -- and it never spends an icon
 //   canvas of its own, it reuses the one the client cached in SKILLENTRY.
 //
+// --- where a slot layer hangs ----------------------------------------------
+//   CWnd::CreateWnd (0x009DE4D2) keeps the window's own Gr2D layer at *(CWnd + 0x18)
+//   (CWnd::GetLayer 0x00426604 is literally `return *(this + 6)`), and 0x00800214 -- the window's
+//   own mouse-down handler, drawing the drag ghost over a potion cell -- shows the shape a child
+//   layer must take:
+//       CreateLayer(gr2d, &layer, 0, 0, 0, 0, 0, empty, empty)
+//       Animate(layer, &retbuf, canvas, empty x5)
+//       Putcolor(layer, 0x80FFFFFF)                      vtable+224; CreateLayer leaves it 0
+//       put_origin(layer, CWnd::GetLayer(this - 4))      hang it on the window's own layer
+//       raw_RelMove(layer, x, y, empty, empty)           the same frame as its own mouse coords
+//   So the slot layers hang on that layer and move in WINDOW-LOCAL pixels: no screen position is
+//   needed anywhere, and the icons follow the window while it is dragged.
+//
+//   CWnd::GetAbsLeft (0x009E03C5) must NOT be used for this: it dereferences *(CWnd + 0x14), which
+//   CreateWnd writes as `*(this + 5) = ++dword_BF1604` -- a window sequence number -- so Getx()
+//   runs on a small integer. Every drop took an access violation there (petbuff.log).
+//
 // --- layer lifecycle -------------------------------------------------------
 //   the window is created and destroyed on every toggle of the 宠物装备 button
 //   (CUIEquip::TogglePetEquip 0x007FFA84 -> ctor sub_7FE299 / destroy), so the layers are
-//   positioned on each CUIPetEquip::OnMouseMove and hidden from CWnd::Destroy (0x009E00AF) when
-//   the window goes away.
+//   re-positioned on each CUIPetEquip::OnMouseMove (that is also what picks up a tab switch) and
+//   released from CWnd::Destroy (0x009E00AF) when the window goes away. Release is not enough on
+//   its own: put_origin holds the window's layer, so the origin is handed back to the Gr2D centre
+//   first, the way BuffTimer::ClearLabelLayer does it -- otherwise the window's graphics outlive
+//   the window.
 //
 // =================================================================================================
 
 static const DWORD ADDR_DraggableSkill_OnDropped = 0x004FAA22;
 static const DWORD ADDR_CUIPetEquip_OnMouseMove = 0x00800F7B;
 static const DWORD ADDR_CWnd_Destroy = 0x009E00AF;
-static const DWORD ADDR_CWnd_GetAbsLeft = 0x009E03C5;
-static const DWORD ADDR_CWnd_GetAbsTop = 0x009E0447;
 static const DWORD ADDR_CSkillInfo_GetSkill = 0x0075C755;
 static const DWORD ADDR_SkillInfoInstance = 0x00BE78DC;
 static const DWORD ADDR_IWzGr2DLayer_Animate = 0x00426BAB;
 static const DWORD ADDR_IWzGr2D_CreateLayer = 0x00426C7E;
 static const DWORD ADDR_IWzGr2D_GetCenter = 0x004374CB;
 static const DWORD ADDR_IWzGr2DLayer_Putcolor = 0x0045144A;
+static const DWORD ADDR_IWzGr2DLayer_GetZ = 0x0044337D;
 static const DWORD ADDR_Gr2DInstance = 0x00BF14EC;
 static const DWORD ADDR_EmptyVariant = 0x00BF6300;
 
@@ -74,6 +93,7 @@ static const DWORD VTBL_CUIPetEquip_Second = 0x00B38A24;  // *(void**)(obj + 4)
 static const int OFF_DraggableSkill_SkillId = 6 * 4;    // *(this + 6)
 static const int OFF_CUIPetEquip_Tab = 360 * 4;         // *(this + 360), 0..2
 static const int OFF_SKILLENTRY_Icon = 0xAC;            // *(SKILLENTRY + 0xAC) = 32x32 canvas
+static const int OFF_CWnd_Layer = 0x18;                 // *(CWnd + 6), the window's own Gr2D layer
 
 static const int nVtbl_IWzVector2D__put_origin = 100;
 static const int nVtbl_IWzVector2D__raw_RelMove = 144;
@@ -103,8 +123,9 @@ static const int kSlotCount = 2;
 // The remembered configuration. Client-side only, lost when the client closes.
 static int g_anSlots[kPetCount][kSlotCount] = {};
 
-// The pet equip window the layers belong to, and one layer per slot.
+// The pet equip window the layers belong to, the window layer they hang on, and one layer per slot.
 static void* g_pWindow = nullptr;
+static void* g_pParentLayer = nullptr;
 static void* g_apLayers[kPetCount][kSlotCount] = {};
 static int g_anDrawn[kPetCount][kSlotCount] = {};
 
@@ -117,10 +138,10 @@ typedef void* (__fastcall* Gr2DGetCenter_t)(void* pGr2D, void* edx, void** ppCen
 typedef long(__stdcall* VectorPutOrigin_t)(void* pVector, VARIANTARG vOrigin);
 typedef long(__stdcall* VectorRawRelMove_t)(void* pVector, long nX, long nY, VARIANTARG v1, VARIANTARG v2);
 typedef long(__stdcall* LayerPutZ_t)(void* pLayer, int nZ);
+typedef int(__fastcall* LayerGetZ_t)(void* pLayer, void* edx);
 typedef void (__fastcall* LayerPutColor_t)(void* pLayer, void* edx, unsigned long nColor);
 typedef void* (__thiscall* LayerAnimate_t)(void* pLayer, void* pRetBuf, void* pCanvas,
     const void* pV1, const void* pV2, const void* pV3, const void* pV4, const void* pV5);
-typedef int(__thiscall* CWndGetAbs_t)(void* pWnd);
 typedef void (__thiscall* CWndDestroy_t)(void* pWnd);
 typedef int(__thiscall* PetEquipOnMouseMove_t)(void* pThis, int nX, int nY);
 typedef void* (__thiscall* SkillInfoGetSkill_t)(void* pSkillInfo, int nSkillId);
@@ -129,9 +150,8 @@ typedef int(__thiscall* DraggableSkillOnDropped_t)(void* pThis, void* pFrom, voi
 static auto _create_layer = reinterpret_cast<Gr2DCreateLayer_t>(ADDR_IWzGr2D_CreateLayer);
 static auto _gr2d_get_center = reinterpret_cast<Gr2DGetCenter_t>(ADDR_IWzGr2D_GetCenter);
 static auto _layer_put_color = reinterpret_cast<LayerPutColor_t>(ADDR_IWzGr2DLayer_Putcolor);
+static auto _layer_get_z = reinterpret_cast<LayerGetZ_t>(ADDR_IWzGr2DLayer_GetZ);
 static auto _layer_animate = reinterpret_cast<LayerAnimate_t>(ADDR_IWzGr2DLayer_Animate);
-static auto _wnd_abs_left = reinterpret_cast<CWndGetAbs_t>(ADDR_CWnd_GetAbsLeft);
-static auto _wnd_abs_top = reinterpret_cast<CWndGetAbs_t>(ADDR_CWnd_GetAbsTop);
 static auto _skill_get = reinterpret_cast<SkillInfoGetSkill_t>(ADDR_CSkillInfo_GetSkill);
 
 static DraggableSkillOnDropped_t g_origOnDropped = nullptr;
@@ -273,53 +293,106 @@ static void SetLayerVisible(void* pLayer, bool bVisible)
     }
 }
 
-// One fresh layer, parented to the Gr2D centre (screen frame) so MoveLayer takes screen pixels.
-static void* CreateSlotLayer()
+// The layer the window draws itself into (CWnd::GetLayer 0x00426604: `return *(this + 6)`).
+// Borrowed: the window owns it, so this side never AddRefs or Releases it.
+static void* GetWindowLayer(void* pWindow)
 {
-    void* pGr2D = *reinterpret_cast<void**>(ADDR_Gr2DInstance);
-    if (pGr2D == nullptr || IsBadReadPtr(pGr2D, sizeof(void*)))
+    if (pWindow == nullptr)
     {
         return nullptr;
     }
 
-    unsigned char aEmpty1[16];
-    unsigned char aEmpty2[16];
-    CopyEmptyVariant(aEmpty1);
-    CopyEmptyVariant(aEmpty2);
-
-    void* pLayer = nullptr;
-    try
+    __try
     {
+        void* pLayer = *reinterpret_cast<void**>(reinterpret_cast<char*>(pWindow) + OFF_CWnd_Layer);
+        if (pLayer != nullptr && !IsBadReadPtr(pLayer, sizeof(void*)))
+        {
+            return pLayer;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+
+    return nullptr;
+}
+
+// One fresh layer hung on the window's own layer, so raw_RelMove takes WINDOW-LOCAL pixels and the
+// engine carries the icon along when the window is dragged. Every step is traced (bVerbose) and
+// guarded: a fault here must not escape into the drop handler, which would leave the drop
+// unconsumed.
+static void* CreateSlotLayer(void* pParentLayer, bool bVerbose)
+{
+    __try
+    {
+        void* pGr2D = *reinterpret_cast<void**>(ADDR_Gr2DInstance);
+        if (pGr2D == nullptr || IsBadReadPtr(pGr2D, sizeof(void*)))
+        {
+            if (bVerbose) LogLine("  create: no Gr2D instance");
+            return nullptr;
+        }
+
+        unsigned char aEmpty1[16];
+        unsigned char aEmpty2[16];
+        CopyEmptyVariant(aEmpty1);
+        CopyEmptyVariant(aEmpty2);
+
+        void* pLayer = nullptr;
+        if (bVerbose) LogLine("  create: CreateLayer...");
         _create_layer(pGr2D, nullptr, &pLayer, 0, 0, 0, 0, 0, aEmpty1, aEmpty2);
+        if (bVerbose) LogLine("  create: layer=%p", pLayer);
+        if (pLayer == nullptr)
+        {
+            return nullptr;
+        }
+
+        if (bVerbose) LogLine("  create: put_origin=%d", SetLayerOrigin(pLayer, pParentLayer) ? 1 : 0);
+        if (bVerbose) LogLine("  create: putz=%d", LayerPutZ(pLayer, _layer_get_z(pParentLayer, nullptr)) ? 1 : 0);
+
+        // CreateLayer leaves the layer colour at zero and a zero-alpha layer is not drawn at all
+        // (CUIToolTip::MakeLayer ends with exactly this call, 0x00800214 does it with 0x80FFFFFF).
+        _layer_put_color(pLayer, nullptr, kLayerVisible);
+        return pLayer;
     }
-    catch (...)
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
+        LogLine("  create: EXCEPTION");
         return nullptr;
     }
+}
 
+// Takes a slot layer off the screen for good. The order matters: put_origin holds the window's
+// layer, so handing the origin back to the Gr2D centre is what releases it -- without that, the
+// window's own Destroy cannot free its layer and its graphics stay on screen after it is gone
+// (BuffTimer::ClearLabelLayer hit the same thing). Only then does dropping our reference free the
+// slot layer itself.
+static void DestroySlotLayer(void* pLayer)
+{
     if (pLayer == nullptr)
     {
-        return nullptr;
+        return;
     }
 
-    void* pCenter = nullptr;
-    try
+    __try
     {
-        _gr2d_get_center(pGr2D, nullptr, &pCenter);
+        void* pGr2D = *reinterpret_cast<void**>(ADDR_Gr2DInstance);
+        void* pCenter = nullptr;
+        if (pGr2D != nullptr && !IsBadReadPtr(pGr2D, sizeof(void*)))
+        {
+            _gr2d_get_center(pGr2D, nullptr, &pCenter);
+        }
+        if (pCenter != nullptr)
+        {
+            SetLayerOrigin(pLayer, pCenter);
+            ReleaseComPtr(pCenter); // ours; the layer kept its own
+        }
+        _layer_put_color(pLayer, nullptr, kLayerHidden);
     }
-    catch (...)
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        pCenter = nullptr;
     }
 
-    if (pCenter != nullptr)
-    {
-        SetLayerOrigin(pLayer, pCenter);
-        ReleaseComPtr(pCenter);
-    }
-
-    LayerPutZ(pLayer, 0);
-    return pLayer;
+    ReleaseComPtr(pLayer);
 }
 
 // Hands the skill's own icon canvas to the layer: Animate(layer, retbuf, canvas, empty x5).
@@ -379,32 +452,62 @@ static void* GetSkillIconCanvas(int nSkillId)
 // Slot layers
 // ---------------------------------------------------------------------------------------------
 
-static void HideAllLayers()
+static void DestroyAllLayers()
 {
     for (int nPet = 0; nPet < kPetCount; ++nPet)
     {
         for (int nSlot = 0; nSlot < kSlotCount; ++nSlot)
         {
-            if (g_apLayers[nPet][nSlot] != nullptr)
-            {
-                SetLayerVisible(g_apLayers[nPet][nSlot], false);
-            }
+            DestroySlotLayer(g_apLayers[nPet][nSlot]);
+            g_apLayers[nPet][nSlot] = nullptr;
             g_anDrawn[nPet][nSlot] = 0;
         }
     }
+
+    g_pParentLayer = nullptr;
 }
 
-// Positions every configured slot on the window and (re)paints the ones whose skill changed.
-static void RefreshLayers()
+// Puts every configured slot on the window and (re)paints the ones whose skill changed.
+// bVerbose traces every step; it is only set on the drop path so mouse-move churn stays quiet.
+static void RefreshLayers(bool bVerbose)
 {
     if (g_pWindow == nullptr)
     {
         return;
     }
 
-    const int nAbsLeft = _wnd_abs_left(g_pWindow);
-    const int nAbsTop = _wnd_abs_top(g_pWindow);
-    const int nPet = *reinterpret_cast<int*>(reinterpret_cast<char*>(g_pWindow) + OFF_CUIPetEquip_Tab);
+    void* pParentLayer = GetWindowLayer(g_pWindow);
+    if (pParentLayer == nullptr)
+    {
+        return;
+    }
+
+    // The window rebuilds its layer if it is re-created behind our back; a layer we hung on the old
+    // one would be orphaned, so start over rather than move a layer that no longer follows.
+    if (g_pParentLayer != pParentLayer)
+    {
+        if (bVerbose)
+        {
+            LogLine("  window layer %p -> %p: rebuilding", g_pParentLayer, pParentLayer);
+        }
+        DestroyAllLayers();
+        g_pParentLayer = pParentLayer;
+    }
+
+    int nPet = -1;
+    __try
+    {
+        nPet = *reinterpret_cast<int*>(reinterpret_cast<char*>(g_pWindow) + OFF_CUIPetEquip_Tab);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return;
+    }
+
+    if (bVerbose)
+    {
+        LogLine("  refresh win=%p parent=%p tab=%d", g_pWindow, pParentLayer, nPet);
+    }
 
     if (nPet < 0 || nPet >= kPetCount)
     {
@@ -415,6 +518,11 @@ static void RefreshLayers()
     {
         const int nSkillId = g_anSlots[nPet][nSlot];
         void* pLayer = g_apLayers[nPet][nSlot];
+
+        if (bVerbose)
+        {
+            LogLine("  slot %d: skill=%d layer=%p drawn=%d", nSlot, nSkillId, pLayer, g_anDrawn[nPet][nSlot]);
+        }
 
         if (nSkillId == 0)
         {
@@ -428,7 +536,7 @@ static void RefreshLayers()
 
         if (pLayer == nullptr)
         {
-            pLayer = CreateSlotLayer();
+            pLayer = CreateSlotLayer(pParentLayer, bVerbose);
             g_apLayers[nPet][nSlot] = pLayer;
             g_anDrawn[nPet][nSlot] = 0;
             if (pLayer == nullptr)
@@ -441,6 +549,10 @@ static void RefreshLayers()
         if (g_anDrawn[nPet][nSlot] != nSkillId)
         {
             void* pCanvas = GetSkillIconCanvas(nSkillId);
+            if (bVerbose)
+            {
+                LogLine("  icon canvas=%p for skill=%d", pCanvas, nSkillId);
+            }
             if (pCanvas == nullptr)
             {
                 LogLine("  no icon canvas for skill=%d", nSkillId);
@@ -459,7 +571,11 @@ static void RefreshLayers()
             }
         }
 
-        MoveLayer(pLayer, nAbsLeft + kSlotRects[nSlot].nLeft, nAbsTop + kSlotRects[nSlot].nTop);
+        if (bVerbose)
+        {
+            LogLine("  moving to (%d,%d)", kSlotRects[nSlot].nLeft, kSlotRects[nSlot].nTop);
+        }
+        MoveLayer(pLayer, kSlotRects[nSlot].nLeft, kSlotRects[nSlot].nTop);
         SetLayerVisible(pLayer, true);
     }
 }
@@ -563,7 +679,7 @@ static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, vo
         LogLine("  stored pet=%d slot=%d skill=%d", nPet, nSlot, nSkillId);
 
         g_pWindow = pObject;
-        RefreshLayers();
+        RefreshLayers(true);
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -592,7 +708,7 @@ static int __fastcall OnMouseMove_Hook(void* pThis, void* /*edx*/, int nX, int n
                 g_pWindow = pThis;
             }
 
-            RefreshLayers();
+            RefreshLayers(false);
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -610,7 +726,7 @@ static void __fastcall Destroy_Hook(void* pThis, void* /*edx*/)
         if (g_pWindow != nullptr &&
             (pThis == g_pWindow || pThis == reinterpret_cast<char*>(g_pWindow) + 4))
         {
-            HideAllLayers();
+            DestroyAllLayers();
             g_pWindow = nullptr;
         }
     }
