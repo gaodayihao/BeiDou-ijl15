@@ -64,10 +64,20 @@
 //
 //   Text comes from IWzCanvas::DrawTextA (0x004277AD, vtable +0x98) with a font from
 //   get_basic_font (0x0098A707, global cache spFontBasic[56], whose 56 cases differ only in COLOUR --
-//   all of them create the same font). Both that wrapper and the width helper IWzFont (0x0042782E,
-//   vtable +0x1C) CONSUME the bstr they are handed: each releases it on the way out, so measuring and
-//   drawing need one bstr each. Both colour arguments are left empty -- the client never passes
-//   anything but an empty Ztl_variant_t there (0x00BF6300) -- and the colour comes from the font.
+//   all of them create the same font). That wrapper CONSUMES the bstr it is handed, so every draw needs
+//   a fresh one. Both colour arguments are left empty -- the client never passes anything but an empty
+//   Ztl_variant_t there (0x00BF6300) -- and the colour comes from the font.
+//
+//   THE BSTR SLOT HAS TO BE BIGGER THAN THE POINTER. The wrapper reads the pointer in the slot's first
+//   dword and then calls Data_t::Release ON THE SLOT, which InterlockedDecrements the dword at +8. A
+//   4-byte slot therefore gets written 8 bytes past its end -- straight onto the next local -- and that
+//   corrupted stack framing ends the process later on with NO crash dump at all. ZtlBstrSlot below is
+//   zeroed and 16 bytes, so the decrement walks 0 to -1 inside the slot and nothing is ever freed.
+//
+//   IWzFont vtable +0x1C (0x0042782E) is NOT a text-width call: it answers a constant (12, then 18)
+//   for every string measured, "AUTO" included. What CAvatarMegaphone::Draw halves for its centring is
+//   therefore a font metric, not the width of its text. The label is positioned from a fixed offset
+//   instead of from a measurement -- see the constant by kSlotRects.
 //
 //   THE STRING IS FED AS DBCS BYTES, NOT AS A WIDE LITERAL. The font itself lives in Canvas.dll
 //   (CWzFont): that module has no TextOut/CreateFont/GetGlyphOutline import at all and only
@@ -166,9 +176,9 @@ static const int nVtbl_IWzCanvas__DrawCanvas = 128;
 static const int nVtbl_IWzCanvas__DrawRect = 140;
 
 static const DWORD ADDR_IWzCanvas_DrawTextA = 0x004277AD;  // IWzCanvas::DrawTextA, vtable +0x98
-static const DWORD ADDR_IWzFont_GetTextWidth = 0x0042782E; // IWzFont width, vtable +0x1C
 static const DWORD ADDR_get_basic_font = 0x0098A707;       // get_basic_font(FONT_TYPE)
 static const DWORD ADDR_bstr_t_CtorA = 0x00425ADD;         // _bstr_t::_bstr_t(char const*)
+static const DWORD ADDR_bstr_t_CtorW = 0x00403382;         // _bstr_t::_bstr_t(wchar_t const*)
 static const int nFontTypeCount = 56;                      // get_basic_font's switch covers 0..55
 
 // Window-local pixels of the two free cells in the second row (verified in game).
@@ -190,9 +200,11 @@ static const SlotRect kSlotRects[2] = {
 static const unsigned long kSlotBackColor = 0x8000C000u;
 
 // 自动技能, as the DBCS bytes every other UI string in this client is made of (GBK: 自 D7D4, 动 B6AF,
-// 技 BCBC, 能 C4DC). Written as escapes so the source file's encoding cannot change it -- and it must
-// NOT be a wide literal, see the header block.
+// 技 BCBC, 能 C4DC). Written as escapes so the source file's encoding cannot change it.
 static const char kszSlotLabelDbcs[] = "\xD7\xD4\xB6\xAF\xBC\xBC\xC4\xDC";
+// The same four characters as a wide literal (自 U+81EA, 动 U+52A8, 技 U+6280, 能 U+80FD), spelled in
+// universal character names. TEMPORARY: the diagnostic build draws both forms, see DrawSlotLabelRaw.
+static const wchar_t kWszSlotLabel[] = L"\u81EA\u52A8\u6280\u80FD";
 static const int nSlotLabelOffsetY = 9;      // label top, from the cell top: 12px text centres in 32
 static const int nSlotLabelMaxWidth = 200;   // sanity bound on the measured width (see DrawSlotLabel)
 
@@ -227,9 +239,9 @@ typedef long(__stdcall* CanvasDrawRect_t)(void* pCanvas, long nX, long nY, long 
 // keeps our temp a bare 4-byte slot instead of a C++ object the compiler would copy and destroy.
 typedef long(__thiscall* CanvasDrawTextA_t)(void* pCanvas, long nX, long nY, void* pBstrSlot,
     void* pFont, const VARIANTARG* pColor, const VARIANTARG* pTabOrg);
-typedef long(__thiscall* FontTextWidth_t)(void* pFont, void* pBstrSlot, const VARIANTARG* pVar);
 typedef void* (__cdecl* GetBasicFont_t)(void* pRetSlot, int nFontType);
 typedef void* (__thiscall* BstrCtorA_t)(void* pThis, const char* pszText);
+typedef void* (__thiscall* BstrCtorW_t)(void* pThis, const wchar_t* pszText);
 typedef void (__thiscall* CWndManGetCursorPos_t)(void* pWndMan, POINT* pOut, int nFlag);
 typedef void (__thiscall* CInputSystemSetCursorState_t)(void* pInputSystem, long nState);
 typedef int(__fastcall* CWvsContextOnLeaveGame_t)(void* pThis, void* edx);
@@ -688,38 +700,73 @@ static void DrawCellBottom(void* pCanvas, void** pVtbl, const SlotRect& rect, un
         pCanvas, rect.nLeft, rect.nTop, rect.nRight - rect.nLeft, rect.nBottom - rect.nTop, nColor);
 }
 
-// The label, centred over the pair of cells. Its font is whichever FONT_TYPE the configuration names
-// -- the 56 cases are one font in different colours; get_basic_font caches, but hands out a counted
-// reference that has to be released.
+// TEMPORARY diagnostic (removed once the right form is known). Four candidate spellings of 自动技能,
+// drawn one per row of the cell grid so a single screenshot identifies the one the font can resolve.
+static const char* const kaszLabelForms[] = { "wide", "gbk", "big5", "ascii" };
+static const int nLabelFormCount = 4;
+
+// A Ztl_bstr_t slot. The Gr2D wrappers read the pointer in its FIRST dword and then call
+// Data_t::Release on the slot itself, which InterlockedDecrements the dword at +8. With a 4-byte slot
+// that write lands 8 bytes past the end -- on whatever local sits next -- and the corrupted stack ends
+// the process later with no crash dump at all (the client's own callers get away with it because their
+// temps sit in frames the compiler padded). Zeroed, so the decrement takes 0 to -1 and nothing is
+// freed; re-zeroed before every construction because Release leaves -1 behind.
+struct ZtlBstrSlot
+{
+    void* pData;
+    void* aReserved[3];
+};
+
+static void BuildLabelForm(ZtlBstrSlot* pSlot, int nForm)
+{
+    memset(pSlot, 0, sizeof(*pSlot));
+    switch (nForm)
+    {
+    case 0:
+        reinterpret_cast<BstrCtorW_t>(ADDR_bstr_t_CtorW)(pSlot, kWszSlotLabel);
+        break;
+    case 1:
+        reinterpret_cast<BstrCtorA_t>(ADDR_bstr_t_CtorA)(pSlot, kszSlotLabelDbcs);
+        break;
+    case 2:
+        reinterpret_cast<BstrCtorA_t>(ADDR_bstr_t_CtorA)(pSlot, "\xA6\xDB\xB0\xCA\xA7\xDE\xAF\xE0");
+        break;
+    default:
+        reinterpret_cast<BstrCtorA_t>(ADDR_bstr_t_CtorA)(pSlot, "AUTO");
+        break;
+    }
+}
+
+// Draws every candidate form on its own row of the cell grid, left-aligned at the pair's left edge so
+// nothing depends on a measurement. One screenshot then says which form the font can resolve. Drawn on
+// every repaint -- drawing only once lets the window's next repaint erase it.
+static void DiagnosticLabelForms(void* pCanvas, void* pFont, const VARIANTARG& vEmpty)
+{
+    for (int i = 0; i < nLabelFormCount; ++i)
+    {
+        ZtlBstrSlot aText;
+        BuildLabelForm(&aText, i);
+        reinterpret_cast<CanvasDrawTextA_t>(ADDR_IWzCanvas_DrawTextA)(pCanvas,
+            kSlotRects[0].nLeft + 2, kSlotRects[0].nTop + 33 * i + nSlotLabelOffsetY, &aText, pFont,
+            const_cast<VARIANTARG*>(&vEmpty), const_cast<VARIANTARG*>(&vEmpty));
+    }
+}
+
+// The label over the pair of cells. Its font is whichever FONT_TYPE the configuration names -- the 56
+// cases are one font in different colours; get_basic_font caches, but hands out a counted reference
+// that has to be released.
 static void DrawSlotLabelRaw(void* pCanvas, void* pFont)
 {
     VARIANTARG vEmpty;
     memset(&vEmpty, 0, sizeof(vEmpty));
     memcpy(&vEmpty, reinterpret_cast<const void*>(ADDR_EmptyVariant), sizeof(vEmpty));
 
-    // Measuring and drawing each consume their bstr, so each gets its own. The slot is one pointer
-    // wide: that is all a Ztl_bstr_t holds, and the client's own callers keep it in a 4-byte local.
-    void* aProbe[1] = {};
-    reinterpret_cast<BstrCtorA_t>(ADDR_bstr_t_CtorA)(aProbe, kszSlotLabelDbcs);
-    long nWidth = reinterpret_cast<FontTextWidth_t>(ADDR_IWzFont_GetTextWidth)(pFont, aProbe, &vEmpty);
-    if (nWidth < 0 || nWidth > nSlotLabelMaxWidth)
-    {
-        LogLine("  draw: label width %d out of range, drawing it from the centre", nWidth);
-        nWidth = 0;
-    }
-
-    void* aText[1] = {};
-    reinterpret_cast<BstrCtorA_t>(ADDR_bstr_t_CtorA)(aText, kszSlotLabelDbcs);
-
-    const int nCenter = (kSlotRects[0].nLeft + kSlotRects[kSlotCount - 1].nRight) / 2;
-    reinterpret_cast<CanvasDrawTextA_t>(ADDR_IWzCanvas_DrawTextA)(pCanvas,
-        nCenter - nWidth / 2, kSlotRects[0].nTop + nSlotLabelOffsetY, aText, pFont, &vEmpty, &vEmpty);
+    DiagnosticLabelForms(pCanvas, pFont, vEmpty);
 
     if (PetSkillSlot::bDebug && !g_bLabelLogged)
     {
         g_bLabelLogged = true;
-        LogLine("  draw: label width=%d font=%d colour=0x%08X", nWidth, PetSkillSlot::nLabelFont,
-            kSlotBackColor);
+        LogLine("  draw: label forms (font=%d colour=0x%08X)", PetSkillSlot::nLabelFont, kSlotBackColor);
     }
 }
 
