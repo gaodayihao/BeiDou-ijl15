@@ -13,9 +13,10 @@
 //
 // Layout, both directions: version(1) + 6 x int32 skillId (order = pet*2 + slot, 0 = empty).
 //
-// Receive side mirrors HpMpAlert.cpp, which is the same hook on the same socket and is proven in the
-// client: the CInPacket buffer carries a 4-byte prefix, so the opcode sits at Data + 4 (WORD) and the
-// payload starts at Data + 6.
+// Receive side: CClientSocket::ProcessPacket (0x004965F1) -- the same function HpMpAlert.cpp hooks,
+// but the LAYOUT below is read off the client, not copied from that file (its CInPacket offsets are
+// wrong; see the struct comment). The buffer keeps the wire framing: RawSeq(2) | DataLen(2) |
+// opcode(2) | payload, so the opcode sits at Data + 4 and the payload at Data + 6.
 // =================================================================================================
 
 static const DWORD ADDR_ClientSocket = 0x00BE7914;
@@ -48,13 +49,25 @@ struct COutPacket
     int EncryptedByShanda;
 };
 
-// The receive view. Only Data/Size are touched, and the payload is read out of the raw buffer the way
-// HpMpAlert does it -- the packet is consumed here, so its read cursor is never used.
+// The receive view, with the field offsets the client itself uses -- read off CInPacket::Decode2
+// (0x0042470C: base at +0x08, cursor at +0x14, length at +0x18) and the copy constructor
+// CClientSocket::ManipulatePacket calls (0x006EC39F: `memcpy(newBuf, src + 0x08, src + 0x18)`).
+// Do NOT copy HpMpAlert.cpp's declaration here: it puts Data at +0x04, which is a flag (2 when the
+// packet copy is built), so every read goes to address 6 -- an access violation that its own __try
+// swallows, leaving that module's receive path silently dead.
+//
+// The buffer keeps the wire framing AppendBuffer consumed: RawSeq(2) | DataLen(2) | opcode(2) |
+// payload, so the first Decode2 in ProcessPacket reads the opcode at Data + 4 (cursor starts at 4)
+// and the payload starts at Data + 6. Size = 4 + DataLen (the whole buffer, header included).
 struct CInPacket
 {
-    void* Unk;
-    unsigned char* Data;
-    unsigned long Size;
+    void* Vtbl;                     // +0x00
+    int Flags;                      // +0x04
+    unsigned char* Data;            // +0x08
+    int Unk0C;                      // +0x0C
+    int Unk10;                      // +0x10
+    int Position;                   // +0x14
+    int Size;                       // +0x18
 };
 
 typedef void(__fastcall* SendPacket_t)(void* pSocket, void* edx, void* pPacket);
@@ -157,13 +170,21 @@ static bool TryConsumeConfigPacket(CInPacket* packet)
         return false;
     }
 
-    if (packet->Size < static_cast<unsigned long>(nReceivePrefix + nPayloadSize))
+    if (packet->Size < nReceivePrefix + nPayloadSize)
     {
         return false;
     }
 
-    const unsigned char* data = reinterpret_cast<const unsigned char*>(packet->Data);
-    if (*reinterpret_cast<const unsigned short*>(data + 4) != nOpcodePetBuffConfig)
+    const unsigned char* data = packet->Data;
+    const unsigned short opcode = static_cast<unsigned short>(data[4] | (data[5] << 8));
+    if (opcode >= 0x1000)
+    {
+        // Every opcode in this range is a candidate for "what the server just sent us"; the raw dump
+        // is what pinned the field offsets down, so keep it (rare: 0x1000 / 0x1001 / 0x3713 / 0xFFFE).
+        LogLine("  recv: op=0x%04X size=%d payload0=%d", opcode, packet->Size, data[6]);
+    }
+
+    if (opcode != nOpcodePetBuffConfig)
     {
         return false;
     }

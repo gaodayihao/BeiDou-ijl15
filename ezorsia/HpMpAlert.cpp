@@ -19,16 +19,21 @@ struct COutPacket {
     unsigned int Offset;
     int EncryptedByShanda;
 };
+// Field offsets per the client's own CInPacket: CInPacket::Decode2 (0x0042470C) uses +0x08 as the
+// buffer base, +0x14 as the read cursor and +0x18 as the length, and the copy constructor that
+// CClientSocket::ManipulatePacket (0x006EC39F) builds does `memcpy(newBuf, src + 0x08, src + 0x18)`.
+// The previous declaration here (Data at +4) read the +0x04 flag as a pointer, so every receive went
+// to address 6 and the __try below swallowed the access violation: the handler never ran.
+// Buffer framing (AppendBuffer consumed RawSeq + DataLen, cursor starts at 4):
+// RawSeq(2) | DataLen(2) | opcode(2) | payload, and Size = 4 + DataLen.
 struct CInPacket {
-    bool Loopback;
-    int State;
-    void* Data;
-    unsigned long Size;
-    unsigned short RawSeq;
-    unsigned short DataLen;
-    unsigned short Unknown;
-    unsigned int Offset;
-    void* Unk;
+    void* Vtbl;
+    int Flags;
+    unsigned char* Data;
+    int Unk0C;
+    int Unk10;
+    int Position;
+    int Size;
 };
 using SendPacket_t = void(__fastcall*)(void* pThis, void* edx, COutPacket* packet);
 static SendPacket_t g_SendPacket = reinterpret_cast<SendPacket_t>(0x0049637B);
