@@ -617,27 +617,14 @@ static bool StartSlotDrag(void* pSource, void* pWindow, int nPet, int nSlot, int
 // Drawing: the window's own canvas, the way CUIPetEquip::Draw paints its cells
 // ---------------------------------------------------------------------------------------------
 
-// Paints the two slot icons into the pet equip window's canvas. Runs after the window's own Draw,
-// i.e. after its background and its cell icons and before the tooltip is painted over the window.
-static void DrawSlotIcons(void* pWindow)
+// The drawing half, kept apart from the SEH guard because SEH (__try/__except) and C++ EH
+// (try/catch) cannot share a function. Both are needed: the client's Gr2D wrappers raise _com_error,
+// and an exception escaping a hook unwinds into the client's frames, which have no handler for it --
+// that ends the process through abort()/__fastfail, with no crash dump at all (an access violation at
+// least gets caught here and logged). BuffTimer documents the same split.
+static void DrawSlotIconsRaw(void* pWindow, int nPet)
 {
-    if (pWindow == nullptr)
-    {
-        return;
-    }
-
-    const int nPet = GetTab(pWindow);
-    if (nPet < 0 || nPet >= kPetCount)
-    {
-        return;
-    }
-
-    if (g_anSlots[nPet][0] == 0 && g_anSlots[nPet][1] == 0)
-    {
-        return;
-    }
-
-    __try
+    try
     {
         unsigned char aCanvasPtr[16];
         memset(aCanvasPtr, 0, sizeof(aCanvasPtr));
@@ -682,6 +669,36 @@ static void DrawSlotIcons(void* pWindow)
         }
 
         ReleaseComPtr(pCanvas);
+    }
+    catch (...)
+    {
+        LogLine("  draw: the canvas call raised, skipped");
+    }
+}
+
+// Paints the two slot icons into the pet equip window's canvas. Runs after the window's own Draw,
+// i.e. after its background and its cell icons and before the tooltip is painted over the window.
+static void DrawSlotIcons(void* pWindow)
+{
+    if (pWindow == nullptr)
+    {
+        return;
+    }
+
+    const int nPet = GetTab(pWindow);
+    if (nPet < 0 || nPet >= kPetCount)
+    {
+        return;
+    }
+
+    if (g_anSlots[nPet][0] == 0 && g_anSlots[nPet][1] == 0)
+    {
+        return;
+    }
+
+    __try
+    {
+        DrawSlotIconsRaw(pWindow, nPet);
     }
     __except (LogSehFilter(GetExceptionInformation()))
     {

@@ -207,6 +207,7 @@
     <ClInclude Include="NewCharEquipFix.h" />
     <ClInclude Include="ItemWndExpanded.h" />
     <ClInclude Include="PetSkillSlot.h" />
+    <ClInclude Include="PetAutoBuff.h" />
     <ClInclude Include="Memory.h" />
     <ClInclude Include="NMCO.h" />
     <ClInclude Include="SelectCharMacFix.h" />
@@ -229,6 +230,7 @@
     <ClCompile Include="NewCharEquipFix.cpp" />
     <ClCompile Include="ItemWndExpanded.cpp" />
     <ClCompile Include="PetSkillSlot.cpp" />
+    <ClCompile Include="PetAutoBuff.cpp" />
     <ClCompile Include="Memory.cpp" />
     <ClCompile Include="NMCO.cpp" />
     <ClCompile Include="SelectCharMacFix.cpp" />
