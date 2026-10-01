@@ -15,6 +15,7 @@
 #include "ItemWndExpanded.h"
 #include "PetSkillSlot.h"
 #include "PetAutoBuff.h"
+#include "PetBuffConfig.h"
 #pragma comment(lib, "ws2_32.lib")
 
 // config.ini can use IP or hostname (ServerIP_Address=...).
@@ -117,6 +118,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			PetAutoBuff::bEnabled = reader.GetBoolean("optional", "petAutoBuff", true);
 			PetAutoBuff::nLeadMs = reader.GetInteger("optional", "petAutoBuffLead", 3000);
 			PetAutoBuff::bDebug = reader.GetBoolean("optional", "petAutoBuffDebug", true);
+			PetBuffConfig::bDebug = reader.GetBoolean("optional", "petBuffDebug", true);
 			BossHP::bShowPercent = reader.GetBoolean("optional", "bossHpPercent", true);
 			BossHP::bShowText = reader.GetBoolean("optional", "bossHpText", true);
 			BossHP::bShowTextName = reader.GetBoolean("optional", "bossHpTextShowName", true);
@@ -181,6 +183,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		QuestBulb::Hook(); // pin the auto-quest light bulb to the left edge of the screen
 		PetSkillSlot::Hook(); // pet auto-buff slots: buff skills dropped into the pet equip window
 		PetAutoBuff::Hook();  // pet auto-buff refresh: re-cast them when they run out
+		PetBuffConfig::Hook(); // pet auto-buff configuration: save to / load from the server (0x1001)
 		Client::WorldMap();
 		Client::RefreshRate(); 
 		Client::DeleteChar();

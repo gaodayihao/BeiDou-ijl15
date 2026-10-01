@@ -27,8 +27,14 @@ public:
     static bool bEnabled;   // petBuff      : the whole feature
     static bool bDebug;     // petBuffDebug : append every drop decision to petbuff.log
 
-    // Skill id in slot (nPet 0..2, nSlot 0..1); 0 = empty. Used by the future auto-refresh step.
+    // Skill id in slot (nPet 0..2, nSlot 0..1); 0 = empty. Used by the auto-refresh step and by the
+    // configuration sync (PetBuffConfig) that ships it to / receives it from the server.
     static int GetSkill(int nPet, int nSlot);
+
+    // Writes one slot without notifying the server. Used only by the configuration load (the values
+    // come from the server and must not be echoed back); player-driven changes go through the drop
+    // paths, which send the whole configuration themselves.
+    static void SetSkill(int nPet, int nSlot, int nSkillId);
 };
 
 void Hook_PetSkillSlot(bool enable);

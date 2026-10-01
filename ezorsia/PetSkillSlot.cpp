@@ -2,6 +2,7 @@
 #include "PetSkillSlot.h"
 #include "Memory.h"
 #include "PetBuffWhitelist.h"
+#include "PetBuffConfig.h"      // configuration changes are shipped to the server here
 #include <stdio.h>
 #include <stdarg.h>
 #include <oleauto.h> // VARIANTARG (the WzGr2D / WzCanvas wrappers take Ztl_variant_t by value)
@@ -461,6 +462,7 @@ static void ClearDragSourceSlot()
 
     g_anSlots[nPet][nSlot] = 0;
     LogLine("  removed pet=%d slot=%d", nPet, nSlot);
+    PetBuffConfig_Send();                   // whole-configuration save; see PetBuffConfig.h
 
     __try
     {
@@ -807,6 +809,7 @@ static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, vo
 
         g_anSlots[nPet][nSlot] = nSkillId;
         LogLine("  stored pet=%d slot=%d skill=%d", nPet, nSlot, nSkillId);
+        PetBuffConfig_Send();               // whole-configuration save; see PetBuffConfig.h
 
         // Dragging a slot onto another slot is the same case as dropping the same skill again: the
         // dedup pass above has already emptied the cell it came from, so only the bookkeeping is
@@ -997,6 +1000,16 @@ int PetSkillSlot::GetSkill(int nPet, int nSlot)
     }
 
     return g_anSlots[nPet][nSlot];
+}
+
+void PetSkillSlot::SetSkill(int nPet, int nSlot, int nSkillId)
+{
+    if (nPet < 0 || nPet >= kPetCount || nSlot < 0 || nSlot >= kSlotCount)
+    {
+        return;
+    }
+
+    g_anSlots[nPet][nSlot] = nSkillId;      // server-side values; the caller does not re-send them
 }
 
 void PetSkillSlot::Hook()
