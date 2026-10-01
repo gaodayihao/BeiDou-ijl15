@@ -80,6 +80,14 @@ static const DWORD ADDR_CWvsContext_GetCharacterData = 0x00425D0B;
 static const DWORD ADDR_SkillInfoInstance = 0x00BE78DC;
 static const DWORD ADDR_get_field = 0x00437A0C;
 static const DWORD ADDR_CField_IsSkillForbiden = 0x00537C7F;
+// The local player: TSingleton<CUserLocal>::ms_pInstance (CField::Init null-checks the same global
+// before finishing the field setup). Its pet array is three 8-byte ZRef<CPet> slots, the pointer in
+// the second dword of each -- the layout CUserLocal::TryConsumePetHP walks (`*(this + 1975) + 8 * i
+// + 4`, 0x0095B9A4) and the reason a removed pet stops being enumerated.
+static const DWORD ADDR_CUserLocal_Instance = 0x00BEBF98;
+static const int OFF_CUserLocal_Pets = 0x1EDC;
+static const int nPetSlotStride = 8;
+static const int OFF_PetSlot_Pet = 4;
 
 // The two status objects the consume check is handed. What they are is settled by how the callee reads
 // them (0x00764256): the first at +96/+104 (maxHP, the 1311006 half-HP gate) => BasicStat; the second
@@ -109,6 +117,7 @@ static const int kMaxSlots = 3 * 2; // three pet tabs, two cells each
 
 bool PetAutoBuff::bEnabled = true;
 int PetAutoBuff::nLeadMs = 3000;
+int PetAutoBuff::nTickMs = 1000;
 bool PetAutoBuff::bDebug = true;
 
 typedef void (__fastcall* WvsContextUpdate_t)(void* pThis, void* edx);
@@ -151,7 +160,44 @@ struct COutPacket
 static unsigned int g_adwRetryAfter[kMaxSlots];
 static unsigned int g_dwLastTick = 0;
 static const unsigned int kRetryMs = 2000;
-static const unsigned int kTickMs = 200;
+
+// How many pets the local character currently has out (0..3), by walking the client's own pet array
+// and stopping at the first empty slot -- the same "pets are contiguous from index 0" assumption
+// CUserLocal::TryConsumePetHP makes. A tab without a pet has nothing to refresh, so its cells are
+// skipped: unequipping a pet must stop its pair, and the stored configuration is left alone so it
+// comes back when the pet does.
+static int GetActivePetCount()
+{
+    __try
+    {
+        char* pUser = *reinterpret_cast<char**>(ADDR_CUserLocal_Instance);
+        if (pUser == nullptr)
+        {
+            return 0;                       // not in a field: CUserLocal exists only in game
+        }
+
+        char* pPets = *reinterpret_cast<char**>(pUser + OFF_CUserLocal_Pets);
+        if (pPets == nullptr)
+        {
+            return 0;
+        }
+
+        int nCount = 0;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (*reinterpret_cast<void**>(pPets + nPetSlotStride * i + OFF_PetSlot_Pet) == nullptr)
+            {
+                break;
+            }
+            ++nCount;
+        }
+        return nCount;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
 
 static void LogLine(const char* sFormat, ...)
 {
@@ -460,8 +506,9 @@ static void* GetFieldOrVeto(void* pWvsContext, const char** ppszReason)
     return pField;
 }
 
-// Walks the six cells and re-casts whatever is missing. Runs from CWvsContext::Update, throttled, so
-// the cost is a list walk every kTickMs at most.
+// Walks the six cells and re-casts whatever is missing. Runs from CWvsContext::Update (every frame),
+// so the whole body is throttled to PetAutoBuff::nTickMs; a cell that was just attempted is held off
+// for kRetryMs on top of that, which is what bounds the actual packets.
 static void Tick(void* pWvsContext)
 {
     if (!PetAutoBuff::bEnabled || pWvsContext == nullptr)
@@ -470,7 +517,10 @@ static void Tick(void* pWvsContext)
     }
 
     const unsigned int dwNow = GetTickCount();
-    if (dwNow - g_dwLastTick < kTickMs)
+    const int nConfiguredTick = PetAutoBuff::nTickMs;
+    const unsigned int dwTickMs = static_cast<unsigned int>(
+        nConfiguredTick < 100 ? 100 : (nConfiguredTick > 5000 ? 5000 : nConfiguredTick));
+    if (dwNow - g_dwLastTick < dwTickMs)
     {
         return;
     }
@@ -501,7 +551,17 @@ static void Tick(void* pWvsContext)
     }
     s_bVetoLogged = false;
 
-    for (int nPet = 0; nPet < 3; ++nPet)
+    // Pets currently out. Tabs without one are skipped: a removed pet must stop refreshing its pair,
+    // and the configured values stay put for when it comes back. Logged on the edge only.
+    static int s_nLastPetCount = -1;
+    const int nPetCount = GetActivePetCount();
+    if (nPetCount != s_nLastPetCount)
+    {
+        LogLine("  autobuff: %d pet(s) out, tabs 0..%d active", nPetCount, nPetCount - 1);
+        s_nLastPetCount = nPetCount;
+    }
+
+    for (int nPet = 0; nPet < nPetCount; ++nPet)
     {
         for (int nSlot = 0; nSlot < 2; ++nSlot)
         {

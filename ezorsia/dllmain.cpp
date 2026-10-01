@@ -117,6 +117,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			PetSkillSlot::bDebug = reader.GetBoolean("optional", "petBuffDebug", true);
 			PetAutoBuff::bEnabled = reader.GetBoolean("optional", "petAutoBuff", true);
 			PetAutoBuff::nLeadMs = reader.GetInteger("optional", "petAutoBuffLead", 3000);
+			PetAutoBuff::nTickMs = reader.GetInteger("optional", "petAutoBuffTickMs", 1000);
 			PetAutoBuff::bDebug = reader.GetBoolean("optional", "petAutoBuffDebug", true);
 			PetBuffConfig::bDebug = reader.GetBoolean("optional", "petBuffDebug", true);
 			BossHP::bShowPercent = reader.GetBoolean("optional", "bossHpPercent", true);

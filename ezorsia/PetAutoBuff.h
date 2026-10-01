@@ -16,9 +16,12 @@ public:
     static void Hook();
 
     // config.ini [optional]
-    static bool bEnabled;   // petAutoBuff     : re-cast buffs when they run out
-    static int nLeadMs;     // petAutoBuffLead : re-cast this many ms before they expire
-    static bool bDebug;     // petAutoBuffDebug: append every cast decision to petbuff.log
+    static bool bEnabled;   // petAutoBuff       : re-cast buffs when they run out
+    static int nLeadMs;     // petAutoBuffLead   : re-cast this many ms before they expire
+    static int nTickMs;     // petAutoBuffTickMs : how often the six cells are scanned (ms, clamped
+                            //                     100..5000); each cell is additionally retried at
+                            //                     most once per 2 s, which bounds the packets
+    static bool bDebug;     // petAutoBuffDebug  : append every cast decision to petbuff.log
 };
 
 void Hook_PetAutoBuff(bool enable);
