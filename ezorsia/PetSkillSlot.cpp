@@ -3,6 +3,7 @@
 #include "Memory.h"
 #include "PetBuffWhitelist.h"
 #include "PetBuffConfig.h"      // configuration changes are shipped to the server here
+#include "BuffTimer.h"          // BuffTimer::CreateFont: the label's own size/colour font
 #include <stdio.h>
 #include <stdarg.h>
 #include <oleauto.h> // VARIANTARG (the WzGr2D / WzCanvas wrappers take Ztl_variant_t by value)
@@ -63,24 +64,19 @@
 //   for its whole background and for its 1x1 corner pixels, so a 1px-tall fill is a supported shape.
 //
 //   Text comes from IWzCanvas::DrawTextA (0x004277AD, vtable +0x98) with a font from
-//   get_basic_font (0x0098A707). That wrapper CONSUMES the bstr it is handed, so every draw needs a
-//   fresh one. Both colour arguments are left empty -- the client never passes anything but an empty
-//   Ztl_variant_t there (0x00BF6300) -- and the colour comes from the font.
+//   get_basic_font (0x0098A707) or from BuffTimer::CreateFont when the configuration wants a size or
+//   colour that table does not have. Both colour arguments are left empty -- the client never passes
+//   anything but an empty Ztl_variant_t there (0x00BF6300) -- and the colour comes from the font.
 //
-//   THE SLOT HOLDS THE STRING, NOT A POINTER TO IT. The wrapper reads the slot's first dword and hands
-//   it straight to the font, which treats it as the characters. The client's own _bstr_t ctor
-//   (0x00403382 -> 0x00402BE8) instead allocates a bookkeeping object and stores a POINTER to that in
-//   the slot, so handing its output over unchanged renders the object's first two dwords as text: two
-//   glyphs built from a heap address, followed by the object's zero second dword -- a garble that
-//   changes every time the heap moves. Unwrapping one level (MakeLabelSlot) leaves the string pointer
-//   the font actually wants. Verified live: the slot's contents read back as `86D8 2BB0 0000 0000` as
-//   handed over, and as `81EA 52A8 6280 80FD` (自动技能) after unwrapping.
-//
-//   THE SLOT HAS TO BE BIGGER THAN THE POINTER TOO. After drawing, the wrapper calls
-//   Data_t::Release ON THE SLOT, which InterlockedDecrements the dword at +8. A 4-byte slot therefore
-//   gets written 8 bytes past its end -- straight onto the next local -- and that corrupted stack
-//   framing ends the process later on with NO crash dump at all. ZtlBstrSlot below is zeroed and
-//   16 bytes, so the decrement walks 0 to -1 inside the slot and nothing is ever freed.
+//   WHAT THE TEXT ARGUMENT IS. The wrapper takes a Ztl_bstr_t by value, i.e. a pointer to the object;
+//   it dereferences that once and hands the result to the font, and it then Releases that same pointer
+//   as if it were the string object. So the caller passes the bstr's INNER pointer -- which is the
+//   string -- and the callee frees it. That is BuffTimer's MakeBstrData, and PetSkillSlot does the
+//   same. Handing over the SLOT'S ADDRESS instead (which is what the client's own call sites look like
+//   in the disassembly) makes the wrapper Release the slot itself: the decrement lands 8 bytes past a
+//   4-byte slot, on the next local, and that stack corruption ends the process later on with NO crash
+//   dump -- while the font, reading the object's first two dwords as text, renders two glyphs' worth
+//   of heap address that change whenever the heap moves.
 //
 //   IWzFont vtable +0x1C (0x0042782E) is NOT a text-width call: it answers a constant for every string
 //   measured, "AUTO" included. What CAvatarMegaphone::Draw halves for its centring is therefore a font
@@ -219,6 +215,11 @@ static void* g_pDragFromWindow = nullptr;
 bool PetSkillSlot::bEnabled = true;
 bool PetSkillSlot::bDebug = true;
 int PetSkillSlot::nLabelFont = 43;
+int PetSkillSlot::nFontSize = 11;
+int PetSkillSlot::nFontColor = 0x000000;
+
+// One-off: a font that could not be built is logged once, not on every repaint.
+static bool g_bLabelFontLogged = false;
 
 typedef void* (__thiscall* CWndGetCanvas_t)(void* pWnd, void* pRetBuf);
 typedef void (__thiscall* CWndInvalidateRect_t)(void* pWnd, const void* pRect);
@@ -716,66 +717,59 @@ static int FontSizeForType(int nFontType)
     return nFontType == 35 ? 15 : 12;
 }
 
-// A Ztl_bstr_t slot. The Gr2D wrappers read the pointer in its FIRST dword and then call
-// Data_t::Release on the slot itself, which InterlockedDecrements the dword at +8. With a 4-byte slot
-// that write lands 8 bytes past the end -- on whatever local sits next -- and the corrupted stack ends
-// the process later with no crash dump at all (the client's own callers get away with it because their
-// temps sit in frames the compiler padded). Zeroed, so the decrement takes 0 to -1 and nothing is
-// freed.
-struct ZtlBstrSlot
+// The client's text APIs take a Ztl_bstr_t BY VALUE: what travels on the stack is the pointer the
+// wrapper reaches through one dereference, and the callee destroys that reference. BuffTimer's
+// MakeBstrData is the same shape and reached the same conclusion -- build one instance per call, hand
+// over the instance's inner pointer, release nothing here.
+//
+// Handing over the SLOT'S ADDRESS instead (which is what the client's own call sites look like in the
+// disassembly) gives the wrapper a pointer it will Release as if it were the string object: the
+// decrement lands 8 bytes past a 4-byte slot, i.e. on the next local -- stack corruption, and a
+// process exit later with no crash dump -- and the font reads the object's first two dwords as text,
+// which is two glyphs' worth of heap address that changes whenever the heap moves.
+static void* MakeLabelText(char* pSlot, const wchar_t* pszText)
 {
-    void* pData;
-    void* aReserved[3];
-};
-
-// Turns a literal into the slot the font wants. The client's _bstr_t ctor builds a bookkeeping object
-// and stores a POINTER to it in the slot's first dword -- but IWzCanvas::DrawTextA reads the slot AS
-// the string, so the ctor's object would be read as two characters taken from a heap address followed
-// by its zero second dword: a two-glyph garble that changes every time the heap moves. Unwrapping one
-// level leaves exactly the string pointer the font expects. (A _com_ptr_t would go through the same
-// kind of accessor the client's own call sites use; this is the same idea, done here.)
-static void MakeLabelSlot(ZtlBstrSlot* pSlot, const wchar_t* pszText)
-{
-    memset(pSlot, 0, sizeof(*pSlot));
+    memset(pSlot, 0, 8);
     reinterpret_cast<BstrCtorW_t>(ADDR_bstr_t_CtorW)(pSlot, pszText);
-    if (pSlot->pData != nullptr && !IsBadReadPtr(pSlot->pData, sizeof(void*)))
-    {
-        pSlot->pData = *reinterpret_cast<void**>(pSlot->pData);
-    }
+    return *reinterpret_cast<void**>(pSlot);
 }
 
-// Both lines are constant, so they are built once and reused on every repaint. The wrappers' Release
-// lands inside our own slot (at +8) and never frees anything, and the two ctor objects stay allocated
-// for the process lifetime -- two small blocks, once.
-static ZtlBstrSlot g_aLabelSlot[nLabelLineCount];
-static bool g_bLabelSlotsReady = false;
-
-static void EnsureLabelSlots()
+// The label's font, built once. The client's FONT_TYPE table only offers 9/11/12/15 and has no dark
+// colour at the sizes this label wants, so the font is built the way BuffTimer builds its own --
+// petSkillSlotFontSize <= 0 keeps the table slot named by petSkillSlotFont instead.
+static void* GetLabelFont()
 {
-    if (g_bLabelSlotsReady)
+    static void* pFont = nullptr;
+    static bool bTried = false;
+    if (bTried)
     {
-        return;
+        return pFont;
     }
 
-    g_bLabelSlotsReady = true;
-    for (int i = 0; i < nLabelLineCount; ++i)
+    bTried = true;
+    if (PetSkillSlot::nFontSize > 0)
     {
-        MakeLabelSlot(&g_aLabelSlot[i], kaszLabelLines[i]);
+        pFont = BuffTimer::CreateFont(PetSkillSlot::nFontSize, PetSkillSlot::nFontColor);
     }
+
+    if (pFont == nullptr)
+    {
+        void* aFont[1] = { nullptr };
+        reinterpret_cast<GetBasicFont_t>(ADDR_get_basic_font)(aFont, PetSkillSlot::nLabelFont);
+        pFont = aFont[0];   // get_basic_font caches and keeps its own reference: never release this
+    }
+    return pFont;
 }
 
-// The label: 自动 over 技能, centred in each of the two cells. Its font is whichever FONT_TYPE the
-// configuration names; get_basic_font caches, but hands out a counted reference that has to be
-// released by the caller.
-static void DrawSlotLabelRaw(void* pCanvas, void* pFont)
+// The label: 自动 over 技能, centred in each of the two cells.
+static void DrawSlotLabel(void* pCanvas, void* pFont)
 {
     VARIANTARG vEmpty;
     memset(&vEmpty, 0, sizeof(vEmpty));
     memcpy(&vEmpty, reinterpret_cast<const void*>(ADDR_EmptyVariant), sizeof(vEmpty));
 
-    EnsureLabelSlots();
-
-    const int nGlyph = FontSizeForType(PetSkillSlot::nLabelFont);
+    const int nGlyph = (PetSkillSlot::nFontSize > 0) ? PetSkillSlot::nFontSize
+                                                     : FontSizeForType(PetSkillSlot::nLabelFont);
     const int nLineHeight = nGlyph + 1;
     const int nBlockHeight = nLineHeight * (nLabelLineCount - 1) + nGlyph;
 
@@ -787,8 +781,15 @@ static void DrawSlotLabelRaw(void* pCanvas, void* pFont)
 
         for (int i = 0; i < nLabelLineCount; ++i)
         {
+            char aText[8] = { 0 };
+            void* pText = MakeLabelText(aText, kaszLabelLines[i]);
+            if (pText == nullptr)
+            {
+                continue;
+            }
+
             reinterpret_cast<CanvasDrawTextA_t>(ADDR_IWzCanvas_DrawTextA)(pCanvas,
-                nLeft, nTop + i * nLineHeight, &g_aLabelSlot[i], pFont,
+                nLeft, nTop + i * nLineHeight, pText, pFont,
                 const_cast<VARIANTARG*>(&vEmpty), const_cast<VARIANTARG*>(&vEmpty));
         }
     }
@@ -825,24 +826,16 @@ static void DrawSlotsRaw(void* pWindow, int nPet)
             DrawCellBottom(pCanvas, pVtbl, kSlotRects[nSlot], kSlotBackColor);
         }
 
-        int nFontType = PetSkillSlot::nLabelFont;
-        if (nFontType < 0 || nFontType >= nFontTypeCount)
-        {
-            LogLine("  draw: FONT_TYPE=%d out of range, using 0", PetSkillSlot::nLabelFont);
-            nFontType = 0;
-        }
-
-        void* aFontPtr[1] = {};
-        reinterpret_cast<GetBasicFont_t>(ADDR_get_basic_font)(aFontPtr, nFontType);
-        void* pFont = aFontPtr[0];
+        void* pFont = GetLabelFont();
         if (pFont != nullptr)
         {
-            DrawSlotLabelRaw(pCanvas, pFont);
-            ReleaseComPtr(pFont);
+            DrawSlotLabel(pCanvas, pFont);
         }
-        else
+        else if (!g_bLabelFontLogged)
         {
-            LogLine("  draw: no font for FONT_TYPE=%d, label skipped", nFontType);
+            g_bLabelFontLogged = true;
+            LogLine("  draw: no font (size=%d colour=0x%06X type=%d), label skipped",
+                PetSkillSlot::nFontSize, PetSkillSlot::nFontColor, PetSkillSlot::nLabelFont);
         }
 
         // DrawCanvas takes its attribute as a Ztl_variant_t BY VALUE, so it has to be a real

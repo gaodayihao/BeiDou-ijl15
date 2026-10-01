@@ -23,6 +23,12 @@ public:
 	static void Tick(void* pWvsContext);
 	static void ForgetAll(); // the client emptied the whole buff row: drop every label with it
 
+	// Builds a font with a size and colour the client's FONT_TYPE table does not offer (it only has
+	// 9/11/12/15 and no dark colour at those sizes), by the same chain get_basic_font uses. Public
+	// because other labels want the same thing -- PetSkillSlot's slot captions build theirs here.
+	// nullptr when the chain fails. Note: windows.h turns the name into CreateFontW.
+	static void* CreateFont(int nSize, int nRgb);
+
 private:
 	// The three fonts the label draws with. The table's slots are not enough on their own (see
 	// GetLabelFont), so each role gets a font built with the requested size and colour.
@@ -47,5 +53,4 @@ private:
 	static void ClearLabelLayer(void* pLayer);
 	static void* GetFont(int nType);
 	static void* GetLabelFont(int nRole);
-	static void* CreateFont(int nSize, int nRgb);
 };

@@ -27,10 +27,15 @@ public:
     static bool bEnabled;   // petBuff      : the whole feature
     static bool bDebug;     // petBuffDebug : append every drop decision to petbuff.log
 
-    // FONT_TYPE of the label drawn in the two cells, 0..55 as get_basic_font has them. The cases are
-    // the same face in different SIZES and COLOURS: 43..49 are size 9 (white / black / red / orange /
-    // cream), 34 and 36 are size 11, 35 is size 15, everything else is size 12. The default 43 is
-    // 9px white. The label's centring follows the size, so any of them can be picked.
+    // The label's own font, built the way BuffTimer builds its buff-timer labels. nFontSize is the
+    // point size and nFontColor an 0xRRGGBB colour (opaque); nFontSize <= 0 falls back to the
+    // get_basic_font table slot named by nLabelFont.
+    static int nFontSize;   // petSkillSlotFontSize
+    static int nFontColor;  // petSkillSlotFontColor
+
+    // Fallback FONT_TYPE for the label, 0..55 as get_basic_font has them. The cases are one face in
+    // different SIZES and COLOURS: 43..49 are size 9, 34 and 36 are size 11, 35 is size 15, the rest
+    // are size 12. Only used when nFontSize <= 0.
     static int nLabelFont;  // petSkillSlotFont
 
     // Skill id in slot (nPet 0..2, nSlot 0..1); 0 = empty. Used by the auto-refresh step and by the

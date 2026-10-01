@@ -116,6 +116,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			PetSkillSlot::bEnabled = reader.GetBoolean("optional", "petBuff", true);
 			PetSkillSlot::bDebug = reader.GetBoolean("optional", "petBuffDebug", true);
 			PetSkillSlot::nLabelFont = reader.GetInteger("optional", "petSkillSlotFont", 43);
+			PetSkillSlot::nFontSize = reader.GetInteger("optional", "petSkillSlotFontSize", 11);
+			PetSkillSlot::nFontColor = reader.GetInteger("optional", "petSkillSlotFontColor", 0x000000);
 			PetAutoBuff::bEnabled = reader.GetBoolean("optional", "petAutoBuff", true);
 			PetAutoBuff::nLeadMs = reader.GetInteger("optional", "petAutoBuffLead", 3000);
 			PetAutoBuff::nTickMs = reader.GetInteger("optional", "petAutoBuffTickMs", 1000);
