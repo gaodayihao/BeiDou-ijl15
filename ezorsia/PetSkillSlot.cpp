@@ -55,6 +55,24 @@
 //   (nothing in 0x8E49B5..0x8F6000 creates one), so any depth that keeps a layer above the window's
 //   canvas keeps it above the tooltip too.
 //
+// --- the slot bottom: a green rounded rect, in the client's own paint calls ----------------------
+//   CUIPetEquip::Draw washes a cell it cannot use with IWzCanvas vtable +140, "fill a rectangle":
+//       (*(*canvas + 140))(canvas, x, y, 32, 32, 0x40FF0000)   at (46, 11) / (112, 11) / (tbl, tbl)
+//   i.e. (left, top, width, height, 0xAARRGGBB) -- 0x40FF0000 is the semi-transparent RED of that
+//   wash, which is what makes the argument order readable. CUIToolTip::MakeLayer uses the same call
+//   for its whole background and for its 1x1 corner pixels, so a 1px-tall fill is a supported shape;
+//   the rounded corners below are cut by drawing the rect one scanline at a time (never overlapping,
+//   or a translucent colour would double-blend along the seams).
+//
+//   Text comes from IWzCanvas::DrawTextA (0x004277AD, vtable +0x98) with a font from
+//   get_basic_font (0x0098A707, global cache spFontBasic[56]). Both that wrapper and the width
+//   helper IWzFont (0x0042782E, vtable +0x1C) CONSUME the bstr they are handed -- each releases it on
+//   the way out -- so measuring and drawing need one bstr each. A bstr is made with the client's own
+//   _bstr_t(wchar_t const*) (0x00403382) into a 4-byte slot, exactly as CUIMessenger::DrawTextA and
+//   CAvatarMegaphone::Draw do (the latter centres with `78 - (width >> 1)`, the same arithmetic).
+//   Both colour arguments are left empty: the client never passes anything but an empty Ztl_variant_t
+//   there (0x00BF6300), and the colour comes from the font itself.
+//
 // --- the skill tooltip -----------------------------------------------------
 //   the window's embedded CUIToolTip sits at obj + 108 (its ctor: CUIToolTip::CUIToolTip(a1 + 27)).
 //   CTemporaryStatView::ShowToolTip 0x007B2FD5 shows a buff icon's tooltip with exactly:
@@ -136,6 +154,16 @@ static const int OFF_SKILLENTRY_Icon = 0xAC;            // *(SKILLENTRY + 0xAC) 
 // IWzCanvas vtable+128 = "draw this canvas at (x, y)", the call CWnd::Draw makes for a background.
 static const int nVtbl_IWzCanvas__DrawCanvas = 128;
 
+// IWzCanvas vtable+140 = "fill (x, y, w, h) with 0xAARRGGBB" -- CUIPetEquip::Draw's red wash and
+// CUIToolTip::MakeLayer's background frame (see the header block).
+static const int nVtbl_IWzCanvas__DrawRect = 140;
+
+static const DWORD ADDR_IWzCanvas_DrawTextA = 0x004277AD;  // IWzCanvas::DrawTextA, vtable +0x98
+static const DWORD ADDR_IWzFont_GetTextWidth = 0x0042782E; // IWzFont width, vtable +0x1C
+static const DWORD ADDR_get_basic_font = 0x0098A707;       // get_basic_font(FONT_TYPE)
+static const DWORD ADDR_bstr_t_CtorW = 0x00403382;         // _bstr_t::_bstr_t(wchar_t const*)
+static const int nFontTypeCount = 56;                      // get_basic_font's switch covers 0..55
+
 // Window-local pixels of the two free cells in the second row (verified in game).
 struct SlotRect
 {
@@ -149,6 +177,20 @@ static const SlotRect kSlotRects[2] = {
     { 79, 44, 111, 76 },
     { 112, 44, 144, 76 },
 };
+
+// The bottom each of those two cells gets: a green rounded rect, plus one label over the pair. The
+// alpha and the "tint the cell" idea mirror the client's own red wash (0x40FF0000) at the same rects.
+static const unsigned long kSlotBackColor = 0x8000C000u;
+static const int nSlotRadius = 6;
+
+// Corner insets for a 6px radius: scanline i of the top edge is pulled in by
+// radius - round(sqrt(radius^2 - dy^2)), dy = radius - 1 - i. The bottom edge mirrors it.
+static const int kSlotRadiusInset[nSlotRadius] = { 3, 2, 1, 0, 0, 0 };
+
+// The label, spelled in universal character names so the source file's encoding cannot change it.
+static const wchar_t kWszSlotLabel[] = L"\u81EA\u52A8\u6280\u80FD";
+static const int nSlotLabelOffsetY = 9;      // label top, from the cell top: 12px text centres in 32
+static const int nSlotLabelMaxWidth = 200;   // sanity bound on the measured width (see DrawSlotLabel)
 
 static const int kPetCount = 3;
 static const int kSlotCount = 2;
@@ -164,11 +206,22 @@ static void* g_pDragFromWindow = nullptr;
 
 bool PetSkillSlot::bEnabled = true;
 bool PetSkillSlot::bDebug = true;
+int PetSkillSlot::nLabelFont = 0;
 
 typedef void* (__thiscall* CWndGetCanvas_t)(void* pWnd, void* pRetBuf);
 typedef void (__thiscall* CWndInvalidateRect_t)(void* pWnd, const void* pRect);
 typedef long(__stdcall* CanvasDrawCanvas_t)(void* pCanvas, long nX, long nY, void* pSrcCanvas,
     VARIANTARG vAttr);
+typedef long(__stdcall* CanvasDrawRect_t)(void* pCanvas, long nX, long nY, long nWidth, long nHeight,
+    unsigned long nColor);
+// The text argument of the two wrappers below is a bstr SLOT (a Ztl_bstr_t: one dword holding the
+// client's refcounted string object), passed as its address; both consume it. Declaring it as void*
+// keeps our temp a bare 4-byte slot instead of a C++ object the compiler would copy and destroy.
+typedef long(__thiscall* CanvasDrawTextA_t)(void* pCanvas, long nX, long nY, void* pBstrSlot,
+    void* pFont, const VARIANTARG* pColor, const VARIANTARG* pTabOrg);
+typedef long(__thiscall* FontTextWidth_t)(void* pFont, void* pBstrSlot, const VARIANTARG* pVar);
+typedef void* (__cdecl* GetBasicFont_t)(void* pRetSlot, int nFontType);
+typedef void* (__thiscall* BstrCtorW_t)(void* pThis, const wchar_t* pszText);
 typedef void (__thiscall* CWndManGetCursorPos_t)(void* pWndMan, POINT* pOut, int nFlag);
 typedef void (__thiscall* CInputSystemSetCursorState_t)(void* pInputSystem, long nState);
 typedef int(__fastcall* CWvsContextOnLeaveGame_t)(void* pThis, void* edx);
@@ -619,12 +672,63 @@ static bool StartSlotDrag(void* pSource, void* pWindow, int nPet, int nSlot, int
 // Drawing: the window's own canvas, the way CUIPetEquip::Draw paints its cells
 // ---------------------------------------------------------------------------------------------
 
+// One cell's bottom: a rounded rect, drawn as one 1px scanline per row so that two fills never
+// overlap (a translucent colour would double-blend where they did).
+static void DrawRoundedRect(void* pCanvas, void** pVtbl, const SlotRect& rect, unsigned long nColor)
+{
+    auto drawRect = reinterpret_cast<CanvasDrawRect_t>(pVtbl[nVtbl_IWzCanvas__DrawRect / sizeof(void*)]);
+    const int nWidth = rect.nRight - rect.nLeft;
+    const int nHeight = rect.nBottom - rect.nTop;
+
+    for (int i = 0; i < nHeight; ++i)
+    {
+        int nInset = 0;
+        if (i < nSlotRadius)
+        {
+            nInset = kSlotRadiusInset[i];
+        }
+        else if (i >= nHeight - nSlotRadius)
+        {
+            nInset = kSlotRadiusInset[nHeight - 1 - i];
+        }
+
+        drawRect(pCanvas, rect.nLeft + nInset, rect.nTop + i, nWidth - 2 * nInset, 1, nColor);
+    }
+}
+
+// The label, centred over the pair of cells. Its font is whichever FONT_TYPE the configuration
+// names; get_basic_font caches, but hands out a counted reference that has to be released.
+static void DrawSlotLabelRaw(void* pCanvas, void* pFont)
+{
+    VARIANTARG vEmpty;
+    memset(&vEmpty, 0, sizeof(vEmpty));
+    memcpy(&vEmpty, reinterpret_cast<const void*>(ADDR_EmptyVariant), sizeof(vEmpty));
+
+    // Measuring and drawing each consume their bstr, so each gets its own. The slot is one pointer
+    // wide: that is all a Ztl_bstr_t holds, and the client's own callers keep it in a 4-byte local.
+    void* aProbe[1] = {};
+    reinterpret_cast<BstrCtorW_t>(ADDR_bstr_t_CtorW)(aProbe, kWszSlotLabel);
+    long nWidth = reinterpret_cast<FontTextWidth_t>(ADDR_IWzFont_GetTextWidth)(pFont, aProbe, &vEmpty);
+    if (nWidth < 0 || nWidth > nSlotLabelMaxWidth)
+    {
+        LogLine("  draw: label width %d out of range, drawing it from the centre", nWidth);
+        nWidth = 0;
+    }
+
+    void* aText[1] = {};
+    reinterpret_cast<BstrCtorW_t>(ADDR_bstr_t_CtorW)(aText, kWszSlotLabel);
+
+    const int nCenter = (kSlotRects[0].nLeft + kSlotRects[kSlotCount - 1].nRight) / 2;
+    reinterpret_cast<CanvasDrawTextA_t>(ADDR_IWzCanvas_DrawTextA)(pCanvas,
+        nCenter - nWidth / 2, kSlotRects[0].nTop + nSlotLabelOffsetY, aText, pFont, &vEmpty, &vEmpty);
+}
+
 // The drawing half, kept apart from the SEH guard because SEH (__try/__except) and C++ EH
 // (try/catch) cannot share a function. Both are needed: the client's Gr2D wrappers raise _com_error,
 // and an exception escaping a hook unwinds into the client's frames, which have no handler for it --
 // that ends the process through abort()/__fastfail, with no crash dump at all (an access violation at
 // least gets caught here and logged). BuffTimer documents the same split.
-static void DrawSlotIconsRaw(void* pWindow, int nPet)
+static void DrawSlotsRaw(void* pWindow, int nPet)
 {
     try
     {
@@ -639,10 +743,35 @@ static void DrawSlotIconsRaw(void* pWindow, int nPet)
         }
 
         void** pVtbl = *reinterpret_cast<void***>(pCanvas);
-        if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzCanvas__DrawCanvas + sizeof(void*)))
+        if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzCanvas__DrawRect + sizeof(void*)))
         {
             ReleaseComPtr(pCanvas);
             return;
+        }
+
+        for (int nSlot = 0; nSlot < kSlotCount; ++nSlot)
+        {
+            DrawRoundedRect(pCanvas, pVtbl, kSlotRects[nSlot], kSlotBackColor);
+        }
+
+        int nFontType = PetSkillSlot::nLabelFont;
+        if (nFontType < 0 || nFontType >= nFontTypeCount)
+        {
+            LogLine("  draw: FONT_TYPE=%d out of range, using 0", PetSkillSlot::nLabelFont);
+            nFontType = 0;
+        }
+
+        void* aFontPtr[1] = {};
+        reinterpret_cast<GetBasicFont_t>(ADDR_get_basic_font)(aFontPtr, nFontType);
+        void* pFont = aFontPtr[0];
+        if (pFont != nullptr)
+        {
+            DrawSlotLabelRaw(pCanvas, pFont);
+            ReleaseComPtr(pFont);
+        }
+        else
+        {
+            LogLine("  draw: no font for FONT_TYPE=%d, label skipped", nFontType);
         }
 
         // DrawCanvas takes its attribute as a Ztl_variant_t BY VALUE, so it has to be a real
@@ -678,9 +807,11 @@ static void DrawSlotIconsRaw(void* pWindow, int nPet)
     }
 }
 
-// Paints the two slot icons into the pet equip window's canvas. Runs after the window's own Draw,
-// i.e. after its background and its cell icons and before the tooltip is painted over the window.
-static void DrawSlotIcons(void* pWindow)
+// Paints the two cells into the pet equip window's canvas: the bottom and the label always (they are
+// the empty-slot affordance), then whatever icon the current tab holds on top of them. Runs after the
+// window's own Draw, i.e. after its background and its own cell icons and before the tooltip is
+// painted over the window.
+static void DrawSlots(void* pWindow)
 {
     if (pWindow == nullptr)
     {
@@ -693,14 +824,9 @@ static void DrawSlotIcons(void* pWindow)
         return;
     }
 
-    if (g_anSlots[nPet][0] == 0 && g_anSlots[nPet][1] == 0)
-    {
-        return;
-    }
-
     __try
     {
-        DrawSlotIconsRaw(pWindow, nPet);
+        DrawSlotsRaw(pWindow, nPet);
     }
     __except (LogSehFilter(GetExceptionInformation()))
     {
@@ -727,7 +853,7 @@ static int __fastcall Draw_Hook(void* pThis, void* /*edx*/, const void* pRect)
         void* pObject = nullptr;
         if (IsPetEquipWindow(pThis, &pObject))
         {
-            DrawSlotIcons(pObject);
+            DrawSlots(pObject);
         }
     }
     __except (LogSehFilter(GetExceptionInformation()))
