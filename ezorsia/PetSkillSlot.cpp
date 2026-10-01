@@ -84,6 +84,10 @@ static const DWORD ADDR_IWzGr2D_CreateLayer = 0x00426C7E;
 static const DWORD ADDR_IWzGr2D_GetCenter = 0x004374CB;
 static const DWORD ADDR_IWzGr2DLayer_Putcolor = 0x0045144A;
 static const DWORD ADDR_IWzGr2DLayer_GetZ = 0x0044337D;
+static const DWORD ADDR_IWzGr2DLayer_GetWidth = 0x00440C00;
+static const DWORD ADDR_IWzGr2DLayer_GetHeight = 0x00440C2A;
+static const DWORD ADDR_IWzCanvas_Getcx = 0x0040F09B;
+static const DWORD ADDR_IWzCanvas_Getcy = 0x0040F0C2;
 static const DWORD ADDR_Gr2DInstance = 0x00BF14EC;
 static const DWORD ADDR_EmptyVariant = 0x00BF6300;
 
@@ -95,6 +99,8 @@ static const int OFF_CUIPetEquip_Tab = 360 * 4;         // *(this + 360), 0..2
 static const int OFF_SKILLENTRY_Icon = 0xAC;            // *(SKILLENTRY + 0xAC) = 32x32 canvas
 static const int OFF_CWnd_Layer = 0x18;                 // *(CWnd + 6), the window's own Gr2D layer
 
+static const int nVtbl_IWzVector2D__get_x = 32;
+static const int nVtbl_IWzVector2D__get_y = 40;
 static const int nVtbl_IWzVector2D__put_origin = 100;
 static const int nVtbl_IWzVector2D__raw_RelMove = 144;
 static const int nVtbl_IWzGr2DLayer__PutZ = 180;
@@ -102,6 +108,20 @@ static const int nVtbl_IWzGr2DLayer__PutZ = 180;
 // Visible / invisible alpha for a slot layer (Putcolor is ARGB).
 static const unsigned long kLayerVisible = 0xFFFFFFFFu;
 static const unsigned long kLayerHidden = 0x00000000u;
+
+// The pet equip window's own layer is created at depth 10: its ctor sub_7FE299 calls
+// CWnd::CreateWnd(nLeft, nTop, /*w*/ 0xB1 = 177, /*h*/ 181, /*z*/ 10, /*bScreenCoord*/ 1, 0, 1),
+// and the layer measures 177x181 at runtime, which pins the argument positions.
+//
+// The slot layers sit ONE ABOVE that, in their own depth group. Larger depths draw in front
+// (measured: depth 0 put the icon behind the window, depth 10 in front of it), and a same-depth
+// layer only wins on creation order -- which the window takes back every time it is dragged:
+// CWndMan::UpdateWindowPosition (0x009E03A6) removes and re-inserts the window's own layer, so the
+// icon was buried by the window's canvas as soon as the window moved. A depth of its own cannot be
+// overtaken that way. Reading the depth off the parent is not an option either:
+// IWzGr2DLayer::GetZ (0x0044337D) answers 0xFFFFFFFF for the window's own layer, not the 10 that
+// CreateWnd set.
+static const int kSlotLayerZ = 11;
 
 // Window-local pixels of the two free cells in the second row (verified in game).
 struct SlotRect
@@ -138,8 +158,10 @@ typedef void* (__fastcall* Gr2DGetCenter_t)(void* pGr2D, void* edx, void** ppCen
 typedef long(__stdcall* VectorPutOrigin_t)(void* pVector, VARIANTARG vOrigin);
 typedef long(__stdcall* VectorRawRelMove_t)(void* pVector, long nX, long nY, VARIANTARG v1, VARIANTARG v2);
 typedef long(__stdcall* LayerPutZ_t)(void* pLayer, int nZ);
-typedef int(__fastcall* LayerGetZ_t)(void* pLayer, void* edx);
+typedef int(__fastcall* LayerGetInt_t)(void* pLayer, void* edx);
 typedef void (__fastcall* LayerPutColor_t)(void* pLayer, void* edx, unsigned long nColor);
+// The client's property-get convention is COM-style: __stdcall long get_x(long* pOut) (QuestBulb).
+typedef long(__stdcall* VectorGetLong_t)(void* pVector, long* pnOut);
 typedef void* (__thiscall* LayerAnimate_t)(void* pLayer, void* pRetBuf, void* pCanvas,
     const void* pV1, const void* pV2, const void* pV3, const void* pV4, const void* pV5);
 typedef void (__thiscall* CWndDestroy_t)(void* pWnd);
@@ -150,7 +172,11 @@ typedef int(__thiscall* DraggableSkillOnDropped_t)(void* pThis, void* pFrom, voi
 static auto _create_layer = reinterpret_cast<Gr2DCreateLayer_t>(ADDR_IWzGr2D_CreateLayer);
 static auto _gr2d_get_center = reinterpret_cast<Gr2DGetCenter_t>(ADDR_IWzGr2D_GetCenter);
 static auto _layer_put_color = reinterpret_cast<LayerPutColor_t>(ADDR_IWzGr2DLayer_Putcolor);
-static auto _layer_get_z = reinterpret_cast<LayerGetZ_t>(ADDR_IWzGr2DLayer_GetZ);
+static auto _layer_get_z = reinterpret_cast<LayerGetInt_t>(ADDR_IWzGr2DLayer_GetZ);
+static auto _layer_get_width = reinterpret_cast<LayerGetInt_t>(ADDR_IWzGr2DLayer_GetWidth);
+static auto _layer_get_height = reinterpret_cast<LayerGetInt_t>(ADDR_IWzGr2DLayer_GetHeight);
+static auto _canvas_get_cx = reinterpret_cast<LayerGetInt_t>(ADDR_IWzCanvas_Getcx);
+static auto _canvas_get_cy = reinterpret_cast<LayerGetInt_t>(ADDR_IWzCanvas_Getcy);
 static auto _layer_animate = reinterpret_cast<LayerAnimate_t>(ADDR_IWzGr2DLayer_Animate);
 static auto _skill_get = reinterpret_cast<SkillInfoGetSkill_t>(ADDR_CSkillInfo_GetSkill);
 
@@ -208,6 +234,33 @@ static void ReleaseComPtr(void* pUnknown)
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
+}
+
+// IUnknown::AddRef answers with the resulting count, so an AddRef immediately followed by a Release
+// reports the current reference count without changing it. Used to tell "my layer still holds the
+// window's layer" apart from "the window's own release is the one that matters".
+static unsigned ProbeRefCount(void* pUnknown)
+{
+    if (pUnknown == nullptr)
+    {
+        return 0;
+    }
+
+    __try
+    {
+        void** pVtbl = *reinterpret_cast<void***>(pUnknown);
+        if (pVtbl != nullptr && !IsBadReadPtr(pVtbl, 12))
+        {
+            const unsigned nCount = reinterpret_cast<unsigned(__stdcall*)(void*)>(pVtbl[1])(pUnknown);
+            reinterpret_cast<unsigned(__stdcall*)(void*)>(pVtbl[2])(pUnknown);
+            return nCount - 1;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+
+    return 0;
 }
 
 static bool SetLayerOrigin(void* pLayer, void* pOrigin)
@@ -317,6 +370,185 @@ static void* GetWindowLayer(void* pWindow)
     return nullptr;
 }
 
+// Reports a structured exception through the log. Only ever used from an __except filter, so it
+// must not throw and must not build anything that needs unwinding. A C++ exception surfaces here as
+// code 0xE06D7363 with the faulting address inside the CRT, an access violation as 0xC0000005.
+static int LogSehFilter(EXCEPTION_POINTERS* pInfo)
+{
+    if (pInfo != nullptr && pInfo->ExceptionRecord != nullptr)
+    {
+        const EXCEPTION_RECORD* pRecord = pInfo->ExceptionRecord;
+        LogLine("  SEH code=0x%08X addr=0x%08X p0=0x%08X p1=0x%08X",
+            static_cast<unsigned>(pRecord->ExceptionCode),
+            static_cast<unsigned>(static_cast<DWORD_PTR>(reinterpret_cast<DWORD_PTR>(pRecord->ExceptionAddress))),
+            pRecord->NumberParameters > 0 ? static_cast<unsigned>(pRecord->ExceptionInformation[0]) : 0u,
+            pRecord->NumberParameters > 1 ? static_cast<unsigned>(pRecord->ExceptionInformation[1]) : 0u);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// CreateLayer's first variant is a VT_I4 canvas id, not an empty variant: the client builds it with
+// sub_402FAB(&v, 0, 3) in both CWnd::CreateWnd and 0x00800214, and the second variant is a copy of
+// the global empty variant. Passing two empty variants makes the w = h = 0 shape fail with
+// E_INVALIDARG (0x80070057).
+static void MakeIntVariant(void* pOut, long nValue)
+{
+    memset(pOut, 0, 16);
+    *reinterpret_cast<unsigned short*>(pOut) = VT_I4;
+    *reinterpret_cast<long*>(reinterpret_cast<char*>(pOut) + 8) = nValue;
+}
+
+static void GetVectorPos(void* pVector, long* pnX, long* pnY)
+{
+    *pnX = 0;
+    *pnY = 0;
+    if (pVector == nullptr)
+    {
+        return;
+    }
+
+    __try
+    {
+        void** pVtbl = *reinterpret_cast<void***>(pVector);
+        if (pVtbl == nullptr || IsBadReadPtr(pVtbl, nVtbl_IWzVector2D__get_y + sizeof(void*)))
+        {
+            return;
+        }
+        reinterpret_cast<VectorGetLong_t>(pVtbl[nVtbl_IWzVector2D__get_x / sizeof(void*)])(pVector, pnX);
+        reinterpret_cast<VectorGetLong_t>(pVtbl[nVtbl_IWzVector2D__get_y / sizeof(void*) ])(pVector, pnY);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+}
+
+// Everything that decides whether a layer can be seen at all: size (a layer without a canvas draws
+// nothing), depth (behind the window's own canvas) and where it actually sits in its frame.
+// GetAlpha is deliberately not read: its prototype is not the (this, edx) shape GetWidth/GetHeight
+// use, and calling it that way faults inside it at 0x004143F4.
+static void DumpLayer(const char* sTag, void* pLayer)
+{
+    if (pLayer == nullptr)
+    {
+        LogLine("  %s: null", sTag);
+        return;
+    }
+
+    __try
+    {
+        long nX = 0;
+        long nY = 0;
+        GetVectorPos(pLayer, &nX, &nY);
+        LogLine("  %s %p: w=%d h=%d z=0x%08X pos=(%d,%d)", sTag, pLayer,
+            _layer_get_width(pLayer, nullptr), _layer_get_height(pLayer, nullptr),
+            static_cast<unsigned>(_layer_get_z(pLayer, nullptr)),
+            static_cast<int>(nX), static_cast<int>(nY));
+    }
+    __except (LogSehFilter(GetExceptionInformation()))
+    {
+    }
+}
+
+// Logs the binding only when it actually changes. Mouse moves drive this many times a second, so an
+// unconditional line would drown the log; a change is exactly what "the icon vanished" looks like.
+static void LogRefreshState(void* pParent, void* pLayer)
+{
+    static void* s_pParent = nullptr;
+    static void* s_pLayer = nullptr;
+    static long s_nParentX = 0;
+    static long s_nParentY = 0;
+    static long s_nLayerX = 0;
+    static long s_nLayerY = 0;
+
+    long nParentX = 0;
+    long nParentY = 0;
+    long nLayerX = 0;
+    long nLayerY = 0;
+    GetVectorPos(pParent, &nParentX, &nParentY);
+    GetVectorPos(pLayer, &nLayerX, &nLayerY);
+
+    if (pParent == s_pParent && pLayer == s_pLayer &&
+        nParentX == s_nParentX && nParentY == s_nParentY &&
+        nLayerX == s_nLayerX && nLayerY == s_nLayerY)
+    {
+        return;
+    }
+
+    s_pParent = pParent;
+    s_pLayer = pLayer;
+    s_nParentX = nParentX;
+    s_nParentY = nParentY;
+    s_nLayerX = nLayerX;
+    s_nLayerY = nLayerY;
+
+    __try
+    {
+        LogLine("  state: parent=%p(%d,%d) layer=%p(%d,%d) rel=(%d,%d) z=0x%08X",
+            pParent, static_cast<int>(nParentX), static_cast<int>(nParentY),
+            pLayer, static_cast<int>(nLayerX), static_cast<int>(nLayerY),
+            static_cast<int>(nLayerX - nParentX), static_cast<int>(nLayerY - nParentY),
+            static_cast<unsigned>(pLayer != nullptr ? _layer_get_z(pLayer, nullptr) : 0));
+    }
+    __except (LogSehFilter(GetExceptionInformation()))
+    {
+    }
+}
+
+static void DumpCanvas(const char* sTag, void* pCanvas)
+{
+    if (pCanvas == nullptr)
+    {
+        LogLine("  %s: null", sTag);
+        return;
+    }
+
+    __try
+    {
+        LogLine("  %s %p: cx=%d cy=%d", sTag, pCanvas,
+            _canvas_get_cx(pCanvas, nullptr), _canvas_get_cy(pCanvas, nullptr));
+    }
+    __except (LogSehFilter(GetExceptionInformation()))
+    {
+    }
+}
+
+// Runs CreateLayer once, reporting a _com_error with its HRESULT. Separate function from the
+// __try/__except wrapper below on purpose: MSVC allows only one form of exception handling per
+// function, and these wrappers throw _com_error while a bad pointer raises a structured exception.
+static bool CreateLayerRaw(void* pGr2D, void** ppLayer, unsigned long nWidth, unsigned long nHeight,
+    int nZ, void* pV1, void* pV2)
+{
+    try
+    {
+        _create_layer(pGr2D, nullptr, ppLayer, 0, 0, nWidth, nHeight, nZ, pV1, pV2);
+        return true;
+    }
+    catch (const _com_error& e)
+    {
+        LogLine("  create: _com_error hr=0x%08X w=%u h=%u z=0x%08X",
+            static_cast<unsigned>(e.Error()), nWidth, nHeight, static_cast<unsigned>(nZ));
+        return false;
+    }
+    catch (...)
+    {
+        LogLine("  create: unknown C++ exception w=%u h=%u z=0x%08X", nWidth, nHeight, static_cast<unsigned>(nZ));
+        return false;
+    }
+}
+
+static bool CreateLayerAttempt(void* pGr2D, void** ppLayer, unsigned long nWidth, unsigned long nHeight,
+    int nZ, void* pV1, void* pV2)
+{
+    __try
+    {
+        return CreateLayerRaw(pGr2D, ppLayer, nWidth, nHeight, nZ, pV1, pV2);
+    }
+    __except (LogSehFilter(GetExceptionInformation()))
+    {
+        return false;
+    }
+}
+
 // One fresh layer hung on the window's own layer, so raw_RelMove takes WINDOW-LOCAL pixels and the
 // engine carries the icon along when the window is dragged. Every step is traced (bVerbose) and
 // guarded: a fault here must not escape into the drop handler, which would leave the drop
@@ -332,31 +564,50 @@ static void* CreateSlotLayer(void* pParentLayer, bool bVerbose)
             return nullptr;
         }
 
-        unsigned char aEmpty1[16];
-        unsigned char aEmpty2[16];
-        CopyEmptyVariant(aEmpty1);
-        CopyEmptyVariant(aEmpty2);
+        unsigned char aCanvasId[16];
+        unsigned char aEmpty[16];
+        MakeIntVariant(aCanvasId, 0);
+        CopyEmptyVariant(aEmpty);
 
+        if (bVerbose)
+        {
+            LogLine("  create: gr2d=%p gr2d_vtbl=%p parent=%p", pGr2D, *reinterpret_cast<void**>(pGr2D), pParentLayer);
+            DumpLayer("  parent", pParentLayer);
+        }
+
+        // The client's own layers are created with width = height = 0 (CWnd::CreateWnd, 0x00800214);
+        // BuffTimer's come out 32x32 at depth 0xC006156C. Try the client's shape, fall back to the
+        // one that is proven to work in this plugin.
         void* pLayer = nullptr;
-        if (bVerbose) LogLine("  create: CreateLayer...");
-        _create_layer(pGr2D, nullptr, &pLayer, 0, 0, 0, 0, 0, aEmpty1, aEmpty2);
-        if (bVerbose) LogLine("  create: layer=%p", pLayer);
+        if (!CreateLayerAttempt(pGr2D, &pLayer, 0, 0, kSlotLayerZ, aCanvasId, aEmpty))
+        {
+            LogLine("  create: retrying with BuffTimer's parameters");
+            if (!CreateLayerAttempt(pGr2D, &pLayer, 32, 32, kSlotLayerZ, aCanvasId, aEmpty))
+            {
+                return nullptr;
+            }
+        }
+
+        if (bVerbose)
+        {
+            LogLine("  create: layer=%p", pLayer);
+            DumpLayer("  created", pLayer);
+        }
         if (pLayer == nullptr)
         {
             return nullptr;
         }
 
         if (bVerbose) LogLine("  create: put_origin=%d", SetLayerOrigin(pLayer, pParentLayer) ? 1 : 0);
-        if (bVerbose) LogLine("  create: putz=%d", LayerPutZ(pLayer, _layer_get_z(pParentLayer, nullptr)) ? 1 : 0);
+        if (bVerbose) LogLine("  create: putz=%d", LayerPutZ(pLayer, kSlotLayerZ) ? 1 : 0);
 
         // CreateLayer leaves the layer colour at zero and a zero-alpha layer is not drawn at all
         // (CUIToolTip::MakeLayer ends with exactly this call, 0x00800214 does it with 0x80FFFFFF).
         _layer_put_color(pLayer, nullptr, kLayerVisible);
         return pLayer;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (LogSehFilter(GetExceptionInformation()))
     {
-        LogLine("  create: EXCEPTION");
         return nullptr;
     }
 }
@@ -383,8 +634,12 @@ static void DestroySlotLayer(void* pLayer)
         }
         if (pCenter != nullptr)
         {
-            SetLayerOrigin(pLayer, pCenter);
+            LogLine("  destroy %p: origin back to the centre=%d", pLayer, SetLayerOrigin(pLayer, pCenter) ? 1 : 0);
             ReleaseComPtr(pCenter); // ours; the layer kept its own
+        }
+        else
+        {
+            LogLine("  destroy %p: no Gr2D centre to hand the origin back to", pLayer);
         }
         _layer_put_color(pLayer, nullptr, kLayerHidden);
     }
@@ -395,7 +650,11 @@ static void DestroySlotLayer(void* pLayer)
     ReleaseComPtr(pLayer);
 }
 
-// Hands the skill's own icon canvas to the layer: Animate(layer, retbuf, canvas, empty x5).
+// Hands the skill's own icon canvas to the layer: Animate(layer, retbuf, canvas, v1..v5).
+// The five variants are the SKILL ICON recipe, not empty ones: the CTemporaryStatView entry tail
+// (0x007B3176, reached from its nType == 2 branch) passes VT_I4 500, VT_I4 210, VT_I4 64, empty,
+// empty. The all-empty shape belongs to the drag ghost at 0x00800214, and a layer animated that way
+// stays blank -- which is exactly how this module first came out invisible.
 static bool AnimateIcon(void* pLayer, void* pCanvas)
 {
     if (pLayer == nullptr || pCanvas == nullptr)
@@ -407,10 +666,11 @@ static bool AnimateIcon(void* pLayer, void* pCanvas)
     memset(aRetBuf, 0, sizeof(aRetBuf));
 
     unsigned char aVariants[5][16];
-    for (int i = 0; i < 5; ++i)
-    {
-        CopyEmptyVariant(aVariants[i]);
-    }
+    MakeIntVariant(aVariants[0], 500);
+    MakeIntVariant(aVariants[1], 210);
+    MakeIntVariant(aVariants[2], 64);
+    CopyEmptyVariant(aVariants[3]);
+    CopyEmptyVariant(aVariants[4]);
 
     __try
     {
@@ -418,7 +678,7 @@ static bool AnimateIcon(void* pLayer, void* pCanvas)
             aVariants[0], aVariants[1], aVariants[2], aVariants[3], aVariants[4]);
         return true;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (LogSehFilter(GetExceptionInformation()))
     {
         return false;
     }
@@ -454,6 +714,11 @@ static void* GetSkillIconCanvas(int nSkillId)
 
 static void DestroyAllLayers()
 {
+    if (g_pParentLayer != nullptr)
+    {
+        LogLine("  teardown: window layer %p refs=%u", g_pParentLayer, ProbeRefCount(g_pParentLayer));
+    }
+
     for (int nPet = 0; nPet < kPetCount; ++nPet)
     {
         for (int nSlot = 0; nSlot < kSlotCount; ++nSlot)
@@ -462,6 +727,11 @@ static void DestroyAllLayers()
             g_apLayers[nPet][nSlot] = nullptr;
             g_anDrawn[nPet][nSlot] = 0;
         }
+    }
+
+    if (g_pParentLayer != nullptr)
+    {
+        LogLine("  teardown: window layer refs after=%u", ProbeRefCount(g_pParentLayer));
     }
 
     g_pParentLayer = nullptr;
@@ -534,6 +804,7 @@ static void RefreshLayers(bool bVerbose)
             continue;
         }
 
+        bool bCreated = false;
         if (pLayer == nullptr)
         {
             pLayer = CreateSlotLayer(pParentLayer, bVerbose);
@@ -544,6 +815,8 @@ static void RefreshLayers(bool bVerbose)
                 LogLine("  layer create failed pet=%d slot=%d", nPet, nSlot);
                 continue;
             }
+
+            bCreated = true;
         }
 
         if (g_anDrawn[nPet][nSlot] != nSkillId)
@@ -552,6 +825,7 @@ static void RefreshLayers(bool bVerbose)
             if (bVerbose)
             {
                 LogLine("  icon canvas=%p for skill=%d", pCanvas, nSkillId);
+                DumpCanvas("  icon", pCanvas);
             }
             if (pCanvas == nullptr)
             {
@@ -571,12 +845,35 @@ static void RefreshLayers(bool bVerbose)
             }
         }
 
+        if (bCreated)
+        {
+            if (bVerbose) LogLine("  slot %d created", nSlot);
+        }
+
+        // Re-bind the layer on EVERY refresh, the way BuffTimer::BindLabelLayer re-binds its labels
+        // each tick. Moving the window re-hangs the window's own layer (CWndMan::UpdateWindowPosition
+        // 0x009E03A6 -> RemoveWindow, plus the LT/origin juggling in the layout pass sub_7FFB17), and
+        // whatever that invalidates is restored here.
+        //
+        // raw_RelMove is ABSOLUTE and, once the layer has its canvas, it sets the layer's left-top
+        // directly: measured with a canvas attached, asking for y = 76 reported 76; issued before
+        // Animate (a 0x0 layer with no canvas) the same call came back 32 short, because the engine
+        // then treats the value as the canvas's bottom edge. Hence: move after Animate, ask for the
+        // cell's own top. Repeated calls are idempotent, so re-issuing costs nothing.
+        SetLayerOrigin(pLayer, pParentLayer);
+        MoveLayer(pLayer, kSlotRects[nSlot].nLeft, kSlotRects[nSlot].nTop);
+
+        // PutZ re-inserts the layer at the end of its depth group, so this is also what keeps the
+        // icon above the window's own canvas after the window re-fronts itself.
+        LayerPutZ(pLayer, kSlotLayerZ);
+        SetLayerVisible(pLayer, true);
+
+        LogRefreshState(pParentLayer, pLayer);
+
         if (bVerbose)
         {
-            LogLine("  moving to (%d,%d)", kSlotRects[nSlot].nLeft, kSlotRects[nSlot].nTop);
+            DumpLayer("  painted", pLayer);
         }
-        MoveLayer(pLayer, kSlotRects[nSlot].nLeft, kSlotRects[nSlot].nTop);
-        SetLayerVisible(pLayer, true);
     }
 }
 
@@ -680,9 +977,15 @@ static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, vo
 
         g_pWindow = pObject;
         RefreshLayers(true);
-        return 1;
+
+        // Return 0 even though the slot was taken: a non-zero result tells CWndMan::EndDragDrop
+        // (0x009E37C2) that the target ACCEPTED the drop, and it then runs the drop-into-the-world
+        // path -- `if (v31) sub_8D63EC(CUIStatusBar::ms_pInstance, x, y, dragCtx + 4)` -- which
+        // leaves the UI unresponsive and unclosable for a skill. The original returns 0 whenever
+        // the skill is not one it handles, so 0 is the ordinary "nobody took it" outcome.
+        return 0;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (LogSehFilter(GetExceptionInformation()))
     {
         LogLine("  exception while reading the drop");
         return 0;
@@ -701,17 +1004,20 @@ static int __fastcall OnMouseMove_Hook(void* pThis, void* /*edx*/, int nX, int n
 
     __try
     {
-        if (pThis != nullptr && *reinterpret_cast<void**>(pThis) != nullptr)
+        // CUIPetEquip::OnMouseMove is called with the window's SECOND base (`obj + 4`), the same
+        // pointer CWndMan hands out as a drop target -- the destroy log caught it: `this=2422787C
+        // tracked=24227880`. The tab field, the layer field and CWnd::Destroy all live on the CWnd
+        // base, so the pointer is normalised the same way the drop path does it. Skipping the
+        // normalisation made every mouse move re-hang the icon on whatever sat at obj + 0x1C and
+        // left CWnd::Destroy unable to recognise the window at all.
+        void* pObject = nullptr;
+        if (IsPetEquipWindow(pThis, &pObject))
         {
-            if (g_pWindow != pThis)
-            {
-                g_pWindow = pThis;
-            }
-
+            g_pWindow = pObject;
             RefreshLayers(false);
         }
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (LogSehFilter(GetExceptionInformation()))
     {
     }
 
@@ -723,6 +1029,12 @@ static void __fastcall Destroy_Hook(void* pThis, void* /*edx*/)
 {
     __try
     {
+        if (g_pWindow != nullptr)
+        {
+            LogLine("  window destroy: this=%p tracked=%p%s", pThis, g_pWindow,
+                (pThis == g_pWindow || pThis == reinterpret_cast<char*>(g_pWindow) + 4) ? " (ours)" : "");
+        }
+
         if (g_pWindow != nullptr &&
             (pThis == g_pWindow || pThis == reinterpret_cast<char*>(g_pWindow) + 4))
         {
@@ -730,7 +1042,7 @@ static void __fastcall Destroy_Hook(void* pThis, void* /*edx*/)
             g_pWindow = nullptr;
         }
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (LogSehFilter(GetExceptionInformation()))
     {
     }
 
