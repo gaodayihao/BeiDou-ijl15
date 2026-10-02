@@ -2,8 +2,6 @@
 #include "PetBuffConfig.h"
 #include "PetSkillSlot.h"
 #include "Memory.h"
-#include <stdio.h>
-#include <stdarg.h>
 
 // ===== Reverse-engineering anchors (Angel.exe / BeiDou.exe, v83) ================================
 // The packet pair is an Ursa addition; 0x1001 was free in both directions in the v83 opcode enums
@@ -38,8 +36,6 @@ static const int kSlotCount = 2;
 static const int kValueCount = kPetCount * kSlotCount;
 static const int nPayloadSize = 1 + 4 * kValueCount;            // version + six int32
 static const int nReceivePrefix = 6;                            // bytes before the payload (see above)
-
-bool PetBuffConfig::bDebug = true;
 
 // COutPacket, laid out the way HpMpAlert.cpp / PetAutoBuff.cpp declare it: Data/Size describe a buffer
 // the caller owns, so nothing here or in the client has to allocate or free.
@@ -87,27 +83,6 @@ static auto _send_packet = reinterpret_cast<SendPacket_t>(ADDR_ClientSocket_Send
 static auto _decode1 = reinterpret_cast<Decode1_t>(ADDR_CInPacket_Decode1);
 static auto _decode2 = reinterpret_cast<Decode2_t>(ADDR_CInPacket_Decode2);
 static auto _decode4 = reinterpret_cast<Decode4_t>(ADDR_CInPacket_Decode4);
-
-static void LogLine(const char* sFormat, ...)
-{
-    if (!PetBuffConfig::bDebug)
-    {
-        return;
-    }
-
-    FILE* pFile = nullptr;
-    if (fopen_s(&pFile, "petbuff.log", "a") != 0 || pFile == nullptr)
-    {
-        return;
-    }
-
-    va_list args;
-    va_start(args, sFormat);
-    vfprintf(pFile, sFormat, args);
-    va_end(args);
-    fputc('\n', pFile);
-    fclose(pFile);
-}
 
 // One free function for both halves: reading the six values out of a received buffer and writing them
 // into one. Keeping the order (pet*2 + slot) in a single place is what makes the two directions agree.
@@ -163,14 +138,9 @@ void PetBuffConfig_Send()
     __try
     {
         WriteRaw(pSocket, aPayload, static_cast<unsigned long>(n));
-        LogLine("  config: sent %d/%d/%d/%d/%d/%d",
-            PetSkillSlot::GetSkill(0, 0), PetSkillSlot::GetSkill(0, 1),
-            PetSkillSlot::GetSkill(1, 0), PetSkillSlot::GetSkill(1, 1),
-            PetSkillSlot::GetSkill(2, 0), PetSkillSlot::GetSkill(2, 1));
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        LogLine("  config: send faulted, ignored");
     }
 }
 
@@ -194,16 +164,11 @@ static bool ReadConfigPacketRaw(CInPacket* packet, int* pSlots, bool* pbApplied)
         if (nOpcode != nOpcodePetBuffConfig)
         {
             *pCursor = nSavedCursor;                       // not ours: hand it back untouched
-            if (nOpcode >= 0x1000)
-            {
-                LogLine("  recv: op=0x%04X (not ours)", nOpcode);
-            }
             return false;
         }
 
         if (_decode1(packet, nullptr) != nConfigVersion)
         {
-            LogLine("  config: version != %d, ignored", static_cast<int>(nConfigVersion));
             return true;                                   // ours, but a version we cannot read
         }
 
@@ -218,7 +183,6 @@ static bool ReadConfigPacketRaw(CInPacket* packet, int* pSlots, bool* pbApplied)
     catch (...)
     {
         *pCursor = nSavedCursor;                           // short/garbled: leave it to the client
-        LogLine("  recv: decode raised, packet left alone");
         return false;
     }
 }
@@ -245,11 +209,6 @@ static bool TryConsumeConfigPacket(CInPacket* packet, bool* pbApplied)
                     PetSkillSlot::SetSkill(nPet, nSlot, aSlots[SlotIndex(nPet, nSlot)]);
                 }
             }
-
-            LogLine("  config: loaded %d/%d/%d/%d/%d/%d",
-                PetSkillSlot::GetSkill(0, 0), PetSkillSlot::GetSkill(0, 1),
-                PetSkillSlot::GetSkill(1, 0), PetSkillSlot::GetSkill(1, 1),
-                PetSkillSlot::GetSkill(2, 0), PetSkillSlot::GetSkill(2, 1));
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -262,7 +221,6 @@ static bool TryConsumeConfigPacket(CInPacket* packet, bool* pbApplied)
 }
 
 static ProcessPacket_t g_origProcessPacket = nullptr;
-static unsigned long g_nHookCalls = 0;
 
 static void __fastcall ProcessPacket_Hook(void* pThis, void* edx, CInPacket* packet)
 {
@@ -271,12 +229,6 @@ static void __fastcall ProcessPacket_Hook(void* pThis, void* edx, CInPacket* pac
 
     __try
     {
-        ++g_nHookCalls;
-        if (PetBuffConfig::bDebug && g_nHookCalls == 1)
-        {
-            LogLine("--- packet hook live (orig=%p) ---", g_origProcessPacket);
-        }
-
         bConsumed = TryConsumeConfigPacket(packet, &bApplied);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -318,6 +270,4 @@ void Hook_PetBuffConfig(bool enable)
             std::cout << "pet auto-buff config sync: ProcessPacket hook FAILED" << std::endl;
         }
     }
-
-    LogLine("--- pet auto-buff config sync armed (opcode 0x%04X) ---", nOpcodePetBuffConfig);
 }

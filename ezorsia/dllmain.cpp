@@ -114,15 +114,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			itemWndExpanded = reader.GetBoolean("optional", "itemWndExpanded", true);
 			itemWndRemember = reader.GetBoolean("optional", "itemWndRemember", true);
 			PetSkillSlot::bEnabled = reader.GetBoolean("optional", "petBuff", true);
-			PetSkillSlot::bDebug = reader.GetBoolean("optional", "petBuffDebug", true);
 			PetSkillSlot::nLabelFont = reader.GetInteger("optional", "petSkillSlotFont", 43);
 			PetSkillSlot::nFontSize = reader.GetInteger("optional", "petSkillSlotFontSize", 11);
 			PetSkillSlot::nFontColor = reader.GetInteger("optional", "petSkillSlotFontColor", 0x006400);
 			PetAutoBuff::bEnabled = reader.GetBoolean("optional", "petAutoBuff", true);
 			PetAutoBuff::nLeadMs = reader.GetInteger("optional", "petAutoBuffLead", 3000);
 			PetAutoBuff::nTickMs = reader.GetInteger("optional", "petAutoBuffTickMs", 1000);
-			PetAutoBuff::bDebug = reader.GetBoolean("optional", "petAutoBuffDebug", true);
-			PetBuffConfig::bDebug = reader.GetBoolean("optional", "petBuffDebug", true);
 			BossHP::bShowPercent = reader.GetBoolean("optional", "bossHpPercent", true);
 			BossHP::bShowText = reader.GetBoolean("optional", "bossHpText", true);
 			BossHP::bShowTextName = reader.GetBoolean("optional", "bossHpTextShowName", true);

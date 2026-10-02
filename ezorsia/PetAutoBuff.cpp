@@ -3,8 +3,6 @@
 #include "PetSkillSlot.h"
 #include "PetBuffWhitelist.h"
 #include "Memory.h"
-#include <stdio.h>
-#include <stdarg.h>
 
 // ===== Reverse-engineering anchors (Angel.exe / BeiDou.exe, v83; bookmarks prefixed "PETBUFF:") ====
 //
@@ -118,7 +116,6 @@ static const int kMaxSlots = 3 * 2; // three pet tabs, two cells each
 bool PetAutoBuff::bEnabled = true;
 int PetAutoBuff::nLeadMs = 3000;
 int PetAutoBuff::nTickMs = 1000;
-bool PetAutoBuff::bDebug = true;
 
 typedef void (__fastcall* WvsContextUpdate_t)(void* pThis, void* edx);
 typedef void* (__fastcall* ZListFindIndex_t)(void* pList, void* edx, unsigned int nIndex);
@@ -197,27 +194,6 @@ static int GetActivePetCount()
     {
         return 0;
     }
-}
-
-static void LogLine(const char* sFormat, ...)
-{
-    if (!PetAutoBuff::bDebug)
-    {
-        return;
-    }
-
-    FILE* pFile = nullptr;
-    if (fopen_s(&pFile, "petbuff.log", "a") != 0 || pFile == nullptr)
-    {
-        return;
-    }
-
-    va_list args;
-    va_start(args, sFormat);
-    vfprintf(pFile, sFormat, args);
-    va_end(args);
-    fputc('\n', pFile);
-    fclose(pFile);
 }
 
 // True while the client's own temporary-stat list holds a skill buff with this id, and the time it
@@ -348,7 +324,6 @@ static int CheckConsumeRaw(void* pWvsContext, void* pCharacterData, int nSkillId
     }
     catch (...)
     {
-        LogLine("  autobuff: consume check raised, skipped");
         return 0;
     }
 }
@@ -382,7 +357,6 @@ static int GetSkillLevelRaw(void* pSkillInfo, void* pCharacterData, int nSkillId
     }
     catch (...)
     {
-        LogLine("  autobuff: level lookup raised, ignored");
         return 0;
     }
 }
@@ -433,7 +407,6 @@ static void SendSkillUseRaw(void* pSocket, const unsigned char* pPayload, unsign
     }
     catch (...)
     {
-        LogLine("  autobuff: SendPacket raised, ignored");
     }
 }
 
@@ -476,34 +449,24 @@ static void SendSkillUse(int nSkillId, int nLevel)
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        LogLine("  autobuff: SendPacket faulted, ignored");
     }
 }
 
 // The client's own "not now" state for a cast, restricted to the two gates that need no CUserLocal
-// instance (see the anchors at the top): the local death stamp and the map pointer. Returns the field
-// used by the per-skill map gate, or null to skip the whole tick, with the reason for the log.
-static void* GetFieldOrVeto(void* pWvsContext, const char** ppszReason)
+// instance (see the anchors at the top): the local death stamp and the map pointer. Null means this
+// tick has nothing to do -- dead with the revive dialog pending, or no usable field.
+static void* GetFieldOrVeto(void* pWvsContext)
 {
-    *ppszReason = nullptr;
-
     // Non-zero = dead with the revive dialog pending. The server refuses a dead caster anyway
     // (SpecialMoveHandler checks IsAlive); this only keeps the packets home.
     if (*reinterpret_cast<int*>(reinterpret_cast<char*>(pWvsContext) + OFF_CWvsContext_ReviveStamp) != 0)
     {
-        *ppszReason = "dead";
         return nullptr;
     }
 
     // 0 in the cash shop, at login and while a field transfer is in flight -- the client has no skill
     // context there either, and this is the pointer the map gate has to be handed.
-    void* pField = _get_field();
-    if (pField == nullptr)
-    {
-        *ppszReason = "not in a map";
-    }
-
-    return pField;
+    return _get_field();
 }
 
 // Walks the six cells and re-casts whatever is missing. Runs from CWvsContext::Update (every frame),
@@ -526,40 +489,25 @@ static void Tick(void* pWvsContext)
     }
     g_dwLastTick = dwNow;
 
-    static bool s_bVetoLogged = false;
-    const char* pszVeto = nullptr;
     void* pField = nullptr;
     __try
     {
-        pField = GetFieldOrVeto(pWvsContext, &pszVeto);
+        pField = GetFieldOrVeto(pWvsContext);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        pszVeto = "gate read faulted";
     }
 
     if (pField == nullptr)
     {
-        // Logged on the edge only: the veto is re-evaluated every kTickMs, and a player sitting dead in
-        // front of the revive dialog would otherwise write five lines a second.
-        if (!s_bVetoLogged)
-        {
-            LogLine("  autobuff: holding off (%s)", pszVeto);
-            s_bVetoLogged = true;
-        }
+        // Dead with the revive dialog pending, or no field (cash shop / login / transfer in flight):
+        // the same "nothing to do" answer CUserLocal::DoActiveSkill would give.
         return;
     }
-    s_bVetoLogged = false;
 
     // Pets currently out. Tabs without one are skipped: a removed pet must stop refreshing its pair,
-    // and the configured values stay put for when it comes back. Logged on the edge only.
-    static int s_nLastPetCount = -1;
+    // and the configured values stay put for when it comes back.
     const int nPetCount = GetActivePetCount();
-    if (nPetCount != s_nLastPetCount)
-    {
-        LogLine("  autobuff: %d pet(s) out, tabs 0..%d active", nPetCount, nPetCount - 1);
-        s_nLastPetCount = nPetCount;
-    }
 
     for (int nPet = 0; nPet < nPetCount; ++nPet)
     {
@@ -592,7 +540,6 @@ static void Tick(void* pWvsContext)
             if (_is_skill_forbiden(pField, nSkillId) != 0)
             {
                 g_adwRetryAfter[nCell] = dwNow + kRetryMs;
-                LogLine("  autobuff pet=%d slot=%d skill=%d: forbidden on this map", nPet, nSlot, nSkillId);
                 continue;
             }
 
@@ -601,7 +548,6 @@ static void Tick(void* pWvsContext)
             if (nLevel <= 0)
             {
                 g_adwRetryAfter[nCell] = dwNow + kRetryMs;
-                LogLine("  autobuff pet=%d slot=%d skill=%d: not learned, skipped", nPet, nSlot, nSkillId);
                 continue;
             }
 
@@ -612,15 +558,11 @@ static void Tick(void* pWvsContext)
             if (nConsume != 1)
             {
                 g_adwRetryAfter[nCell] = dwNow + kRetryMs;
-                LogLine("  autobuff pet=%d slot=%d skill=%d: consume refused (%d; 2=HP 3=MP 4=meso, other=missing item id)",
-                    nPet, nSlot, nSkillId, nConsume);
                 continue;
             }
 
             SendSkillUse(nSkillId, nLevel);
             g_adwRetryAfter[nCell] = dwNow + kRetryMs;
-            LogLine("  autobuff pet=%d slot=%d skill=%d level=%d remaining=%d up=%d: cast sent",
-                nPet, nSlot, nSkillId, nLevel, nRemaining, bUp ? 1 : 0);
         }
     }
 }
@@ -666,6 +608,4 @@ void Hook_PetAutoBuff(bool enable)
             std::cout << "pet auto-buff refresh: Update hook FAILED" << std::endl;
         }
     }
-
-    LogLine("--- pet auto-buff refresh armed (lead=%dms) ---", PetAutoBuff::nLeadMs);
 }

@@ -18,10 +18,6 @@ class PetBuffConfig
 {
 public:
     static void Hook();
-
-    // config.ini [optional]
-    static bool bDebug;     // petBuffDebug : append every send / load to petbuff.log (same switch as
-                            // the slots themselves)
 };
 
 void Hook_PetBuffConfig(bool enable);

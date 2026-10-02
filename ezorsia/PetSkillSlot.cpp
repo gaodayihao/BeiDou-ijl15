@@ -4,8 +4,6 @@
 #include "PetBuffWhitelist.h"
 #include "PetBuffConfig.h"      // configuration changes are shipped to the server here
 #include "BuffTimer.h"          // BuffTimer::CreateFont: the label's own size/colour font
-#include <stdio.h>
-#include <stdarg.h>
 #include <oleauto.h> // VARIANTARG (the WzGr2D / WzCanvas wrappers take Ztl_variant_t by value)
 #include <comdef.h>
 
@@ -134,9 +132,6 @@ static const DWORD ADDR_IWzGr2D_CreateLayer = 0x00426C7E;
 static const DWORD ADDR_IWzGr2D_GetCenter = 0x004374CB;
 static const DWORD ADDR_IWzGr2DLayer_Animate = 0x00426BAB;
 static const DWORD ADDR_IWzGr2DLayer_Putcolor = 0x0045144A;
-static const DWORD ADDR_IWzGr2DLayer_GetWidth = 0x00440C00;
-static const DWORD ADDR_IWzGr2DLayer_GetHeight = 0x00440C2A;
-static const DWORD ADDR_IWzGr2DLayer_GetZ = 0x0044337D;
 static const DWORD ADDR_Gr2DInstance = 0x00BF14EC;
 static const int nVtbl_IWzVector2D__put_origin = 100;
 static const int nVtbl_IWzVector2D__raw_RelMove = 144;
@@ -213,13 +208,9 @@ static int g_nDragFromSlot = -1;
 static void* g_pDragFromWindow = nullptr;
 
 bool PetSkillSlot::bEnabled = true;
-bool PetSkillSlot::bDebug = true;
 int PetSkillSlot::nLabelFont = 43;
 int PetSkillSlot::nFontSize = 11;
 int PetSkillSlot::nFontColor = 0x006400;   // darkgreen: a shade under the cell's 0x00C000 wash
-
-// One-off: a font that could not be built is logged once, not on every repaint.
-static bool g_bLabelFontLogged = false;
 
 typedef void* (__thiscall* CWndGetCanvas_t)(void* pWnd, void* pRetBuf);
 typedef void (__thiscall* CWndInvalidateRect_t)(void* pWnd, const void* pRect);
@@ -255,7 +246,6 @@ typedef long(__stdcall* VectorRawRelMove_t)(void* pVector, long nX, long nY, VAR
 typedef void (__fastcall* LayerPutColor_t)(void* pLayer, void* edx, unsigned long nColor);
 typedef void* (__thiscall* LayerAnimate_t)(void* pLayer, void* pRetBuf, void* pCanvas,
     const void* pV1, const void* pV2, const void* pV3, const void* pV4, const void* pV5);
-typedef int(__fastcall* LayerGetInt_t)(void* pLayer, void* edx);
 typedef int(__thiscall* PetEquipOnMouseMove_t)(void* pThis, int nX, int nY);
 typedef void* (__thiscall* SkillInfoGetSkill_t)(void* pSkillInfo, int nSkillId);
 typedef int(__thiscall* DraggableSkillOnDropped_t)(void* pThis, void* pFrom, void* pTo, int nX, int nY);
@@ -272,55 +262,12 @@ static auto _create_layer = reinterpret_cast<Gr2DCreateLayer_t>(ADDR_IWzGr2D_Cre
 static auto _gr2d_get_center = reinterpret_cast<Gr2DGetCenter_t>(ADDR_IWzGr2D_GetCenter);
 static auto _layer_animate = reinterpret_cast<LayerAnimate_t>(ADDR_IWzGr2DLayer_Animate);
 static auto _layer_put_color = reinterpret_cast<LayerPutColor_t>(ADDR_IWzGr2DLayer_Putcolor);
-static auto _layer_get_width = reinterpret_cast<LayerGetInt_t>(ADDR_IWzGr2DLayer_GetWidth);
-static auto _layer_get_height = reinterpret_cast<LayerGetInt_t>(ADDR_IWzGr2DLayer_GetHeight);
-static auto _layer_get_z = reinterpret_cast<LayerGetInt_t>(ADDR_IWzGr2DLayer_GetZ);
 
 static DraggableSkillOnDropped_t g_origOnDropped = nullptr;
 static PetEquipDraw_t g_origDraw = nullptr;
 static PetEquipOnMouseMove_t g_origOnMouseMove = nullptr;
 static PetEquipOnMouseButton_t g_origOnMouseButton = nullptr;
 static CWvsContextOnLeaveGame_t g_origOnLeaveGame = nullptr;
-
-// petbuff.log in the client directory: the drop path was calibrated from it (window pointer, tab,
-// skill id and the drop coordinates as the client reports them).
-static void LogLine(const char* sFormat, ...)
-{
-    if (!PetSkillSlot::bDebug)
-    {
-        return;
-    }
-
-    FILE* pFile = nullptr;
-    if (fopen_s(&pFile, "petbuff.log", "a") != 0 || pFile == nullptr)
-    {
-        return;
-    }
-
-    va_list args;
-    va_start(args, sFormat);
-    vfprintf(pFile, sFormat, args);
-    va_end(args);
-    fputc('\n', pFile);
-    fclose(pFile);
-}
-
-// Reports a structured exception through the log. Only ever used from an __except filter, so it
-// must not throw and must not build anything that needs unwinding. A C++ exception surfaces here as
-// code 0xE06D7363 with the faulting address inside the CRT, an access violation as 0xC0000005.
-static int LogSehFilter(EXCEPTION_POINTERS* pInfo)
-{
-    if (pInfo != nullptr && pInfo->ExceptionRecord != nullptr)
-    {
-        const EXCEPTION_RECORD* pRecord = pInfo->ExceptionRecord;
-        LogLine("  SEH code=0x%08X addr=0x%08X p0=0x%08X p1=0x%08X",
-            static_cast<unsigned>(pRecord->ExceptionCode),
-            static_cast<unsigned>(static_cast<DWORD_PTR>(reinterpret_cast<DWORD_PTR>(pRecord->ExceptionAddress))),
-            pRecord->NumberParameters > 0 ? static_cast<unsigned>(pRecord->ExceptionInformation[0]) : 0u,
-            pRecord->NumberParameters > 1 ? static_cast<unsigned>(pRecord->ExceptionInformation[1]) : 0u);
-    }
-    return EXCEPTION_EXECUTE_HANDLER;
-}
 
 static void ReleaseComPtr(void* pUnknown)
 {
@@ -526,7 +473,6 @@ static void ClearDragSourceSlot()
     }
 
     g_anSlots[nPet][nSlot] = 0;
-    LogLine("  removed pet=%d slot=%d", nPet, nSlot);
     PetBuffConfig_Send();                   // whole-configuration save; see PetBuffConfig.h
 
     __try
@@ -602,9 +548,6 @@ static void* CreateGhostLayer(void* pIconCanvas, void* pWindow, int nLocalX, int
         MoveLayer(pLayer, nLocalX + nGhostOffsetX, nLocalY + nGhostOffsetY);
     }
 
-    LogLine("  ghost layer: w=%d h=%d z=0x%08X",
-        _layer_get_width(pLayer, nullptr), _layer_get_height(pLayer, nullptr),
-        static_cast<unsigned>(_layer_get_z(pLayer, nullptr)));
     return pLayer;
 }
 
@@ -626,7 +569,6 @@ static bool StartSlotDrag(void* pSource, void* pWindow, int nPet, int nSlot, int
     __try
     {
         pGhost = CreateGhostLayer(GetSkillIconCanvas(nSkillId), pWindow, nLocalX, nLocalY);
-        LogLine("  drag: ghost=%p", pGhost);
         if (pGhost == nullptr)
         {
             return false;
@@ -634,7 +576,6 @@ static bool StartSlotDrag(void* pSource, void* pWindow, int nPet, int nSlot, int
 
         void* pDraggable = reinterpret_cast<ZAllocExAlloc_t>(ADDR_ZAllocEx_Alloc)(
             reinterpret_cast<void*>(ADDR_ZAllocEx_s_alloc), nCDraggableSkill_Size);
-        LogLine("  drag: alloc=%p", pDraggable);
         if (pDraggable == nullptr)
         {
             ReleaseComPtr(pGhost);
@@ -643,14 +584,12 @@ static bool StartSlotDrag(void* pSource, void* pWindow, int nPet, int nSlot, int
 
         memset(pDraggable, 0, nCDraggableSkill_Size);
         reinterpret_cast<CDraggableBaseCtor_t>(ADDR_CDraggable_BaseCtor)(pDraggable, pGhost);
-        LogLine("  drag: base ctor done, p=%p", pDraggable);
 
         *reinterpret_cast<int*>(reinterpret_cast<char*>(pDraggable) + OFF_CDraggableSkill_SkillId) = nSkillId;
         // 1 skips OnDropped's "is this skill learned?" gate, which is the check the client's own
         // drags from the skill window satisfy differently (they drag a skill the player has).
         *reinterpret_cast<int*>(reinterpret_cast<char*>(pDraggable) + OFF_CDraggableSkill_Validated) = 1;
         *reinterpret_cast<void**>(pDraggable) = reinterpret_cast<void*>(ADDR_CDraggableSkill_Vtbl);
-        LogLine("  drag: fields set");
 
         // The base ctor took its own reference on the ghost; ours is handed back here, leaving the
         // draggable the only owner.
@@ -659,9 +598,8 @@ static bool StartSlotDrag(void* pSource, void* pWindow, int nPet, int nSlot, int
 
         reinterpret_cast<CWndManBeginDragDrop_t>(ADDR_CWndMan_BeginDragDrop)(
             *reinterpret_cast<void**>(ADDR_CWndMan_Instance), pSource, pDraggable);
-        LogLine("  drag: begun");
     }
-    __except (LogSehFilter(GetExceptionInformation()))
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
         if (pGhost != nullptr)
         {
@@ -676,7 +614,6 @@ static bool StartSlotDrag(void* pSource, void* pWindow, int nPet, int nSlot, int
     // skill, and the interface pointer leaves the window un-repainted (the icon then stays on screen
     // until the window is recreated).
     g_pDragFromWindow = pWindow;
-    LogLine("  drag start pet=%d slot=%d skill=%d", nPet, nSlot, nSkillId);
     return true;
 }
 
@@ -831,12 +768,6 @@ static void DrawSlotsRaw(void* pWindow, int nPet)
         {
             DrawSlotLabel(pCanvas, pFont);
         }
-        else if (!g_bLabelFontLogged)
-        {
-            g_bLabelFontLogged = true;
-            LogLine("  draw: no font (size=%d colour=0x%06X type=%d), label skipped",
-                PetSkillSlot::nFontSize, PetSkillSlot::nFontColor, PetSkillSlot::nLabelFont);
-        }
 
         // DrawCanvas takes its attribute as a Ztl_variant_t BY VALUE, so it has to be a real
         // VARIANTARG rather than the byte buffer the by-reference wrappers use.
@@ -855,7 +786,6 @@ static void DrawSlotsRaw(void* pWindow, int nPet)
             void* pIcon = GetSkillIconCanvas(nSkillId);
             if (pIcon == nullptr)
             {
-                LogLine("  draw: no icon canvas for skill=%d", nSkillId);
                 continue;
             }
 
@@ -867,7 +797,7 @@ static void DrawSlotsRaw(void* pWindow, int nPet)
     }
     catch (...)
     {
-        LogLine("  draw: the canvas call raised, skipped");
+        // Never let a failed COM call reach the client's top-level handler: skip this repaint.
     }
 }
 
@@ -892,7 +822,7 @@ static void DrawSlots(void* pWindow)
     {
         DrawSlotsRaw(pWindow, nPet);
     }
-    __except (LogSehFilter(GetExceptionInformation()))
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
 }
@@ -920,7 +850,7 @@ static int __fastcall Draw_Hook(void* pThis, void* /*edx*/, const void* pRect)
             DrawSlots(pObject);
         }
     }
-    __except (LogSehFilter(GetExceptionInformation()))
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
 
@@ -957,9 +887,6 @@ static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, vo
         const int nSkillId = *reinterpret_cast<int*>(reinterpret_cast<char*>(pThis) + OFF_DraggableSkill_SkillId);
         const int nPet = GetTab(pObject);
 
-        LogLine("drop to=%p obj=%p tab=%d skill=%d x=%d y=%d whitelisted=%d",
-            pTo, pObject, nPet, nSkillId, nX, nY, IsPetBuffSkill(nSkillId) ? 1 : 0);
-
         if (!IsPetBuffSkill(nSkillId))
         {
             return 0;
@@ -967,7 +894,6 @@ static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, vo
 
         if (nPet < 0 || nPet >= kPetCount)
         {
-            LogLine("  refused: tab %d out of range", nPet);
             return 0;
         }
 
@@ -977,7 +903,6 @@ static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, vo
         const int nSlot = FindSlotAt(nX, nY);
         if (nSlot < 0)
         {
-            LogLine("  dropped off the cells: removing");
             ClearDragSourceSlot();
             return 0;
         }
@@ -992,13 +917,11 @@ static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, vo
                     g_anSlots[nOtherPet][nOtherSlot] == nSkillId)
                 {
                     g_anSlots[nOtherPet][nOtherSlot] = 0;
-                    LogLine("  moved out of pet=%d slot=%d", nOtherPet, nOtherSlot);
                 }
             }
         }
 
         g_anSlots[nPet][nSlot] = nSkillId;
-        LogLine("  stored pet=%d slot=%d skill=%d", nPet, nSlot, nSkillId);
         PetBuffConfig_Send();               // whole-configuration save; see PetBuffConfig.h
 
         // Dragging a slot onto another slot is the same case as dropping the same skill again: the
@@ -1018,9 +941,8 @@ static int __fastcall OnDropped_Hook(void* pThis, void* /*edx*/, void* pFrom, vo
         // is not one it handles, so 0 is the ordinary "nobody took it" outcome.
         return 0;
     }
-    __except (LogSehFilter(GetExceptionInformation()))
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        LogLine("  exception while reading the drop");
         ForgetDragSource();
         return 0;
     }
@@ -1056,10 +978,6 @@ static void __fastcall OnMouseButton_Hook(void* pThis, void* /*edx*/, unsigned i
         const int nPet = GetTab(pObject);
         const int nSlot = FindSlotAt(nX, nY);
 
-        // Logged for every press so a drag that never starts can be told apart from a press that
-        // never reaches this window (a tooltip sitting under the cursor does exactly that).
-        LogLine("  press msg=%u x=%d y=%d tab=%d slot=%d", nMsg, nX, nY, nPet, nSlot);
-
         if (nPet < 0 || nPet >= kPetCount || nSlot < 0)
         {
             return;
@@ -1067,7 +985,7 @@ static void __fastcall OnMouseButton_Hook(void* pThis, void* /*edx*/, unsigned i
 
         StartSlotDrag(pThis, pObject, nPet, nSlot, nX, nY);
     }
-    __except (LogSehFilter(GetExceptionInformation()))
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
 }
@@ -1119,7 +1037,7 @@ static void ShowSlotToolTip(void* pObject, int nX, int nY, bool bOnClientCell)
         // with it centred on the cursor the press landed on the tooltip window instead of the cell.
         _tooltip_set_skill(pToolTip, nullptr, ptCursor.x, ptCursor.y + 20, pEntry, 0);
     }
-    __except (LogSehFilter(GetExceptionInformation()))
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
 }
@@ -1151,7 +1069,7 @@ static int __fastcall OnMouseMove_Hook(void* pThis, void* /*edx*/, int nX, int n
             ShowSlotToolTip(pObject, nX, nY, bOnClientCell);
         }
     }
-    __except (LogSehFilter(GetExceptionInformation()))
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
 
@@ -1172,7 +1090,6 @@ static int __fastcall OnLeaveGame_Hook(void* pThis, void* edx)
     }
 
     ForgetDragSource();
-    LogLine("  left the game: slots cleared");
 
     if (g_origOnLeaveGame != nullptr)
     {
@@ -1272,5 +1189,4 @@ void Hook_PetSkillSlot(bool enable)
     }
 
     std::cout << "pet auto-buff slots hook created (CDraggableSkill::OnDropped)" << std::endl;
-    LogLine("--- pet auto-buff slots armed (build 0x%08X) ---", ADDR_DraggableSkill_OnDropped);
 }

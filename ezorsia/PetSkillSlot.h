@@ -25,7 +25,6 @@ public:
 
     // config.ini [optional]
     static bool bEnabled;   // petBuff      : the whole feature
-    static bool bDebug;     // petBuffDebug : append every drop decision to petbuff.log
 
     // The label's own font, built the way BuffTimer builds its buff-timer labels. nFontSize is the
     // point size and nFontColor an 0xRRGGBB colour (opaque); nFontSize <= 0 falls back to the
