@@ -13,18 +13,20 @@
 
 | 地址 | 符号 | 原型 | 用途 |
 |---|---|---|---|
-| `0x00A202BE` | `CWvsContext::OnTemporaryStatSet` | `void __thiscall(CInPacket&)` | GIVE_BUFF 入口；本特性在此抓时长 |
+| `0x00A202BE` | `CWvsContext::OnTemporaryStatSet` | `void __thiscall(CInPacket&)` | GIVE_BUFF 入口；**本特性不再 hook 它**（时长改读内存字段，§3） |
 | `0x00A2071F` | `CWvsContext::OnTemporaryStatReset` | `void __thiscall(CInPacket&)` | CANCEL_BUFF；**只带统计掩码，不带 id**，故未 hook |
 | `0x00A03350` | `CWvsContext::Update` | `void __thiscall(void)` | 每帧 tick（内部调 `sub_7B2829` 驱动 buff 视图） |
 | `0x00781D0E` | 临时状态解码器（未命名） | — | 逐位读 `{value, id, len}`，`timeGetTime()+len` 存为到期时刻 |
-| `0x007B24D5` | `CTemporaryStatView::SetTemporary` | `void __thiscall(int,int,int,UINT128,ZXString,int,int)` | 新增一个图标条目 |
+| `0x007B24D5` | `CTemporaryStatView::SetTemporary` | `void __thiscall(int,int,int,UINT128,ZXString,int,int)` | 新增一个图标条目（第 3 实参 = 剩余毫秒，转交条目构造） |
 | `0x007B2679` | `CTemporaryStatView::ResetTemporary` | `void __thiscall(int,int)` | 删条目：`sub_7B4BD1` 摘链 + 释放 entry |
 | `0x007B4BD1` | 摘链 + 释放条目（未命名） | — | ZList 摘除；**图层的生死完全靠引用计数** |
-| `0x007B3176` | 条目构造函数 | — | 建 `entry+0x28`（图标）与 `entry+0x2C`（覆盖层）两个 Gr2DLayer |
+| `0x007B3176` | 条目构造函数 | — | 建 `entry+0x28`（图标）与 `entry+0x2C`（覆盖层）两个 Gr2DLayer；收尾把 `+0x38`/`+0x3C` 清零、`+0x3C = 实参/16`，再 `sub_7B4819(entry, 剩余毫秒)` |
+| `0x007B2829` | `CTemporaryStatView::Update` | `void __thiscall(void)` | **剩余时间的驱动点**：每帧走查 buff 行，把 `5221006` 之外条目的 `entry+0x38` 重写为「旧值 − 30」；`CWvsContext::Update` 的唯一调用点 |
+| `0x007B4819` | 单条目倒计时写入 | `void __thiscall(int remaining)` | `*(entry+0x38) = remaining`；跨过 3000 时给图标起闪（`5221006` 用 `entry+0x3C` 阈值），并调 `sub_7B44F4` |
+| `0x007B30DB` | `CTemporaryStatView::UpdatePassively` | `void __thiscall(void*, int id, int value)` | 同一个 `+0x38` 写入点，值由调用方推入（命中 id 的那一条） |
 | `0x007B2BB0` | `CTemporaryStatView::AdjustPosition` | `int __thiscall(void)` | 用 `raw_RelMove` 把两层叠在同一像素（增删 buff 后整行重排） |
 | `0x007B2E58` | `CTemporaryStatView::ShowToolTip` | `int __thiscall(CUIToolTip&, tagPOINT&, long&, long)` | 读条目字段（本文件的字段布局来源之一） |
 | `0x007B44F4` | 冷却数字更新（未命名） | `void __thiscall(void)` | 客户端自带的技能冷却数字：`entry+0x38 / +0x3C` 取整到 15 档 → `RemoveCanvas(-2)` + `Animate(64,210,500)` 重画到 `entry+0x2C` |
-| `0x007B4819` | 单图标数值写入 | `void __thiscall(int value)` | 写 `entry+0x38`，并调 `sub_7B44F4` |
 | `0x007B4D1D` | `ZList<ZRef<TEMPORARY_STAT>>::FindIndex` | `__POSITION* __thiscall(unsigned int) const` | 取第 n 个图标节点 |
 | `0x004374CB` | `IWzGr2D::GetCenter` | `_com_ptr_t<IWzVector2D> __thiscall(void)` | Gr2D 中心向量：**图标层的 origin 就是它**（条目构造调用） |
 | `0x00A041FF` | `CWvsContext::OnLeaveGame` | `void __thiscall(void)` | 离开游戏（回登录界面）的唯一出口；**本特性在此交还标签层攥着的图标层引用**（hook 点） |
@@ -97,8 +99,8 @@ MSVC 把隐藏返回槽当**第一个栈参数**压入，因此实际形态是
 | `+0x2C` | 覆盖层 `IWzGr2DLayer`（与图标逐像素同位；客户端的冷却数字画在这层） |
 | `+0x30` | 上次显示的冷却档位 |
 | `+0x34` | 冷却开关（条目构造里由 `Item.wz` prop 4037 写入） |
-| `+0x38` | 当前冷却值 |
-| `+0x3C` | 冷却除数 = 满值/16（`sub_7B44F4` 算 `+0x38 / +0x3C` 并钳到 15） |
+| `+0x38` | **剩余毫秒**（活值）：条目构造时由 `SetTemporary` 的实参写入，此后每帧被 `sub_7B2829` 减 30；客户端的冷却数字也读它（`sub_7B44F4` 拿它当分子） |
+| `+0x3C` | 起闪阈值 / 冷却除数：条目构造写 `实参/16`，`sub_7B4819` 只对 `5221006` 用它当起闪阈值（其余一律 3000），`sub_7B44F4` 拿它当分母 |
 
 ### `CInPacket`
 
@@ -107,9 +109,23 @@ MSVC 把隐藏返回槽当**第一个栈参数**压入，因此实际形态是
 | `+0x08` | 数据基址 |
 | `+0x14` | **读游标**（`Decode1`/`Decode2` 都推进它） |
 
-## 3. 报文布局（GIVE_BUFF）
+## 3. 时长来源：读内存字段（不再解包）
 
-服务端 `PacketCreator.giveBuff` 写入顺序与客户端解码顺序逐字段一致：
+**本插件显示的数字 = 条目 `+0x38`**，逐帧采样，不读 wz、不做时长推导：
+
+```
+CTemporaryStatView::SetTemporary(0x007B24D5)  ── 剩余毫秒 ──►  条目构造(0x007B3176) ──► sub_7B4819
+                                                                                        │ 写 entry+0x38
+CWvsContext::Update(0x00A03350) ─► CTemporaryStatView::Update(0x007B2829) ──────────────┘ 每帧 −30
+```
+
+- 该字段就是**客户端自己给图标起闪**用的倒计时（`sub_7B4819`：`old = *(this+14); *(this+14) = remaining;`
+  再比 3000），所以插件显示的数字与图标闪烁**永远同源同拍**，不会出现"数字还在跳、图标已经半透明"这种两套钟。
+- 唯一调用者是 `CWvsContext::Update`（每帧一次），它把 `5221006` 之外条目的值减 30 ⇒ **字段是客户端按帧步进的估值**，
+  不是墙钟；帧率与 30ms 有偏差时，数字跟的是客户端自己的节奏（与本特性只做"显示"的定位一致）。
+- `UpdatePassively`（`0x007B30DB`）是同一个写入点，供外部（服务端修正）推值进来。
+
+**已否决的路：解 `GIVE_BUFF` 包取时长**。服务端 `PacketCreator.giveBuff` 的写入顺序与客户端解码顺序逐字段一致：
 
 ```
 writeLongMask              16 字节（两个 long = 128 位统计掩码）
@@ -117,15 +133,18 @@ writeLongMask              16 字节（两个 long = 128 位统计掩码）
 writeInt(0) | writeByte(0) | writeInt(首个 statup 的值) | [special 时 skip(3)]
 ```
 
-- 客户端 `sub_781D0E` 用 `CInPacket::DecodeBuffer(mask, 16)` 取掩码，`timeGetTime()` 取一次当前时间，
-  然后逐位置读 `Decode2 / Decode4 / Decode4`，存 `now + bufflength` 为到期时刻。
-- **`bufflength` 单位是毫秒**（技能 `time` 秒 ×1000、道具时长本就按 ms 处理，见 `StatEffect.java:298-303`）。
-- **本插件的数字完全来自这个字段**，不读 wz、不做任何时长推导 ⇒ 显示的时长永远等于服务端下发的时长。
-  服务端自身可能对时长做修正（例：药剂精通 `Y%` 对物品/技能的效果，登记在 Ursa-Server 的
-  `docs/milestones/M3.23-飞侠三转技能对拍与回补.md` G-1），因此**数字与技能说明文字不一致时以服务端为准**。
+客户端 `sub_781D0E` 用 `CInPacket::DecodeBuffer(mask, 16)` 取掩码，`timeGetTime()` 取一次当前时间，
+然后逐位置读 `Decode2 / Decode4 / Decode4`，存 `now + bufflength` 为到期时刻；**`bufflength` 单位是毫秒**
+（技能 `time` 秒 ×1000、道具时长本就按 ms 处理，见 `StatEffect.java:298-303`）。插件的 `CaptureDurations`
+曾在 `OnTemporaryStatSet`（`0x00A202BE`）钩子里按这个形状解包并保存/还原 `CInPacket+0x14`，**现已删除**：
 
-本特性的 `CaptureDurations` 在 hook 里**保存并还原 `CInPacket+0x14`**，客户端随后按原样解析。
-由于每个三元组是「id 与时长一起读」，**掩码位的遍历顺序不影响配对正确性**，只需要三元组个数 = 置位数。
+- 要碰客户端**尚未消费**的 `CInPacket`——游标还原只要漏一次，客户端自己随后的解析就越界（同类事故的实机表现是进图 `error code: 38`）；
+- 它给插件带来**第二口钟**（`GetTickCount() + bufflength`），与图标起闪那口钟（`+0x38` 每帧 −30）会漂移；
+- 三元组是「id 与时长一起读」，掩码位遍历顺序不影响配对——这条结论仍然成立，只是不再需要它。
+
+**数字与服务端下发的时长口径不变**：服务端自身可能对时长做修正（例：药剂精通 `Y%` 对物品/技能的效果，登记在
+Ursa-Server 的 `docs/milestones/M3.23-飞侠三转技能对拍与回补.md` G-1），而 `+0x38` 的初值正是服务端下发的
+`bufflength`，所以**数字与技能说明文字不一致时仍以服务端为准**。
 
 ## 4. 字体：`spFontBasic` 56 槽与本插件自建字体
 
@@ -191,8 +210,8 @@ IWzGr2DLayer::Putcolor   (+224)  <- 0xFFFFFFFF                     ← 新层不
   同理，客户端若给同一个 entry 换了图标层（刷新 buff 会），标签也必须重建。
 - **画字**：`DrawTextA(canvas, x, y, bstr, font, empty, empty)`；描边 = 黑字字体在 8 个邻位各画一遍，
   再画主体色一遍（BossHP 已验证的同一手法）。位置 `(buffTimerX, buffTimerY)`，并按图层宽高与字号钳制。
-- **分档与封顶**：`bufflength ≥ buffTimerMaxMinutes`（默认 10 分钟）→ 不显示；`≥ 1 分钟` → 绿色向上取整分钟；
-  否则黄色向上取整秒。**边界向上取整**：剩 9:59 显示 `10`，剩 59.9 秒显示 `60`。
+- **分档与封顶**：采到的剩余（`entry+0x38`）`≥ buffTimerMaxMinutes`（默认 10 分钟）→ 不显示；`≥ 1 分钟` → 绿色向上取整分钟；
+  否则黄色向上取整秒。**边界向上取整**：剩 9:59 显示 `10`，剩 59.9 秒显示 `60`。剩余 ≤ 0 时不显示（标签由收尾扫摘掉）。
 
 ## 6. 踩坑
 
@@ -295,7 +314,6 @@ set_stage(0x00777347)  ── 目标阶段不是 field 阶段 ──►  CWvsCon
 **改法**：hook `CWvsContext::OnLeaveGame`，**在原函数之前** `ForgetAll()`——把每个标签层的 origin
 交还给 `IWzGr2D::GetCenter()`、`Putcolor(0)`、释放本插件那一份引用（走的就是 `ClearLabelLayer`），
 再照原样调原函数。此时标签层是图标层唯一的多余引用，交还之后 `Clear` 释放条目就能把图标层一起带走。
-顺带清空 `aTracked`（记忆的到期时刻属于刚没的那批 buff，留着会让重进游戏后同一个 buff 从旧残留接着倒数）。
 
 `OnLeaveGame` 一次退出可能被调两次（`UI_Menu` `0xA0680F` 先经 `set_stage`、再自己直接调一次），
 所以 `ForgetAll` 必须可重复调用（只对指针做判空与清零，天然满足）。
@@ -309,14 +327,17 @@ set_stage(0x00777347)  ── 目标阶段不是 field 阶段 ──►  CWvsCon
   且 `0x00A04695` 处正是 `E8 33 DE DA FF`（= `call 0x007B24CD`，即 `CTemporaryStatView::Clear`）。
   front prologue 全是无分支指令（`push/push/mov/mov`，共 10 字节）⇒ Detours 的 5 字节跳转重定位安全。
 - 源码在本机用 VS2026 `v145` 工具集编译通过（本机未装工程声明的 v142），
-  产物 `out/Release/ijl15.dll` 里三个 hook 目标地址（`0xA041FF`/`0xA202BE`/`0xA03350`）在指针表内相邻落位。
-- **实机未验**：需要客户端里挂上带倒计时的 buff 再点结束游戏，看图标是否随登录界面一起清掉。
+  产物 `out/Release/ijl15.dll` 里两个 hook 目标地址（`0xA041FF`/`0xA03350`）在指针表内相邻落位。
+- **实机未验**：① 客户端里挂上带倒计时的 buff 再点结束游戏，看图标是否随登录界面一起清掉；
+  ② 改读内存字段后，数字仍应逐秒/逐分跳动且与图标起闪同步（§3 的判别点）。
 
 ## 7. 已知风险与未验证点
 
 1. **HUD 整体隐藏时不跟随**：标签层是独立根图层，只继承坐标不继承图标的 alpha（§6.5）⇒ 客户端隐藏整行 buff
    时（切图/演出）数字可能仍可见。需要的话按 §6.5 的客户端手法给标签层做 alpha 镜像。
-2. **`CWvsContext::Update` 的调用频率**假定为每帧（`Tick` 内部按 100ms 自限流，不依赖帧率）。
+2. **数字跟的是客户端自己的帧步进，不是墙钟**（§3）：`+0x38` 由 `CTemporaryStatView::Update` 每帧减 30，
+   所以客户端若掉帧/被限帧，数字与真实剩余会同向偏移——偏移量与图标自己的起闪、半透明同步，观感上仍自洽。
+   `Tick` 内部按 100ms 自限流，采样频率与帧率无关。
 3. **换数字要重建图层**（§5）：秒级档 = 每秒一次 `CreateLayer`，分钟档 = 每分钟一次；实机长时间挂机无掉帧，
    但这是本特性唯一有量的资源开销。想省掉可试 §6.2 末尾的 `RemoveCanvas + Animate` 路线。
 4. **数字与技能说明文字可能不一致**：本插件忠实显示服务端下发的时长（§3）；服务端的时长修正属服务端登记面。

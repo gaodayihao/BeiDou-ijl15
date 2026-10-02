@@ -33,20 +33,27 @@
 // calls BossHP already proved out.
 //
 // --- where the remaining time comes from ---------------------------------
-// CTemporaryStatView does not keep the buff duration, so it is read off the GIVE_BUFF packet while
-// CWvsContext::OnTemporaryStatSet (0x00A202BE) still has it unread:
+// The entry carries its own countdown at +0x38, so nothing here reads a packet. The view's
+// per-entry update stores whatever it is handed and blinks the icon once the value drops to 3000
+// (or to the entry's own +0x3C threshold, which only skill 5221006 overrides):
 //
-//   CInPacket::DecodeBuffer(mask, 16)     0x00432257  the 128-bit stat mask
-//   per set bit: Decode2 value            0x0042470C
-//                Decode4 buffid           0x00406629
-//                Decode4 bufflength       0x00406629
+//   CTemporaryStatView::Update (sub_7B2829)  0x007B2829  walks the row once per CWvsContext::Update
+//                                                        and re-enters every entry except 5221006's
+//                                                        with the old value less 30
+//   sub_7B4819                               0x007B4819  `old = *(this+14); *(this+14) = a2;` then
+//                                                        `if (old > 3000 && new <= 3000) blink`
+//   CTemporaryStatView::UpdatePassively      0x007B30DB  the same store, for a correction pushed in
+//                                                        from outside (its caller passes the value)
 //
-// byte for byte what PacketCreator.giveBuff writes on this server (mask = two longs, then
-// short value / int buffid / int bufflength per stat) and what the client's own decoder sub_781D0E
-// reads - it takes timeGetTime() once and stores now+bufflength as that stat's expiry, so the
-// duration is in milliseconds on both sides (StatEffect scales skill `time` seconds and item times
-// up to ms). The cursor at CInPacket+0x14 is saved and put back, so the client parses the packet
-// exactly as if this hook were not there.
+// +0x38 is therefore the client's own live countdown in milliseconds, and the very number its icon
+// blinks with - the field PetAutoBuff reads too (see the note there). An earlier version of this
+// file instead decoded the per-stat triplets out of GIVE_BUFF while CWvsContext::OnTemporaryStatSet
+// (0x00A202BE) still had them unread: byte for byte what PacketCreator.giveBuff writes (128-bit stat
+// mask, then short value / int buffid / int bufflength per set bit). That meant touching a CInPacket
+// the client had not consumed yet - the cursor at CInPacket+0x14 had to be saved and put back, one
+// mistake away from the client's own parse running off the end - and it kept a second clock of this
+// file's own, which drifted from the one the icon blinks with. The memory field removes both, so the
+// packet hook is gone; the only time source left is the client's.
 //
 // --- when the labels go away ---------------------------------------------
 // A label hangs off its icon layer through put_origin, which holds a COM reference to that layer.
@@ -71,12 +78,8 @@
 // greens/yellows in the same table: 13 = 0xFF336600, 52 = 0xFF629A00, 9 = 0xFFFF9900 (orange),
 // 27 = 0xFFFFFF20. Slots 43..49 are the only 9px ones (Tahoma) but come in white/black/red/cream.
 
-const DWORD dwCWvsContext__OnTemporaryStatSet = 0x00A202BE;
 const DWORD dwCWvsContext__Update = 0x00A03350;
 const DWORD dwCWvsContext__OnLeaveGame = 0x00A041FF;
-const DWORD dwCInPacket__DecodeBuffer = 0x00432257;
-const DWORD dwCInPacket__Decode2 = 0x0042470C;
-const DWORD dwCInPacket__Decode4 = 0x00406629;
 const DWORD dwZList__FindIndex = 0x007B4D1D;
 const DWORD dwGetBasicFont = 0x0098A707;
 // The chain get_basic_font uses to build a single spFontBasic slot, reused here because that fixed
@@ -144,11 +147,12 @@ const int nCWvsContext__TemporaryStatView = 0x2EA8;
 const int nView__ListBase = 0x04;
 const int nView__ListSize = 0x0C;
 const int nTempStat__Type = 0x1C;
-const int nTempStat__Id = 0x20;
+// The icon layer the label hangs off. The entry's other fields (+0x20 id, +0x2C overlay) are in the
+// header block; nothing here reads them.
 const int nTempStat__Icon = 0x28;
-const int nTempStat__Overlay = 0x2C;
-const int nCInPacket__Data = 0x08;
-const int nCInPacket__Cursor = 0x14;
+// The entry's own countdown in ms (see the header block), and the furthest field Tick reads.
+const int nTempStat__Remaining = 0x38;
+const int nTempStat__ReadSize = nTempStat__Remaining + sizeof(int);
 
 const unsigned int nHourMs = 3600000;
 const unsigned int nMinuteMs = 60000;
@@ -157,7 +161,6 @@ const int nTempStatType__Item = 1;
 const int nTempStatType__Skill = 2;
 
 // A 32x32 icon holds at most a couple of dozen buffs; anything past that is a mis-read, not a buff.
-const int nMaxTracked = 96;
 const int nMaxIcons = 96;
 
 // The FONT_TYPE slots this feature defaults to are 12px, which is what the bounds clamp assumes.
@@ -169,12 +172,6 @@ static const int aTextOutlineOffset[8][2] = {
 	{ -1, -1 }, { 0, -1 }, { 1, -1 },
 	{ -1,  0 },            { 1,  0 },
 	{ -1,  1 }, { 0,  1 }, { 1,  1 },
-};
-
-struct TRACKED_BUFF
-{
-	unsigned int dwId;
-	unsigned int dwExpire;
 };
 
 // One label layer per buff icon. The layer is ours (created with a real size so it owns a canvas),
@@ -193,8 +190,6 @@ struct LABEL_LAYER
 	bool bSeen;
 };
 
-static TRACKED_BUFF aTracked[nMaxTracked];
-static int nTrackedNext = 0;
 static LABEL_LAYER aLabels[nMaxIcons];
 static unsigned int dwLastTick = 0;
 
@@ -223,9 +218,6 @@ typedef void* (__fastcall* ZListFindIndex_t)(void* pList, void* edx, unsigned in
 typedef void* (__fastcall* BstrCtor_t)(void* pBstr, void* edx, const char* sText);
 typedef int (__fastcall* FontCalcTextWidth_t)(void* pFont, void* edx, void* pBstrData, const void* pVariant);
 typedef unsigned int (__fastcall* CanvasDrawTextA_t)(void* pCanvas, void* edx, int nLeft, int nTop, void* pBstrData, void* pFont, const void* pV1, const void* pV2);
-typedef void (__fastcall* PacketDecodeBuffer_t)(void* pPacket, void* edx, void* pOut, unsigned int nSize);
-typedef unsigned short (__fastcall* PacketDecode2_t)(void* pPacket, void* edx);
-typedef unsigned int (__fastcall* PacketDecode4_t)(void* pPacket, void* edx);
 typedef void* (__cdecl* GetBasicFont_t)(void** pOut, int nType);
 typedef void* (__cdecl* StringPoolGetInstance_t)(void);
 typedef void* (__fastcall* StringPoolGetString_t)(void* pPool, void* edx, void** ppOut, unsigned int nId);
@@ -244,9 +236,6 @@ static auto _zlist_find_index = reinterpret_cast<ZListFindIndex_t>(dwZList__Find
 static auto _bstr_ctor = reinterpret_cast<BstrCtor_t>(dwBstrCtor);
 static auto _font_calc_text_width = reinterpret_cast<FontCalcTextWidth_t>(dwIWzFont__CalcTextWidth);
 static auto _canvas_draw_text = reinterpret_cast<CanvasDrawTextA_t>(dwIWzCanvas__DrawTextA);
-static auto _packet_decode_buffer = reinterpret_cast<PacketDecodeBuffer_t>(dwCInPacket__DecodeBuffer);
-static auto _packet_decode2 = reinterpret_cast<PacketDecode2_t>(dwCInPacket__Decode2);
-static auto _packet_decode4 = reinterpret_cast<PacketDecode4_t>(dwCInPacket__Decode4);
 static auto _stringpool_get_instance = reinterpret_cast<StringPoolGetInstance_t>(dwStringPool__GetInstance);
 static auto _stringpool_get_string_w = reinterpret_cast<StringPoolGetString_t>(dwStringPool__GetStringW);
 static auto _stringpool_get_bstr = reinterpret_cast<StringPoolGetString_t>(dwStringPool__GetBSTR);
@@ -376,89 +365,10 @@ void* BuffTimer::GetLabelFont(int nRole) {
 }
 
 // ----- remaining time -----------------------------------------------------
-
-void BuffTimer::RememberBuff(unsigned int dwId, unsigned int dwDurationMs) {
-	if (dwId == 0) return;
-	if (dwDurationMs == 0) { // no timer to show at all
-		ForgetBuff(dwId);
-		return;
-	}
-
-	for (int i = 0; i < nMaxTracked; i++) {
-		if (aTracked[i].dwId == dwId) {
-			aTracked[i].dwExpire = GetTickCount() + dwDurationMs;
-			return;
-		}
-	}
-
-	aTracked[nTrackedNext].dwId = dwId;
-	aTracked[nTrackedNext].dwExpire = GetTickCount() + dwDurationMs;
-	nTrackedNext = (nTrackedNext + 1) % nMaxTracked;
-}
-
-void BuffTimer::ForgetBuff(unsigned int dwId) {
-	for (int i = 0; i < nMaxTracked; i++) {
-		if (aTracked[i].dwId == dwId) aTracked[i].dwId = 0;
-	}
-}
-
-int BuffTimer::FindRemainingMs(unsigned int dwId) {
-	if (dwId == 0) return 0; // 0 marks a free slot, so it must never be looked up
-	unsigned int dwNow = GetTickCount();
-	for (int i = 0; i < nMaxTracked; i++) {
-		if (aTracked[i].dwId != dwId) continue;
-		int nRemaining = static_cast<int>(aTracked[i].dwExpire - dwNow); // wrap-safe
-		if (nRemaining <= 0) {
-			aTracked[i].dwId = 0; // the server's reset packet carries only a stat mask, so an entry
-			return 0;             // is dropped here instead: the icon outlives it either way
-		}
-		return nRemaining;
-	}
-	return 0;
-}
-
-// Separated from CaptureDurations because SEH (__try/__except) and C++ EH (try/catch) cannot share
-// one function: the first guards against a bad pointer, the second against the ZException the
-// client's own Decode* raise on a short read. Neither may reach the client's top-level handler.
-void BuffTimer::ParseDurations(void* pPacket) {
-	try {
-		unsigned char aMask[16];
-		memset(aMask, 0, sizeof(aMask));
-		_packet_decode_buffer(pPacket, nullptr, aMask, sizeof(aMask));
-
-		// One triplet per set bit; the bits are consumed in the same order the client reads them,
-		// but the order does not matter here - id and duration are read together, so every triplet
-		// is self-consistent whichever bit it belongs to.
-		for (int i = 0; i < 128; i++) {
-			if ((aMask[i >> 3] & (1 << (i & 7))) == 0) continue;
-			_packet_decode2(pPacket, nullptr); // value: not shown, the label is driven by the duration
-			unsigned int dwId = _packet_decode4(pPacket, nullptr);
-			unsigned int dwDuration = _packet_decode4(pPacket, nullptr);
-			// An item buff travels with a negated source id (StatEffect.applyBuffEffect sends
-			// `skill ? sourceid : -sourceid`) while the icon carries the positive one, so both sides
-			// have to be compared as magnitudes.
-			if ((dwId & 0x80000000u) != 0) dwId = 0u - dwId;
-			RememberBuff(dwId, dwDuration);
-		}
-	}
-	catch (...) {
-	}
-}
-
-// Reads the per-stat triplets straight out of GIVE_BUFF while the client has not consumed them yet.
-void BuffTimer::CaptureDurations(void* pPacket) {
-	if (pPacket == nullptr || IsBadReadPtr(pPacket, nCInPacket__Cursor + sizeof(int))) return;
-
-	unsigned int dwSavedCursor = *reinterpret_cast<unsigned int*>(reinterpret_cast<char*>(pPacket) + nCInPacket__Cursor);
-	__try {
-		ParseDurations(pPacket);
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) {
-	}
-
-	// hand the packet back exactly as it was found, the client parses it next
-	*reinterpret_cast<unsigned int*>(reinterpret_cast<char*>(pPacket) + nCInPacket__Cursor) = dwSavedCursor;
-}
+//
+// Read straight off the entry in Tick (entry + nTempStat__Remaining): the client counts every buff
+// down itself, so this file keeps no clock of its own and holds no duration table - the number that
+// goes on the icon is the one the client is about to blink with. The header block has the anchors.
 
 // ----- drawing ------------------------------------------------------------
 
@@ -626,11 +536,6 @@ void BuffTimer::ForgetAll() {
 		aLabels[i].sText[0] = 0;
 		aLabels[i].bSeen = false;
 	}
-
-	// The remembered durations belong to the buffs that just went away. Keeping them would let a
-	// buff used after re-entering the game start its countdown where the old one stopped.
-	for (int i = 0; i < nMaxTracked; i++) aTracked[i].dwId = 0;
-	nTrackedNext = 0;
 }
 
 // One attempt at putting sText on the layer's canvas. nRole picks the font (minutes, seconds or the
@@ -704,18 +609,15 @@ void BuffTimer::Tick(void* pWvsContext) {
 
 		int* pEntry = *reinterpret_cast<int**>(reinterpret_cast<char*>(pNode) + 4);
 		if (pEntry == nullptr) continue;
-		if (IsBadReadPtr(pEntry, nTempStat__Overlay + sizeof(void*))) continue;
+		if (IsBadReadPtr(pEntry, nTempStat__ReadSize)) continue;
 
 		int nType = *reinterpret_cast<int*>(reinterpret_cast<char*>(pEntry) + nTempStat__Type);
 		if (nType != nTempStatType__Item && nType != nTempStatType__Skill) continue; // family/guild rows
 
-		// The entry id of an item buff is the negated item id (CWvsContext::OnTemporaryStatSet
-		// negates it before SetTemporary), while the packet carries the positive one.
-		int nId = *reinterpret_cast<int*>(reinterpret_cast<char*>(pEntry) + nTempStat__Id);
-		unsigned int dwKey = (nId < 0) ? static_cast<unsigned int>(-nId) : static_cast<unsigned int>(nId);
-		if (dwKey == 0) continue; // no id: nothing to look up
-
-		int nRemaining = FindRemainingMs(dwKey);
+		// The client's own countdown for this icon, in ms - the field its blink reads, so the label
+		// and the icon can never disagree. An entry the client has already run down to zero has no
+		// number to show; the sweep below drops whatever label it had.
+		int nRemaining = *reinterpret_cast<int*>(reinterpret_cast<char*>(pEntry) + nTempStat__Remaining);
 
 		// Long buffs get no number at all: a countdown that starts in the forties is noise, and the
 		// official client does not show one either. nMaxMinutes <= 0 lifts the cap back to an hour.
@@ -822,17 +724,10 @@ void BuffTimer::Tick(void* pWvsContext) {
 
 // ----- hooks --------------------------------------------------------------
 
-static void(__fastcall* _WvsContext__OnTemporaryStatSet)(void* pThis, void* edx, void* pPacket) =
-	reinterpret_cast<void(__fastcall*)(void*, void*, void*)>(dwCWvsContext__OnTemporaryStatSet);
 static void(__fastcall* _WvsContext__Update)(void* pThis, void* edx) =
 	reinterpret_cast<void(__fastcall*)(void*, void*)>(dwCWvsContext__Update);
 static int(__fastcall* _WvsContext__OnLeaveGame)(void* pThis, void* edx) =
 	reinterpret_cast<int(__fastcall*)(void*, void*)>(dwCWvsContext__OnLeaveGame);
-
-static void __fastcall WvsContext__OnTemporaryStatSet_Hook(void* pThis, void* edx, void* pPacket) {
-	BuffTimer::CaptureDurations(pPacket); // the triplet it needs is still unread in the packet
-	_WvsContext__OnTemporaryStatSet(pThis, edx, pPacket);
-}
 
 static void __fastcall WvsContext__Update_Hook(void* pThis, void* edx) {
 	_WvsContext__Update(pThis, edx);
@@ -846,10 +741,6 @@ static int __fastcall WvsContext__OnLeaveGame_Hook(void* pThis, void* edx) {
 	return _WvsContext__OnLeaveGame(pThis, edx);
 }
 
-void BuffTimer::HookTemporaryStatSet() {
-	Memory::SetHook(true, reinterpret_cast<void**>(&_WvsContext__OnTemporaryStatSet), WvsContext__OnTemporaryStatSet_Hook);
-}
-
 void BuffTimer::HookWvsContextUpdate() {
 	Memory::SetHook(true, reinterpret_cast<void**>(&_WvsContext__Update), WvsContext__Update_Hook);
 }
@@ -859,7 +750,6 @@ void BuffTimer::HookWvsContextLeaveGame() {
 }
 
 void BuffTimer::Hook() {
-	HookTemporaryStatSet();
 	HookWvsContextUpdate();
 	HookWvsContextLeaveGame();
 }
