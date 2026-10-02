@@ -51,3 +51,33 @@ inline bool IsPetBuffSkill(int skillId)
     }
     return false;
 }
+
+// Summon skills (subset of the list above). These are the ids StatEffect.getSummonMovementType
+// (:1781-1812) answers non-null for, i.e. the ones the server will spawn a summon entity for
+// (applyTo :1056 `summonMovementType != null && pos != null`). A summon cast carries its spawn
+// point where a plain buff carries the tDelay short -- CUserLocal::DoActiveSkill sends 1321007
+// through its own summon arm (sub_96B140): Encode2(x) Encode2(y) Encode1(facing), five bytes
+// after the level byte, which is exactly what SpecialMoveHandler.java:134-136 reads a point from
+// (`p.available() == 5`). A silent cast without those five bytes still applies the buff, but the
+// summon never appears.
+// Sorted ascending. 10 entries.
+static const int kPetBuffSummonSkillIds[] = {
+    1321007, 3111002, 3211002, 11001004, 12001004, 12111004, 13001004, 13111004,
+    14001005, 15001004,
+};
+static const int kPetBuffSummonSkillCount = 10;
+
+// True when skillId is one of the whitelisted summon skills, i.e. one whose cast must carry the
+// spawn point so the server creates the summon entity.
+inline bool IsPetBuffSummonSkill(int skillId)
+{
+    int lo = 0, hi = kPetBuffSummonSkillCount - 1;
+    while (lo <= hi)
+    {
+        const int mid = lo + ((hi - lo) >> 1);
+        const int v = kPetBuffSummonSkillIds[mid];
+        if (v == skillId) return true;
+        if (v < skillId) lo = mid + 1; else hi = mid - 1;
+    }
+    return false;
+}

@@ -64,6 +64,25 @@
 //   The packet is handed over as a filled-in COutPacket the way HpMpAlert.cpp does it, so no
 //   COutPacket constructor / destructor has to be replicated.
 //
+// --- the summon arm ---------------------------------------------------------
+//   A summon skill is not cast through SendSkillUseRequest at all: CUserLocal::DoActiveSkill
+//   (0x00966F7A) routes it to sub_96B140 (0x0096B140), which composes the same 0x5B packet but ends
+//   with the SPAWN POINT instead of the tDelay short:
+//
+//       COutPacket(91) / Encode4(get_update_time()) / Encode4(skillId) / Encode1(level)
+//       Encode2(x) / Encode2(y) / Encode1(facing)      <- five bytes after the level byte
+//       CClientSocket::SendPacket(...); *(user + 8356) = 1; ShowSkillEffect(...)   <-- SKIPPED
+//
+//   (x, y) = the owner's own position (see GetOwnerPos below, which copies that accessor verbatim);
+//   for the puppet-like ids 3111002 / 3211002 / 13111002 / 5211001 / 5220002 the client offsets it by
+//   45 or 200 px toward the facing side and snaps it onto a foothold first, which this side does not
+//   reproduce. `facing` = `*(user + 0x570) & 1`.
+//
+//   The server needs that tail: SpecialMoveHandler only reads a spawn point when exactly five bytes
+//   are left after the level byte (`p.available() == 5`, Java:134-136), and StatEffect.applyTo :1056
+//   creates the summon entity only when the point arrived. Sending the plain tDelay form therefore
+//   applies the buff but never summons -- which is what 1321007's black soul was missing.
+//
 // =================================================================================================
 
 static const DWORD ADDR_CWvsContext_Update = 0x00A03350;
@@ -86,6 +105,21 @@ static const DWORD ADDR_CUserLocal_Instance = 0x00BEBF98;
 static const int OFF_CUserLocal_Pets = 0x1EDC;
 static const int nPetSlotStride = 8;
 static const int OFF_PetSlot_Pet = 4;
+
+// Where a summon cast gets its spawn point from (sub_96B140, the arm CUserLocal::DoActiveSkill sends
+// the summon skills through -- `mov eax, [esi+4]; lea ecx, [esi+4]; call dword ptr [eax+10h]`):
+// the owner accessor sits at CUserLocal + 4, at vtable offset +0x10, and lands on CUser::GetPos
+// (0x004B2386, `return this + 0x1170`) whose result is a tagPOINT. The facing bit the same function
+// writes into the packet is `*(int*)(CUserLocal + 0x570) & 1` (`mov eax, [esi+570h]; and eax, 1`).
+// The call goes through the vtable rather than straight to 0x004B2386 on purpose: that address is
+// what this build's vtable holds, and calling the slot keeps this side on whatever the client itself
+// would call.
+static const int OFF_CUserLocal_Owner = 0x04;
+static const int OFF_OwnerVtbl_GetPos = 0x10;
+static const int OFF_CUserLocal_Facing = 0x570;
+// A map position is a small pixel coordinate; past this the read is not a position and the spawn point
+// is dropped rather than sent (see GetOwnerPos).
+static const int nPosSanityLimit = 30000;
 
 // The two status objects the consume check is handed. What they are is settled by how the callee reads
 // them (0x00764256): the first at +96/+104 (maxHP, the 1311006 half-HP gate) => BasicStat; the second
@@ -410,6 +444,66 @@ static void SendSkillUseRaw(void* pSocket, const unsigned char* pPayload, unsign
     }
 }
 
+// The local player's own position, the way the client's summon cast reads it. sub_96B140 (the arm
+// CUserLocal::DoActiveSkill sends 1321007 through) takes it with
+//
+//     mov eax, [esi+4]          ; esi = CUserLocal
+//     lea ecx, [esi+4]
+//     call dword ptr [eax+10h]  ; -> CUser::GetPos (0x004B2386, `return this + 0x1170`)
+//
+// i.e. the owner accessor hanging off the object at CUserLocal+4, and the result is a tagPOINT
+// (x at +0, y at +4). The facing bit comes from the same function: `mov eax, [esi+570h]; and eax, 1`.
+// Copied verbatim rather than re-derived from an offset, so whatever the layout is, this side and the
+// client's own packet agree. False when anything about that chain does not look like a map position.
+static bool GetOwnerPos(int* pnX, int* pnY, int* pnFacing)
+{
+    __try
+    {
+        char* pUser = *reinterpret_cast<char**>(ADDR_CUserLocal_Instance);
+        if (pUser == nullptr)
+        {
+            return false;
+        }
+
+        void** pOwner = reinterpret_cast<void**>(pUser + OFF_CUserLocal_Owner);
+        if (IsBadReadPtr(pOwner, sizeof(void*)))
+        {
+            return false;
+        }
+
+        void** pVtbl = *reinterpret_cast<void***>(pOwner);
+        if (pVtbl == nullptr || IsBadReadPtr(pVtbl, OFF_OwnerVtbl_GetPos + sizeof(void*)))
+        {
+            return false;
+        }
+
+        typedef const int* (__fastcall* OwnerGetPos_t)(void* pThis, void* edx);
+        const int* pPos = reinterpret_cast<OwnerGetPos_t>(pVtbl[OFF_OwnerVtbl_GetPos / sizeof(void*)])(pOwner, nullptr);
+        if (pPos == nullptr || IsBadReadPtr(pPos, 2 * sizeof(int)))
+        {
+            return false;
+        }
+
+        const int nX = pPos[0];
+        const int nY = pPos[1];
+        // A map position is a small number of pixels; anything else is a mis-read, and a summon placed
+        // from it would be worse than no summon at all (the server spawns it wherever it is told).
+        if (nX <= -nPosSanityLimit || nX >= nPosSanityLimit || nY <= -nPosSanityLimit || nY >= nPosSanityLimit)
+        {
+            return false;
+        }
+
+        *pnX = nX;
+        *pnY = nY;
+        *pnFacing = *reinterpret_cast<int*>(pUser + OFF_CUserLocal_Facing) & 1;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 static void SendSkillUse(int nSkillId, int nLevel)
 {
     void* pSocket = *reinterpret_cast<void**>(ADDR_ClientSocket);
@@ -418,11 +512,13 @@ static void SendSkillUse(int nSkillId, int nLevel)
         return;
     }
 
-    // opcode(2) + timestamp(4) + skillId(4) + level(1) + tDelay(2) = 13 bytes. The buffer is sized
-    // with room to spare on purpose: writing one byte past a 12-byte array here tripped the /GS stack
-    // cookie, and __report_gsfailure ends the process through __fastfail -- no crash dump, no catchable
-    // exception, just an instant exit.
-    unsigned char aPayload[16];
+    // opcode(2) + timestamp(4) + skillId(4) + level(1) + tail. The tail is the tDelay short (2 bytes)
+    // for an ordinary buff and the spawn point (x, y, facing = 5 bytes) for a summon skill, which is
+    // what the client itself writes on the two paths -- see the anchor block at the top. The buffer is
+    // sized with room to spare on purpose: writing one byte past a 12-byte array here tripped the /GS
+    // stack cookie, and __report_gsfailure ends the process through __fastfail -- no crash dump, no
+    // catchable exception, just an instant exit.
+    unsigned char aPayload[20];
     int n = 0;
     aPayload[n++] = static_cast<unsigned char>(nOpcodeSkillUse & 0xFF);
     aPayload[n++] = static_cast<unsigned char>((nOpcodeSkillUse >> 8) & 0xFF);
@@ -435,8 +531,33 @@ static void SendSkillUse(int nSkillId, int nLevel)
     n += 4;
 
     aPayload[n++] = static_cast<unsigned char>(nLevel);
-    aPayload[n++] = 0; // tDelay low
-    aPayload[n++] = 0; // tDelay high
+
+    int nX = 0;
+    int nY = 0;
+    int nFacing = 0;
+    if (IsPetBuffSummonSkill(nSkillId) && GetOwnerPos(&nX, &nY, &nFacing))
+    {
+        // The spawn point the server turns into the summon entity: SpecialMoveHandler only reads one
+        // when exactly five bytes are left after the level byte (`p.available() == 5`, Java:134-136),
+        // and StatEffect.applyTo :1056 creates the summon only when that point arrived. Without it the
+        // buff still lands and the summon simply never appears (1321007's black soul).
+        //
+        // The point is the player's own position, which is what the client sends for every summon
+        // except the puppet-like ones (3111002/3211002/13111002/5211001/5220002): sub_96B140 offsets
+        // those by 45 or 200 px toward the facing side and snaps them onto a foothold. Pet cells hold
+        // buff skills, and a puppet put there would land on the player instead of in front -- the one
+        // known deviation of this arm, recorded in Ursa-Server docs/client/003 §5.10.
+        aPayload[n++] = static_cast<unsigned char>(nX & 0xFF);
+        aPayload[n++] = static_cast<unsigned char>((nX >> 8) & 0xFF);
+        aPayload[n++] = static_cast<unsigned char>(nY & 0xFF);
+        aPayload[n++] = static_cast<unsigned char>((nY >> 8) & 0xFF);
+        aPayload[n++] = static_cast<unsigned char>(nFacing & 0xFF);
+    }
+    else
+    {
+        aPayload[n++] = 0; // tDelay low
+        aPayload[n++] = 0; // tDelay high
+    }
 
     if (n > static_cast<int>(sizeof(aPayload)))
     {
