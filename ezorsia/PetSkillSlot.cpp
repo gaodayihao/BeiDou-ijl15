@@ -216,7 +216,7 @@ bool PetSkillSlot::bEnabled = true;
 bool PetSkillSlot::bDebug = true;
 int PetSkillSlot::nLabelFont = 43;
 int PetSkillSlot::nFontSize = 11;
-int PetSkillSlot::nFontColor = 0x000000;
+int PetSkillSlot::nFontColor = 0x006400;   // darkgreen: a shade under the cell's 0x00C000 wash
 
 // One-off: a font that could not be built is logged once, not on every repaint.
 static bool g_bLabelFontLogged = false;
