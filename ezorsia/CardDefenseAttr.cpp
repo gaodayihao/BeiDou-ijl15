@@ -1,10 +1,8 @@
 #include "stdafx.h"
 #include "CardDefenseAttr.h"
 #include "Memory.h"
-#include <cstdarg>
-#include <cstdio>
 
-// ===== Reverse-engineering anchors (BeiDou.exe v83; IDA bookmarks "BUG029:") ========================
+// ===== Reverse-engineering anchors (BeiDou.exe v83; IDA bookmarks "BUG029:" / "BUG031:") ============
 //
 // --- the client's own rule, and why the two buffs used to kill each other -------------------------
 //   CTemporaryStatView::SetTemporary (0x007B24D5) walks its entries and, for every entry that is not
@@ -30,10 +28,9 @@
 //   No list surgery at all. Calling the client's own remove (sub_7B4BD1) + relayout (sub_7B2BB0) to
 //   delete a stale duplicate crashed the client within seconds (AV reading 0xFFFFFFFF -- the client
 //   takes a reference on the entry and unlinks it inside its own critical section, which an outside
-//   caller cannot reproduce); see Ursa-Server docs/bugs/031. The correct shape is to never create the
-//   duplicate: parse the incoming GIVE_BUFF for its buff ids and inject the inert bit only into
-//   entries whose id *differs* from the ones being sent, so the client replaces its own same-id entry
-//   natively. Until that parse lands, this module only injects (and logs what it would have removed).
+//   caller cannot reproduce); see Ursa-Server docs/bugs/031. The duplicate is therefore never created:
+//   the incoming GIVE_BUFF is read for its buff ids and the inert bit goes only into entries whose id
+//   *differs* from the ones being sent, so the client replaces its own same-id entry natively.
 //   Also not done: "set remaining to 1 and let the countdown reap it" (measured: the local countdown
 //   only drives blink/label, such entries stayed for minutes and went negative) and "keep whichever
 //   copy has the largest remaining" (a re-sent buff carries the *remaining* duration, so copies can
@@ -63,8 +60,6 @@ static const int nMaxViewEntries = 64;
 // Belongs to no BuffStat on either mask word, so it can never switch a stat on.
 static const unsigned int kInertMaskBit = 0x00000001;
 
-static const int nMaxLogLines = 40000;
-
 struct Mask128
 {
     unsigned int d[4];
@@ -86,41 +81,6 @@ typedef void(__fastcall* OnTemporaryStatReset_t)(void* pThis, void* edx, void* p
 static auto _zlist_find_index = reinterpret_cast<ZListFindIndex_t>(ADDR_ZList_FindIndex);
 static OnTemporaryStatSet_t g_origOnTemporaryStatSet = nullptr;
 static OnTemporaryStatReset_t g_origOnTemporaryStatReset = nullptr;
-
-static FILE* g_pLog = nullptr;
-static bool g_bLogOpened = false;
-static int g_nLogLines = 0;
-
-static void CDLog(const char* pFormat, ...)
-{
-    if (g_nLogLines >= nMaxLogLines)
-    {
-        return;
-    }
-
-    if (!g_bLogOpened)
-    {
-        g_bLogOpened = true;
-        fopen_s(&g_pLog, "carddefense.log", "a");
-    }
-
-    if (g_pLog == nullptr)
-    {
-        return;
-    }
-
-    char szBody[512];
-    va_list args;
-    va_start(args, pFormat);
-    _vsnprintf_s(szBody, sizeof(szBody), _TRUNCATE, pFormat, args);
-    va_end(args);
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(g_pLog, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, szBody);
-    fflush(g_pLog);
-    ++g_nLogLines;
-}
 
 static bool IsRateCouponItem(int nItemId)
 {
@@ -362,119 +322,6 @@ static bool HasOverlappingRateCoupon(void* pWvsContext, const Mask128& mask)
     return bFound;
 }
 
-// Reports (does NOT touch) entries a handler re-sent: an entry present in the snapshot whose (nType,id)
-// also exists on a different node. Removal through the client's own list functions is abandoned --
-// it crashed the client (docs/bugs/031) -- so the duplicate is only logged here and the design moves to
-// "protect only entries whose id differs from the one being sent", which needs no list surgery at all.
-static int ReportStaleDuplicates(void* pWvsContext, const ViewEntry* pSnapshot, int nSnapshot)
-{
-    if (pWvsContext == nullptr || nSnapshot <= 0)
-    {
-        return 0;
-    }
-
-    ViewEntry current[nMaxViewEntries];
-    int nCurrent = 0;
-    __try
-    {
-        ForEachViewEntry(pWvsContext, [&](void* pNode, char* pEntry) -> bool
-        {
-            if (nCurrent >= nMaxViewEntries)
-            {
-                return false;
-            }
-
-            current[nCurrent].pNode = pNode;
-            current[nCurrent].pEntry = pEntry;
-            current[nCurrent].mask = ReadMask(pEntry);
-            ++nCurrent;
-            return true;
-        });
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return 0;
-    }
-
-    int nDropped = 0;
-    int nLegacy = 0;
-    for (int i = 0; i < nSnapshot; ++i)
-    {
-        const int nItemId = GetItemBuffId(pSnapshot[i].pEntry);
-        if (nItemId == 0)
-        {
-            continue;
-        }
-
-        const int nType = *reinterpret_cast<const int*>(pSnapshot[i].pEntry + OFF_TempStat_Type);
-        const int nId = *reinterpret_cast<const int*>(pSnapshot[i].pEntry + OFF_TempStat_Id);
-
-        bool bResent = false;
-        bool bLegacyDuplicate = false;
-        for (int j = 0; j < nCurrent; ++j)
-        {
-            if (current[j].pNode == pSnapshot[i].pNode
-                || *reinterpret_cast<const int*>(current[j].pEntry + OFF_TempStat_Type) != nType
-                || *reinterpret_cast<const int*>(current[j].pEntry + OFF_TempStat_Id) != nId)
-            {
-                continue;
-            }
-
-            // A node that was not in the snapshot is the copy this call created.
-            bool bInSnapshot = false;
-            for (int k = 0; k < nSnapshot && !bInSnapshot; ++k)
-            {
-                bInSnapshot = pSnapshot[k].pNode == current[j].pNode;
-            }
-
-            if (!bInSnapshot)
-            {
-                bResent = true;
-                break;
-            }
-
-            bLegacyDuplicate = true;
-        }
-
-        if (!bResent && bLegacyDuplicate)
-        {
-            // Keep the copy with the largest remaining time among a stale group.
-            const int nRemaining = *reinterpret_cast<const int*>(pSnapshot[i].pEntry + OFF_TempStat_Remaining);
-            for (int j = 0; j < nSnapshot; ++j)
-            {
-                if (j == i || GetItemBuffId(pSnapshot[j].pEntry) != nItemId)
-                {
-                    continue;
-                }
-
-                if (*reinterpret_cast<const int*>(pSnapshot[j].pEntry + OFF_TempStat_Remaining) > nRemaining)
-                {
-                    bResent = true;   // this copy is not the freshest of the stale group
-                    break;
-                }
-            }
-
-            if (bResent)
-            {
-                ++nLegacy;
-            }
-        }
-
-        if (bResent)
-        {
-            CDLog("  stale duplicate left in place type=%d id=%d (list untouched)", nType, nId);
-            ++nDropped;
-        }
-    }
-
-    if (nDropped > 0)
-    {
-        CDLog("stale-scan: %d duplicate(s) reported, %d from pre-existing groups, none removed", nDropped, nLegacy);
-    }
-
-    return nDropped;
-}
-
 static void __fastcall OnTemporaryStatSet_Hook(void* pThis, void* edx, void* pPacket)
 {
     ViewEntry snapshot[nMaxViewEntries];
@@ -485,7 +332,6 @@ static void __fastcall OnTemporaryStatSet_Hook(void* pThis, void* edx, void* pPa
         int incoming[nMaxIncomingIds];
         const int nIncoming = ReadIncomingBuffIds(pPacket, incoming, nMaxIncomingIds);
         nSnapshot = SnapshotProtectedEntries(pThis, snapshot, nMaxViewEntries, incoming, nIncoming, true);
-        CDLog("ontemp: incoming=%d protected=%d", nIncoming, nSnapshot);
     }
 
     __try
@@ -512,8 +358,6 @@ static void __fastcall OnTemporaryStatSet_Hook(void* pThis, void* edx, void* pPa
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
     }
-
-    ReportStaleDuplicates(pThis, snapshot, nSnapshot);
 }
 
 static void __fastcall OnTemporaryStatReset_Hook(void* pThis, void* edx, void* pPacket)
@@ -587,8 +431,6 @@ void CardDefenseAttr::Hook()
 
 void Hook_CardDefenseAttr(bool coexist)
 {
-    CDLog("=== CardDefenseAttr (coexistence build 6, id-aware, no list surgery): coexist=%d ===", coexist ? 1 : 0);
-
     if (!coexist)
     {
         return;
@@ -601,11 +443,6 @@ void Hook_CardDefenseAttr(bool coexist)
             reinterpret_cast<void*>(&OnTemporaryStatSet_Hook)))
         {
             g_origOnTemporaryStatSet = nullptr;
-            CDLog("OnTemporaryStatSet hook FAILED");
-        }
-        else
-        {
-            CDLog("OnTemporaryStatSet hook installed");
         }
     }
 
@@ -616,15 +453,6 @@ void Hook_CardDefenseAttr(bool coexist)
             reinterpret_cast<void*>(&OnTemporaryStatReset_Hook)))
         {
             g_origOnTemporaryStatReset = nullptr;
-            CDLog("OnTemporaryStatReset hook FAILED");
-        }
-        else
-        {
-            CDLog("OnTemporaryStatReset hook installed");
         }
     }
-
-    CDLog("hooks done: ontemp=%d onreset=%d",
-        g_origOnTemporaryStatSet != nullptr ? 1 : 0,
-        g_origOnTemporaryStatReset != nullptr ? 1 : 0);
 }
