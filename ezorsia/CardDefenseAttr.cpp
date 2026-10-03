@@ -35,6 +35,14 @@
 //   only drives blink/label, such entries stayed for minutes and went negative) and "keep whichever
 //   copy has the largest remaining" (a re-sent buff carries the *remaining* duration, so copies can
 //   compare equal).
+//
+// --- how the two sides tell "about me" from "collateral" ------------------------------------------
+//   GIVE_BUFF: the packet carries the ids it applies (see ReadIncomingBuffIds), so an entry with one of
+//   those ids is the one being replaced and is left alone.
+//   CANCEL_BUFF: the packet carries only the mask, so the entry's own countdown decides -- the entry
+//   whose time is (nearly) up is the one being cancelled and must be allowed to go (the client reaps
+//   nothing by itself, so keeping it leaves a stuck icon), while every other entry sharing that bit is
+//   collateral and is kept (kOwnExpiryWindowMs).
 static const DWORD ADDR_CWvsContext_Instance = 0x00BE7918;
 static const DWORD ADDR_CWvsContext_OnTemporaryStatSet = 0x00A202BE;
 static const DWORD ADDR_CWvsContext_OnTemporaryStatReset = 0x00A2071F;
@@ -59,6 +67,11 @@ static const int nMaxViewEntries = 64;
 
 // Belongs to no BuffStat on either mask word, so it can never switch a stat on.
 static const unsigned int kInertMaskBit = 0x00000001;
+
+// An entry whose own countdown is inside this window is the one a CANCEL_BUFF is about (the server's
+// expiry scan is a 1.5 s tick and the client's countdown starts from the packet's duration, so the two
+// are within a second of each other); everything else sharing the bit is collateral and gets kept.
+static const int kOwnExpiryWindowMs = 3000;
 
 struct Mask128
 {
@@ -280,48 +293,6 @@ static Mask128 ReadMask(const char* pEntry)
     return mask;
 }
 
-static bool MaskOverlaps(const Mask128& a, const Mask128& b)
-{
-    for (int i = 0; i < 4; ++i)
-    {
-        if ((a.d[i] & b.d[i]) != 0)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool HasOverlappingRateCoupon(void* pWvsContext, const Mask128& mask)
-{
-    bool bFound = false;
-    __try
-    {
-        ForEachViewEntry(pWvsContext, [&](void*, char* pEntry) -> bool
-        {
-            const int nItemId = GetItemBuffId(pEntry);
-            if (nItemId == 0 || !IsRateCouponItem(nItemId))
-            {
-                return true;
-            }
-
-            if (MaskOverlaps(ReadMask(pEntry), mask))
-            {
-                bFound = true;
-                return false;
-            }
-
-            return true;
-        });
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
-
-    return bFound;
-}
-
 static void __fastcall OnTemporaryStatSet_Hook(void* pThis, void* edx, void* pPacket)
 {
     ViewEntry snapshot[nMaxViewEntries];
@@ -365,27 +336,20 @@ static void __fastcall OnTemporaryStatReset_Hook(void* pThis, void* edx, void* p
     ViewEntry snapshot[nMaxViewEntries];
     int nSnapshot = 0;
 
-    // A CANCEL_BUFF carries only the mask, and a card/coupon pair shares its bit, so the client cannot
-    // tell a coupon cancel from a card cancel. Cards are therefore kept only while a coupon shares
-    // their bit -- that is the coupon chain's cancel/re-add churn (login, channel change, coupon
-    // change), which used to take the card entry with it; coupons are never kept here, because their
-    // entries carry a ~24 h countdown and a wrongly kept one would be a permanent phantom icon.
+    // A CANCEL_BUFF carries only the mask (no ids), and a card/coupon pair shares its bit, so the packet
+    // cannot say whom it is about -- the entry's own countdown can: the entry being cancelled is the one
+    // whose time is (nearly) up, every other entry sharing that bit is only collateral. So an entry is
+    // kept only while it still has time left; the expiring one is left alone and disappears (the client
+    // reaps nothing on its own, so keeping it would leave a permanent icon).
     if (CardDefenseAttr::bCoexist && pThis != nullptr)
     {
         ViewEntry candidates[nMaxViewEntries];
-        // A CANCEL_BUFF carries only the mask (no ids), so every card entry is a candidate here.
         const int nCandidates = SnapshotProtectedEntries(pThis, candidates, nMaxViewEntries, nullptr, 0, false);
         for (int i = 0; i < nCandidates; ++i)
         {
-            const int nItemId = GetItemBuffId(candidates[i].pEntry);
-            if (nItemId == 0 || nItemId / 10000 != 238)
+            if (*reinterpret_cast<const int*>(candidates[i].pEntry + OFF_TempStat_Remaining) <= kOwnExpiryWindowMs)
             {
-                continue;
-            }
-
-            if (!HasOverlappingRateCoupon(pThis, candidates[i].mask))
-            {
-                continue;
+                continue;   // this cancel is about that entry
             }
 
             snapshot[nSnapshot] = candidates[i];
