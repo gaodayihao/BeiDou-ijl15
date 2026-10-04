@@ -209,6 +209,7 @@
     <ClInclude Include="PetSkillSlot.h" />
     <ClInclude Include="PetAutoBuff.h" />
     <ClInclude Include="PetBuffConfig.h" />
+    <ClInclude Include="ManaReflectLevelFix.h" />
     <ClInclude Include="Memory.h" />
     <ClInclude Include="NMCO.h" />
     <ClInclude Include="SelectCharMacFix.h" />
@@ -233,6 +234,7 @@
     <ClCompile Include="PetSkillSlot.cpp" />
     <ClCompile Include="PetAutoBuff.cpp" />
     <ClCompile Include="PetBuffConfig.cpp" />
+    <ClCompile Include="ManaReflectLevelFix.cpp" />
     <ClCompile Include="Memory.cpp" />
     <ClCompile Include="NMCO.cpp" />
     <ClCompile Include="SelectCharMacFix.cpp" />
