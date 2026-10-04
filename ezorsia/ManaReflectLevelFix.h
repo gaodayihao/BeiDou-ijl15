@@ -15,5 +15,5 @@
 // instead. Both the chance (`prop`, +0xF4 of the level data) and the rate (`x`, +0x13C) read the same row,
 // so the hook fixes the roll and the amount together. Nothing else in the client is touched.
 //
-// Enable with [debug] manaReflectFix=true in config.ini. Output: mana_reflect_fix.log next to the client.
+// Enable with [debug] manaReflectFix=true in config.ini (default on). No log file is written.
 void Hook_ManaReflectLevelFix(bool enable);
