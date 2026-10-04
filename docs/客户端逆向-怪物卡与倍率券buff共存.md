@@ -1,8 +1,15 @@
-# 客户端逆向：怪物卡与倍率券 buff 共存
+# 客户端逆向：怪物卡与倍率券 buff 共存（**方案已放弃，本文只留客户端机制取证**）
+
+> **状态：已回滚（2026-10-03）**。本方案在**共享掩码位上"保住表项"**（注入惰性位 + 按报文 id/剩余时长判据），
+> 属**在既有机制上打补丁**：每加一个取消场景就多一个洞（实测已踩三次：同 buff 双图标、卡到期图标滞留、
+> 玩家主动取消卡后图标不消失）。用户拍板**放弃此方案**，插件模块已从构建中整体移除，行为回到客户端原生。
+> **根因路线**（未实施）= 让卡片不再与券共用那一位（服务端换位，零客户端补丁），评估与登记见
+> Ursa-Server `docs/client/004` §4 与 `docs/porting/rejected-alternatives.md`（R-22 / R-23）。
+> 本文余下内容仍是**有效的客户端机制取证**（表项布局、两个入口、报文形状），供后续任何方案参考。
 
 > 姊妹文档：IDA 书签（前缀 `BUG031:`）与本文件成对；改址或改述时两侧同步。
 > 基线：`Angel.exe`（v83，IDA `D:\Downloads\Angel\Angel.i64`）；发布客户端为 `BeiDou.exe`（本文件涉及的地址两侧一致）。
-> 关联实现：`ezorsia/CardDefenseAttr.h` / `CardDefenseAttr.cpp`、`ezorsia/CardDefenseTable.h`（生成物）、
+> 关联实现（**已删除**）：`ezorsia/CardDefenseAttr.h` / `CardDefenseAttr.cpp`、`ezorsia/CardDefenseTable.h`、
 > `config.ini` 的 `cardBuffCoexist`。
 > 服务端侧权威文档：Ursa-Server `docs/client/004-怪物卡属性耐性与buff共存.md`、`docs/bugs/029`、`docs/bugs/031`。
 
