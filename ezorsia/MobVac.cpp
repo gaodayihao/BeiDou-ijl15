@@ -56,6 +56,21 @@ static const DWORD ADDR_FieldCarrier = 0x00BEDED4;            // ZRef carrier; C
 // can (that route crashed the client during map load and was removed).
 static const int OFF_CMob_StunValue = 0x234;
 
+// The mob's sprite lives in the IWzGr2DLayer at CMob+0x4C0 - CMob::PrepareActionLayer (0x00664990)
+// animates exactly that object (IWzGr2DLayer::RemoveCanvas / ::Animate). The vacuum only shifts this
+// layer: the mob's coordinates, move path, animation and the server's idea of where it is all stay
+// untouched, which is the whole point - moving the vector controller instead detaches the layer from
+// its origin (documented in the reverse manual) and the mob stops being drawn at all.
+static const int OFF_CMob_Layer = 0x4C0;
+
+// IWzVector2D slot layout, read off the CVecCtrl implementation of the same interface
+// (vtable 0x00B3E5C8): 0 QueryInterface, 1 AddRef, 2 Release, 3..7 property methods,
+// 8 get_x, 9 put_x, 10 get_y, 11 put_y. COM fixes the order, so a layer uses the same indices.
+static const int VTBL_INDEX_VEC_GET_X = 8;
+static const int VTBL_INDEX_VEC_PUT_X = 9;
+static const int VTBL_INDEX_VEC_GET_Y = 10;
+static const int VTBL_INDEX_VEC_PUT_Y = 11;
+
 // Offsets inside CMob (relative to the CMob object itself, not to its CLife subobject).
 static const int OFF_CMob_Template = 0x188;
 static const int OFF_CMob_Pos = 0x510;       // {x,y} - what CLife::GetPos returns
@@ -119,6 +134,8 @@ static const DWORD POLL_INTERVAL_MS = 15;
 typedef void(__thiscall* tCMobUpdate)(void* pThis);
 typedef void(__thiscall* tCUserLocalOnSetDead)(void* pThis, int bDead);
 typedef long(__stdcall* tVecRawMove)(void* pVecIf, long x, long y);
+typedef long(__stdcall* tVecGet)(void* pVec, long* pOut);
+typedef long(__stdcall* tVecPut)(void* pVec, long nValue);
 typedef void(__thiscall* tMovePathDiscardByInterrupt)(void* pPath, long a2, void* pVec, int a4);
 
 // Distance (per axis, pixels) the mob may drift from the stored point before it is teleported again.
@@ -281,6 +298,104 @@ static bool MoveVecCtrl(void* pVecIf, void* pRawMove, POINT pt)
 	return true;
 }
 
+// Anything in a loaded module is callable; the 2D engine lives in Gr2D_DX8.dll, not in BeiDou.exe,
+// so the check cannot be limited to one image.
+static bool IsCallable(const void* p)
+{
+	const uintptr_t v = reinterpret_cast<uintptr_t>(p);
+	return v >= 0x00010000u && v < 0x80000000u;
+}
+
+static bool GetLayerPos(void* pLayer, long& x, long& y)
+{
+	if (pLayer == nullptr)
+	{
+		return false;
+	}
+
+	void** ppVtbl = *reinterpret_cast<void***>(pLayer);
+	if (ppVtbl == nullptr)
+	{
+		return false;
+	}
+
+	void* pGetX = ppVtbl[VTBL_INDEX_VEC_GET_X];
+	void* pGetY = ppVtbl[VTBL_INDEX_VEC_GET_Y];
+	if (!IsCallable(pGetX) || !IsCallable(pGetY))
+	{
+		return false;
+	}
+
+	long lx = 0;
+	long ly = 0;
+	reinterpret_cast<tVecGet>(pGetX)(pLayer, &lx);
+	reinterpret_cast<tVecGet>(pGetY)(pLayer, &ly);
+	x = lx;
+	y = ly;
+	return true;
+}
+
+static bool SetLayerPos(void* pLayer, long x, long y)
+{
+	if (pLayer == nullptr)
+	{
+		return false;
+	}
+
+	void** ppVtbl = *reinterpret_cast<void***>(pLayer);
+	if (ppVtbl == nullptr)
+	{
+		return false;
+	}
+
+	void* pPutX = ppVtbl[VTBL_INDEX_VEC_PUT_X];
+	void* pPutY = ppVtbl[VTBL_INDEX_VEC_PUT_Y];
+	if (!IsCallable(pPutX) || !IsCallable(pPutY))
+	{
+		return false;
+	}
+
+	reinterpret_cast<tVecPut>(pPutX)(pLayer, x);
+	reinterpret_cast<tVecPut>(pPutY)(pLayer, y);
+	return true;
+}
+
+// Put the mob's sprite on the stored point without touching anything the game logic reads.
+//
+// The layer's own x/y may be absolute map coordinates or an offset from its origin (the client gives
+// layers an origin - see CLife/LoadLayer - and the mob's origin is what the vector controller moves).
+// Which one it is gets decided per frame from the values themselves, and both writes are absolute
+// assignments, so a wrong guess cannot accumulate: the worst case is one frame drawn in the wrong
+// place, and the diagnostic below says which branch ran.
+static bool ShiftMobLayer(const void* pMob, POINT ptMob, POINT ptWant, bool& bAbsoluteOut)
+{
+	void* pLayer = *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_Layer);
+	if (pLayer == nullptr)
+	{
+		return false;
+	}
+
+	long lx = 0;
+	long ly = 0;
+	if (!GetLayerPos(pLayer, lx, ly))
+	{
+		return false;
+	}
+
+	// "Close to the mob's own world position" means the layer carries absolute coordinates.
+	const long dxAbs = lx - ptMob.x;
+	const long dyAbs = ly - ptMob.y;
+	const bool bAbsolute = (dxAbs > -256 && dxAbs < 256 && dyAbs > -256 && dyAbs < 256);
+	bAbsoluteOut = bAbsolute;
+
+	if (bAbsolute)
+	{
+		return SetLayerPos(pLayer, ptWant.x, ptWant.y);
+	}
+
+	return SetLayerPos(pLayer, lx + (ptWant.x - ptMob.x), ly + (ptWant.y - ptMob.y));
+}
+
 // CMovePath::DiscardByInterrupt is deliberately NOT used: the sprite is pushed along the move path
 // by the client's own update, so cutting the path froze the mob at its old spot instead of pinning
 // it to the point. The address and the argument shape stay documented above for the day a path-level
@@ -424,41 +539,13 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 	char* pMob = reinterpret_cast<char*>(pThis);
 	RememberVacuumMob(pThis);
 
-	// The client's own "this mob cannot act" state: it stops the mob walking back onto its path and
-	// keeps the pile from hitting the player. Handed back when the vacuum ends.
-	*reinterpret_cast<int*>(pMob + OFF_CMob_StunValue) = 1;
+	// Where the mob really is (the client refreshes this from the vector controller every frame) and
+	// the point the player asked for. Only the sprite layer is moved - the mob's own coordinates, its
+	// move path and the server's copy stay exactly as they are.
+	const POINT ptMob = *reinterpret_cast<const POINT*>(pMob + OFF_CMob_Pos);
+	bool bAbsolute = false;
+	const bool bShifted = ShiftMobLayer(pThis, ptMob, g_ptVac, bAbsolute);
 
-	POINT* pLive = reinterpret_cast<POINT*>(pMob + OFF_CMob_Pos);
-	void* pVecIf = GetVecCtrlIf(pThis);
-	void* pRawMove = nullptr;
-	const bool bVecOk = ResolveVecRawMove(pVecIf, pRawMove);
-
-	// The vector controller is what moves the mob and what the sprite follows; +0x510 is only the copy
-	// it refreshes every frame. Teleport it only once the mob has drifted off the point: raw_Move
-	// zeroes the velocity fields, so the mob then stays put - and the move path is not rebuilt
-	// every single frame.
-	const POINT ptBefore = *pLive;   // before our write: what the client left this frame
-	const int nDx = ptBefore.x - g_ptVac.x;
-	const int nDy = ptBefore.y - g_ptVac.y;
-	const bool bOnPoint = nDx > -VACUUM_SLACK && nDx < VACUUM_SLACK && nDy > -VACUUM_SLACK && nDy < VACUUM_SLACK;
-
-	bool bMoved = false;
-	if (!bOnPoint)
-	{
-		if (g_nMoveBudget > 0)
-		{
-			--g_nMoveBudget;
-			bMoved = MoveVecCtrl(pVecIf, pRawMove, g_ptVac);
-		}
-
-		// NB: CMob+0x510/+0x518 are deliberately NOT written here. The client refreshes them from the
-		// vector controller every frame, and writing them made the next frame's "am I on the point?"
-		// test read back our own value - so the teleport was skipped and the mob never actually moved.
-		// The vector controller is the only thing worth touching.
-	}
-
-	// What matters here is `moved`: if it stays 0 while the mob is off the point, the vector
-	// controller could not be reached (vecIf/vtbl are printed to see why).
 	if (MobVac::bDebug)
 	{
 		static DWORD s_dwNextLog = 0;
@@ -466,20 +553,16 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 		if (dwNow >= s_dwNextLog)
 		{
 			s_dwNextLog = dwNow + 1000;
-			const void* pVecRef = *reinterpret_cast<const void* const*>(pMob + OFF_CMob_VecCtrlRef);
-			const void* pUser = *reinterpret_cast<void**>(ADDR_UserLocal_Instance);
-			POINT ptNow = { 0, 0 };
-			GetPlayerPos(const_cast<void*>(pUser), ptNow);
+			const void* pLayer = *reinterpret_cast<void* const*>(pMob + OFF_CMob_Layer);
+			long lx = 0;
+			long ly = 0;
+			GetLayerPos(const_cast<void*>(pLayer), lx, ly);
 			std::cout << "[mobvac] mob 0x" << std::hex << pThis << std::dec
-				<< " liveBefore=(" << ptBefore.x << "," << ptBefore.y << ")"
-				<< " liveNow=(" << pLive->x << "," << pLive->y << ")"
+				<< " mobPos=(" << ptMob.x << "," << ptMob.y << ")"
+				<< " layer=0x" << std::hex << pLayer << std::dec
+				<< " layerPos=(" << lx << "," << ly << ")"
 				<< " want=(" << g_ptVac.x << "," << g_ptVac.y << ")"
-				<< " playerNow=(" << ptNow.x << "," << ptNow.y << ")"
-				<< " onPoint=" << bOnPoint << " moved=" << bMoved
-				<< " vecOk=" << bVecOk << " rawMove=0x" << std::hex << pRawMove
-				<< " vecIf=0x" << pVecIf
-				<< " vecVtbl=0x" << (pVecIf != nullptr ? *reinterpret_cast<void**>(pVecIf) : nullptr)
-				<< " vecRef=0x" << pVecRef << std::dec << std::endl;
+				<< " shift=" << bShifted << " absolute=" << bAbsolute << std::endl;
 		}
 	}
 }
