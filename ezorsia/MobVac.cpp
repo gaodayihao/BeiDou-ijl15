@@ -79,6 +79,7 @@ static const DWORD ADDR_GetFootholdClosest = 0x00A45677;      // first bytes 55 
 static const DWORD ADDR_GetFoothold = 0x0050D811;             // first byte B8 (id -> foothold)
 static const DWORD ADDR_CMob_SetChaseTarget = 0x0066B562;     // first bytes 56 8B F1
 static const DWORD ADDR_CMob_SetActive = 0x006637EC;          // first bytes 53 56 57
+static const DWORD ADDR_CMob_IsTargetInAttackRange = 0x0066A517;  // first byte B8, retn 10h (4 args)
 static const DWORD ADDR_PhysicalSpace = 0x00BEBFA0;           // CWvsPhysicalSpace2D* (global)
 static const DWORD ADDR_UserLocal_Instance = 0x00BEBF98;      // TSingleton<CUserLocal>::ms_pInstance
 static const DWORD ADDR_FieldCarrier = 0x00BEDED4;            // ZRef carrier; CField* at +4
@@ -137,12 +138,17 @@ static const int MOB_VACUUM_LEASH = 60;
 static const DWORD MOB_VACUUM_COOLDOWN_MS = 400;
 
 // CMob+0x234: the stun value slot. A mob with a non-zero value here neither walks nor attacks - the
-// client's own movement checks and CMob::DoAttack read it - so it stays exactly where the vacuum put
-// it, which is what "the mobs cannot leave the point" means (and unlike clearing the move path, it
-// leaves the sprite layer alone: a stunned mob is drawn normally and can still be attacked). Written
-// every frame while the vacuum is on, and cleared again once it is switched off.
+// client's own movement checks, CMob::DoAttack and even its attack-RANGE check read it - so it stays
+// exactly where the vacuum put it, which is what "the mobs cannot leave the point" means (and unlike
+// clearing the move path, it leaves the sprite layer alone: a stunned mob is drawn normally and can
+// still be attacked). Written every frame while the vacuum is on, and cleared again once it is off -
+// or as soon as the mob is in reach of the player, so that it attacks instead of standing there.
 static const int OFF_CMob_Stun = 0x234;
 static const int STUN_VALUE = 1;
+
+// While the mob is this close (per axis) to the player it is let go even if the client's own range
+// check says no - close enough that its attack is the next thing its AI will do rather than a walk.
+static const int MOB_VACUUM_ATTACK_DIST = 60;
 
 // The per-mob diagnostics are sampled at most this often, and a pin that has not been ticked for
 // MOB_PIN_TTL_MS counts as gone. Both matter for safety: a mob that leaves the field has its CMob
@@ -160,6 +166,7 @@ typedef void*(__thiscall* tGetFoothold)(void* pSpace, int footholdId);
 typedef long(__stdcall* tVecGetAxis)(void* pVecIf, long* pOut);
 typedef void(__thiscall* tCMobSetChaseTarget)(void* pMob, int bEnable, void* pTargetOwner, int nFlags);
 typedef void(__thiscall* tCMobSetActive)(void* pMob, int bActive);
+typedef int(__thiscall* tCMobIsTargetInAttackRange)(void* pMob, int nTarget, int* pAttackIdx, int* pDirection, void* pTargetInfo);
 
 // IWzVector2D slots on the *interface* table (the one [mob+0x118] points into).
 static const int VTBL_INDEX_VEC_GET_X = 8;
@@ -668,6 +675,55 @@ static void ReleaseStun(void* pMob)
 	pPin->bStunned = false;
 }
 
+// Drop this mob's stun now, whatever the vacuum state is.
+static void UnstunMob(MobPin* pPin, void* pMob)
+{
+	if (pPin->bStunned)
+	{
+		*reinterpret_cast<int*>(reinterpret_cast<char*>(pMob) + OFF_CMob_Stun) = 0;
+		pPin->bStunned = false;
+	}
+}
+
+// Can this mob reach the player right now? That is the client's own question, asked its own way:
+// CMob::IsTargetInAttackRange with the local user as the target (kind 0), the very call CMob::Update's
+// attack decision makes. The distance test is the fallback for a mob the client says no about while it
+// is standing right next to the player (a template whose attack list the check cannot match): close
+// enough that its attack, not a walk, is what its AI will pick.
+static bool PlayerInReach(void* pMob, POINT ptMob)
+{
+	if (reinterpret_cast<tCMobIsTargetInAttackRange>(ADDR_CMob_IsTargetInAttackRange)(
+		pMob, 0, nullptr, nullptr, nullptr) != 0)
+	{
+		return true;
+	}
+
+	void* pUserLocal = *reinterpret_cast<void**>(ADDR_UserLocal_Instance);
+	POINT ptPlayer = { 0, 0 };
+	if (!GetPlayerPos(pUserLocal, ptPlayer))
+	{
+		return false;
+	}
+
+	return AbsDiff(ptMob.x, ptPlayer.x) <= MOB_VACUUM_ATTACK_DIST
+		&& AbsDiff(ptMob.y, ptPlayer.y) <= MOB_VACUUM_ATTACK_DIST;
+}
+
+// The rule the vacuum holds mobs by: a mob that can reach the player is let go so that it attacks
+// (which is what the gathered pile is for), and a mob that cannot is stunned instead so that it cannot
+// wander off the point. The stun is dropped before asking, because CMob+0x234 is one of the early-outs
+// of the client's own range check - a stunned mob always answers "out of range", so asking with the
+// stun on would keep every mob stunned forever.
+static void HoldOrRelease(MobPin* pPin, void* pMob, POINT ptMob)
+{
+	UnstunMob(pPin, pMob);
+
+	if (!PlayerInReach(pMob, ptMob))
+	{
+		StunMob(pPin, pMob);
+	}
+}
+
 // The per-frame vacuum step, run BEFORE the client's own update of the mob (see the file header): a mob
 // on the point is stunned there and left alone, a mob that has left the leash is pulled back onto the
 // point - with the client's own position copies moved along, so everything that reads them in this
@@ -686,10 +742,10 @@ static void VacuumTick(void* pMob)
 	if (AbsDiff(pPin->ptPre.x, g_ptVacuum.x) <= MOB_VACUUM_LEASH
 		&& AbsDiff(pPin->ptPre.y, g_ptVacuum.y) <= MOB_VACUUM_LEASH)
 	{
-		// On the point already: hold it there and touch nothing else about it.
+		// On the point already: hold it there, or let it go if it can reach the player.
 		if (IsLocallyActive(pMob))
 		{
-			StunMob(pPin, pMob);
+			HoldOrRelease(pPin, pMob, pPin->ptPre);
 		}
 
 		return;
@@ -738,7 +794,8 @@ static void VacuumTick(void* pMob)
 	*reinterpret_cast<POINT*>(pMobBytes + OFF_CMob_Pos) = g_ptVacuum;
 	*reinterpret_cast<POINT*>(pMobBytes + OFF_CMob_PosPrev) = g_ptVacuum;
 
-	StunMob(pPin, pMob);   // and keep it there: the pull only decides where it stops
+	// The pull only decides where the mob stops; the hold rule decides whether it stays held there.
+	HoldOrRelease(pPin, pMob, g_ptVacuum);
 }
 
 // After the client's own update of the same frame - bookkeeping only, nothing is written here: where
@@ -966,7 +1023,8 @@ void Hook_MobVac(bool enable)
 		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetChaseTarget + 2) != 0xF1
 		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetActive) != 0x53
 		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetActive + 1) != 0x56
-		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetActive + 2) != 0x57)
+		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetActive + 2) != 0x57
+		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_IsTargetInAttackRange) != 0xB8)
 	{
 		std::cout << "mob vacuum skipped: unexpected client build (CMob::Update=" << std::hex
 			<< static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CMob_Update))
