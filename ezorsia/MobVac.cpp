@@ -150,7 +150,18 @@ static tCUserLocalOnSetDead g_origCUserLocalOnSetDead = nullptr;
 // vacuum ends). The list is only ever appended while the vacuum is on and is cleared whenever it
 // toggles; entries are validated before being written to, because a mob may have died meanwhile.
 static const int MAX_VAC_MOBS = 512;
-static void* g_apVacMobs[MAX_VAC_MOBS];
+
+// One entry per mob this vacuum session touched. The layer's x/y is an offset from its origin (the
+// client never rewrites it for a stationary mob), so the original offset is recorded the first time
+// a mob is touched and put back verbatim when the vacuum ends.
+struct VacMob
+{
+	void* pMob;
+	long nOrigX;
+	long nOrigY;
+};
+
+static VacMob g_aVacMobs[MAX_VAC_MOBS];
 static int g_nVacMobs = 0;
 
 static bool g_bEnabled = false;      // config.ini switch - the thread only starts when set
@@ -222,6 +233,9 @@ static void* GetVecCtrlIf(const void* pMob)
 
 // Is this still a live CMob we may write to? A mob that died while the vacuum was on would leave a
 // dangling pointer in the list, so the template pointer and its boss flag are checked first.
+static bool GetLayerPos(void* pLayer, long& x, long& y);
+static bool SetLayerPos(void* pLayer, long x, long y);
+
 static bool LooksLikeMob(const void* pMob)
 {
 	const char* pTemplate = *reinterpret_cast<const char* const*>(
@@ -239,17 +253,18 @@ static bool LooksLikeMob(const void* pMob)
 
 static void ForgetVacuumMobs()
 {
-	// Hand the mobs back their own state: the STUN value we set is ours, not the game's.
+	// Hand every touched mob its own layer offset back. Skipped for entries that no longer look like
+	// a live mob (the pointer may be a recycled block by now).
 	for (int i = 0; i < g_nVacMobs; ++i)
 	{
-		if (LooksLikeMob(g_apVacMobs[i]))
+		if (!LooksLikeMob(g_aVacMobs[i].pMob))
 		{
-			char* pMob = reinterpret_cast<char*>(g_apVacMobs[i]);
-			if (*reinterpret_cast<int*>(pMob + OFF_CMob_StunValue) == 1)
-			{
-				*reinterpret_cast<int*>(pMob + OFF_CMob_StunValue) = 0;
-			}
+			continue;
 		}
+
+		void* pLayer = *reinterpret_cast<void* const*>(
+			reinterpret_cast<const char*>(g_aVacMobs[i].pMob) + OFF_CMob_Layer);
+		SetLayerPos(pLayer, g_aVacMobs[i].nOrigX, g_aVacMobs[i].nOrigY);
 	}
 
 	g_nVacMobs = 0;
@@ -362,12 +377,12 @@ static bool SetLayerPos(void* pLayer, long x, long y)
 
 // Put the mob's sprite on the stored point without touching anything the game logic reads.
 //
-// The layer's own x/y may be absolute map coordinates or an offset from its origin (the client gives
-// layers an origin - see CLife/LoadLayer - and the mob's origin is what the vector controller moves).
-// Which one it is gets decided per frame from the values themselves, and both writes are absolute
-// assignments, so a wrong guess cannot accumulate: the worst case is one frame drawn in the wrong
-// place, and the diagnostic below says which branch ran.
-static bool ShiftMobLayer(const void* pMob, POINT ptMob, POINT ptWant, bool& bAbsoluteOut)
+// The layer's x/y is an offset from its origin (the client gives layers an origin and the mob's
+// origin is what its vector controller drives), so the sprite is moved by writing the offset
+// `point - mobPosition` - an absolute assignment, never an addition: adding to whatever the layer
+// currently holds compounds every frame (60 x the offset per second) and throws the sprite tens of
+// thousands of pixels away.
+static bool ShiftMobLayer(const void* pMob, POINT ptMob, POINT ptWant)
 {
 	void* pLayer = *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_Layer);
 	if (pLayer == nullptr)
@@ -375,25 +390,7 @@ static bool ShiftMobLayer(const void* pMob, POINT ptMob, POINT ptWant, bool& bAb
 		return false;
 	}
 
-	long lx = 0;
-	long ly = 0;
-	if (!GetLayerPos(pLayer, lx, ly))
-	{
-		return false;
-	}
-
-	// "Close to the mob's own world position" means the layer carries absolute coordinates.
-	const long dxAbs = lx - ptMob.x;
-	const long dyAbs = ly - ptMob.y;
-	const bool bAbsolute = (dxAbs > -256 && dxAbs < 256 && dyAbs > -256 && dyAbs < 256);
-	bAbsoluteOut = bAbsolute;
-
-	if (bAbsolute)
-	{
-		return SetLayerPos(pLayer, ptWant.x, ptWant.y);
-	}
-
-	return SetLayerPos(pLayer, lx + (ptWant.x - ptMob.x), ly + (ptWant.y - ptMob.y));
+	return SetLayerPos(pLayer, ptWant.x - ptMob.x, ptWant.y - ptMob.y);
 }
 
 // CMovePath::DiscardByInterrupt is deliberately NOT used: the sprite is pushed along the move path
@@ -505,23 +502,37 @@ static void __fastcall CUserLocal_OnSetDead_Hook(void* pThis, void* /*edx*/, int
 	g_origCUserLocalOnSetDead(pThis, bDead);
 }
 
-// The vacuumed mobs walk straight back onto the path they were pulled off, so they are put into the
-// client's own "cannot act" state (see OFF_CMob_StunValue) instead of hooking movement code.
-// Everybody else goes through untouched.
+// First touch of a mob in this session: remember its layer offset so the vacuum can hand it back.
 static void RememberVacuumMob(void* pMob)
 {
 	for (int i = 0; i < g_nVacMobs; ++i)
 	{
-		if (g_apVacMobs[i] == pMob)
+		if (g_aVacMobs[i].pMob == pMob)
 		{
 			return;
 		}
 	}
 
-	if (g_nVacMobs < MAX_VAC_MOBS)
+	if (g_nVacMobs >= MAX_VAC_MOBS)
 	{
-		g_apVacMobs[g_nVacMobs++] = pMob;
+		return;
 	}
+
+	VacMob& entry = g_aVacMobs[g_nVacMobs];
+	entry.pMob = pMob;
+	entry.nOrigX = 0;
+	entry.nOrigY = 0;
+
+	void* pLayer = *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_Layer);
+	long lx = 0;
+	long ly = 0;
+	if (GetLayerPos(pLayer, lx, ly))
+	{
+		entry.nOrigX = lx;
+		entry.nOrigY = ly;
+	}
+
+	++g_nVacMobs;
 }
 
 // Every mob, every frame: re-apply the stored point after the client's own update.
@@ -543,8 +554,7 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 	// the point the player asked for. Only the sprite layer is moved - the mob's own coordinates, its
 	// move path and the server's copy stay exactly as they are.
 	const POINT ptMob = *reinterpret_cast<const POINT*>(pMob + OFF_CMob_Pos);
-	bool bAbsolute = false;
-	const bool bShifted = ShiftMobLayer(pThis, ptMob, g_ptVac, bAbsolute);
+	const bool bShifted = ShiftMobLayer(pThis, ptMob, g_ptVac);
 
 	if (MobVac::bDebug)
 	{
@@ -562,7 +572,7 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 				<< " layer=0x" << std::hex << pLayer << std::dec
 				<< " layerPos=(" << lx << "," << ly << ")"
 				<< " want=(" << g_ptVac.x << "," << g_ptVac.y << ")"
-				<< " shift=" << bShifted << " absolute=" << bAbsolute << std::endl;
+				<< " shift=" << bShifted << " offset=(" << (g_ptVac.x - ptMob.x) << "," << (g_ptVac.y - ptMob.y) << ")" << std::endl;
 		}
 	}
 }
