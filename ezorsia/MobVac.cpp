@@ -72,9 +72,12 @@ static const int OFF_CMob_VecCtrlRef = 0x50C;
 static const int OFF_CMob_VecCtrlIf = 0x118;
 
 // IWzVector2D::raw_Move (0x009B5E7F) is CVecCtrl's own teleport: it writes x/y, zeroes the four
-// velocity doubles and (when a move path is attached) flags the path, so the mob stops where it is
-// put instead of continuing to walk. It hangs off the IWzVector2D vtable (0x00B3E1F8) as slot 19.
+// velocity doubles and (when a move path is attached) rebuilds it through SetMovePathAttribute, so
+// the mob stops where it is put instead of continuing to walk. It hangs off the IWzVector2D vtable
+// (0x00B3E1F8) as slot 19 - and CVecCtrl's subclasses carry their own copies of that table, so the
+// gate below checks the FUNCTION, not the table address.
 static const int VTBL_INDEX_VEC_RAW_MOVE = 19;
+static const DWORD ADDR_VecCtrl_raw_Move = 0x009B5E7F;
 
 // Ctrl+0 toggles; the game itself does not bind that combination.
 static const int VK_TOGGLE_KEY = '0';
@@ -101,6 +104,12 @@ static POINT g_ptVac = { 0, 0 };     // the point the mobs are pulled to (player
 static void* g_pLastField = nullptr; // current CField*, to notice a map change
 static void* g_pLastUser = nullptr;  // CUserLocal*, to notice a relogin/character change
 static long g_nMobUpdates = 0;       // how often the mob hook fired (diagnostics only)
+
+// raw_Move rebuilds the mob's move path, so the calls are rationed: the poll thread refills this
+// budget every tick, which spreads "the whole map comes to me at once" over a few frames instead of
+// rebuilding a hundred paths inside a single pool update.
+static const long MOVE_BUDGET_PER_TICK = 4;
+static long g_nMoveBudget = MOVE_BUDGET_PER_TICK;
 
 // get_field (0x00437A0C) in two instructions, without calling into the client.
 static void* GetCurrentField()
@@ -143,12 +152,6 @@ static bool IsVacuumable(const void* pMob)
 	return *reinterpret_cast<const int*>(pTemplate + OFF_CMobTemplate_Boss) == 0;
 }
 
-static bool IsCodePointer(const void* p)
-{
-	const uintptr_t v = reinterpret_cast<uintptr_t>(p);
-	return v >= 0x00401000u && v < 0x00C00000u;
-}
-
 static bool IsDataPointer(const void* p)
 {
 	const uintptr_t v = reinterpret_cast<uintptr_t>(p);
@@ -162,8 +165,16 @@ static void* GetVecCtrlIf(const void* pMob)
 }
 
 // Teleport the mob through the vector controller - the object that really drives it.
-static bool MoveVecCtrl(void* pVecIf, POINT pt)
+//
+// The gate is strict on purpose: slot 19 must be exactly CVecCtrl::raw_Move. Every write raw_Move
+// performs lands inside the vector controller itself (interface-0x0C ... interface+0x104), so once
+// the entry really is raw_Move the call cannot touch anything else; with a looser check (any data
+// page plus any code pointer) a mob whose +0x118 is not a vector controller makes it call a foreign
+// function with a foreign `this`, which corrupts that object and crashes the pool update later.
+static bool ResolveVecRawMove(void* pVecIf, void*& pRawMoveOut)
 {
+	pRawMoveOut = nullptr;
+
 	if (pVecIf == nullptr)
 	{
 		return false;
@@ -176,7 +187,18 @@ static bool MoveVecCtrl(void* pVecIf, POINT pt)
 	}
 
 	void* pRawMove = ppVtbl[VTBL_INDEX_VEC_RAW_MOVE];
-	if (!IsCodePointer(pRawMove))
+	if (pRawMove != reinterpret_cast<void*>(ADDR_VecCtrl_raw_Move))
+	{
+		return false;
+	}
+
+	pRawMoveOut = pRawMove;
+	return true;
+}
+
+static bool MoveVecCtrl(void* pVecIf, void* pRawMove, POINT pt)
+{
+	if (pVecIf == nullptr || pRawMove == nullptr)
 	{
 		return false;
 	}
@@ -225,6 +247,8 @@ static DWORD WINAPI MobVacThread(LPVOID /*param*/)
 		{
 			continue;
 		}
+
+		g_nMoveBudget = MOVE_BUDGET_PER_TICK;   // refill the teleport budget for this tick
 
 		void* pField = GetCurrentField();
 		void* pUser = *reinterpret_cast<void**>(ADDR_UserLocal_Instance);
@@ -301,18 +325,26 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 	POINT* pLive = reinterpret_cast<POINT*>(pMob + OFF_CMob_Pos);
 	POINT* pPrev = reinterpret_cast<POINT*>(pMob + OFF_CMob_PosPrev);
 	void* pVecIf = GetVecCtrlIf(pThis);
+	void* pRawMove = nullptr;
+	const bool bVecOk = ResolveVecRawMove(pVecIf, pRawMove);
 
 	// The vector controller is what moves the mob and what the sprite follows; +0x510 is only the copy
 	// it refreshes every frame. Teleport it only once the mob has drifted off the point: raw_Move
-	// zeroes the velocity fields, so the mob then stays put - and the move path is not re-flagged
+	// zeroes the velocity fields, so the mob then stays put - and the move path is not rebuilt
 	// every single frame.
 	const int nDx = pLive->x - g_ptVac.x;
 	const int nDy = pLive->y - g_ptVac.y;
 	const bool bOnPoint = nDx > -VACUUM_SLACK && nDx < VACUUM_SLACK && nDy > -VACUUM_SLACK && nDy < VACUUM_SLACK;
-	const bool bMoved = !bOnPoint && MoveVecCtrl(pVecIf, g_ptVac);
 
+	bool bMoved = false;
 	if (!bOnPoint)
 	{
+		if (g_nMoveBudget > 0)
+		{
+			--g_nMoveBudget;
+			bMoved = MoveVecCtrl(pVecIf, pRawMove, g_ptVac);
+		}
+
 		*pLive = g_ptVac;
 		*pPrev = g_ptVac;
 	}
@@ -336,7 +368,8 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 				<< " want=(" << g_ptVac.x << "," << g_ptVac.y << ")"
 				<< " playerNow=(" << ptNow.x << "," << ptNow.y << ")"
 				<< " onPoint=" << bOnPoint << " moved=" << bMoved
-				<< " vecIf=0x" << std::hex << pVecIf
+				<< " vecOk=" << bVecOk << " rawMove=0x" << std::hex << pRawMove
+				<< " vecIf=0x" << pVecIf
 				<< " vecVtbl=0x" << (pVecIf != nullptr ? *reinterpret_cast<void**>(pVecIf) : nullptr)
 				<< " vecRef=0x" << pVecRef << std::dec << std::endl;
 		}
