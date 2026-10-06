@@ -2,13 +2,15 @@
 
 // Mob vacuum - Ctrl+0 in game toggles it.
 //
-// While it is on, every non-boss mob the client knows about is held on the point the player stood on
-// at the moment the vacuum was switched on: before the mob's own update runs, a mob that has really
-// wandered off that point is put back on it. A mob that is still on the point is not touched at all,
-// and no mob is moved twice within a few hundred milliseconds - each placement re-seeds the mob's
-// move path, so a mob put back every frame would be frozen: unable to move, to attack or to be hit.
-// The point does not follow the player, and mobs that spawn later join on their own - hooking
-// CMob::Update covers the whole pool, not a snapshot.
+// While it is on, every non-boss mob the client knows about is held inside a leash around an anchor
+// that starts where the player stood when the vacuum was switched on. A mob that walks out of the
+// leash is put back - onto the leash edge, not onto the anchor, so the correction is the few pixels it
+// overshot instead of the whole leash - and no mob is moved twice within a couple of hundred
+// milliseconds, because each placement re-seeds the mob's move path and a mob moved every frame is
+// frozen: unable to move, to attack or to be hit. The anchor follows the player, softly and only once
+// they have really walked off, so the mobs gather around the player (which is also where their own AI
+// stops them and they start attacking). Mobs that spawn later join on their own - hooking CMob::Update
+// covers the whole pool, not a snapshot.
 //
 // Why the client can do this at all: in v83 the client owns mob movement. The client that controls
 // a mob generates its move path and reports it through MOVE_LIFE (0xBC); the server only checks that
@@ -19,11 +21,11 @@
 // What is touched (see MobVac.cpp for the addresses and the evidence behind them):
 //   * CMob::Update            - BEFORE the client's own update of the mob, so its attack-range /
 //                               skill / move-path decisions and the C->S report it derives from them
-//                               are made with the mob already on the point. A mob on the point (or
-//                               within the slack) is left alone, and a mob that was moved is left
-//                               alone for the cooldown - the client's own update of that mob runs in
-//                               between, which is what lets it move, attack and be hit. The mob's
-//                               vector controller is put on the point through the client's own
+//                               are made with the mob already where this module put it. A mob inside
+//                               the leash is left alone, and a mob that was moved is left alone for
+//                               the cooldown - the client's own update of that mob runs in between,
+//                               which is what lets it move, attack and be hit. The mob's vector
+//                               controller is put on the corrected point through the client's own
 //                               CVecCtrlMob::SetActive, which also binds the foothold under that
 //                               point and re-seeds the move path there. The controller's "last
 //                               acknowledged point" cache is moved with it - without that the client

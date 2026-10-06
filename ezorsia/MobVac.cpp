@@ -59,12 +59,17 @@
 // on the same entry would have to chain through the first one's trampoline. Polling from our own
 // thread keeps this module out of the client's update chain entirely - it only reads globals.
 //
-// The pull runs BEFORE the client's own per-mob update, so that every decision that update makes about
-// this mob - attack range, skill choice, and the move path it reports to the server - is made with the
-// mob already on the point. It is not repeated while the mob stays there, and never more often than
-// MOB_VACUUM_COOLDOWN_MS per mob: each pull re-seeds the mob's move path, so a mob held on the point
-// every frame cannot move, attack, or be hit. The point is the player's position at the moment the
-// vacuum is switched on; it does not follow the player afterwards.
+// The correction runs BEFORE the client's own per-mob update, so that every decision that update makes
+// about this mob - attack range, skill choice, and the move path it reports to the server - is made
+// with the mob already where this module put it. It is applied only to a mob that has left the leash
+// around the anchor, and never more often than MOB_VACUUM_COOLDOWN_MS per mob: each placement re-seeds
+// the mob's move path, so a mob moved every frame cannot move, attack, or be hit.
+//
+// The anchor is the player's position when the vacuum was switched on, and it follows them from there
+// on - softly (see FollowPlayer) and only once they have really walked off. Correction goes to the
+// leash EDGE, never to its centre: a mob that walks out is moved back by the few pixels it overshot,
+// which is what keeps the leash from being visible. (Pulling to the centre is what made the mobs snap
+// back and forth: they walked out, were yanked onto the anchor, walked out again.)
 // ---------------------------------------------------------------------------------------------
 
 static const DWORD ADDR_CMob_Update = 0x006675A8;             // first byte B8
@@ -119,17 +124,24 @@ static const int VK_TOGGLE_KEY_PAD = VK_NUMPAD0;
 // How often the vacuum thread looks at the keyboard, in milliseconds.
 static const DWORD POLL_INTERVAL_MS = 15;
 
-// How far (per axis, pixels) a mob may stray from the point before it is put back on it. Generous on
-// purpose: the placement settles a few tens of pixels off the point (the foothold under it wins over
-// the exact y it was handed), and a mob has to be free to walk between two pulls.
-static const int MOB_VACUUM_SLACK = 80;
+// The leash: how far (per axis, pixels) a mob may get from the anchor before it is pushed back. The
+// push goes to the *edge* of the leash, not to its centre - that is what keeps a correction small
+// (the few pixels the mob overshot instead of the whole leash), so a mob held by the leash looks like
+// it walked into a wall rather than being yanked.
+static const int MOB_VACUUM_LEASH = 150;
 
-// The shortest interval between two pulls of the same mob, and the reason the vacuum leaves the mobs
-// usable at all: every placement re-seeds the controller's move path, so a mob that is put back on
-// the point every frame never finishes a single movement - it is motionless, never prepares the
-// action rectangle CMob::GetHitPoint builds (so it cannot be hit) and never reaches its attack step.
-// A pulled mob is therefore left alone for this long before it may be moved again.
-static const DWORD MOB_VACUUM_COOLDOWN_MS = 400;
+// Soft follow: once the player is further than this (per axis) from the anchor, every poll moves the
+// anchor a fraction of the gap toward them. Gliding the anchor instead of snapping it means a mob
+// inside the leash is never moved at all, and one on the boundary only needs the few pixels the
+// boundary itself moved; the mobs end up gathered around the player, which is also where they stop
+// walking (they are in attack range) and start attacking.
+static const int MOB_VACUUM_FOLLOW_DIST = 100;
+static const int MOB_VACUUM_FOLLOW_STEP = 8;      // divisor: 1/8 of the gap per POLL_INTERVAL_MS
+
+// The shortest interval between two placements of the same mob. Even a leash correction re-seeds the
+// controller's move path, so a mob moved every frame never finishes a movement - it cannot act, and
+// the action rectangle CMob::GetHitPoint builds never appears (so it cannot be hit either).
+static const DWORD MOB_VACUUM_COOLDOWN_MS = 200;
 
 // The per-mob diagnostics are sampled at most this often, and a pin that has not been ticked for
 // MOB_PIN_TTL_MS counts as gone. Both matter for safety: a mob that leaves the field has its CMob
@@ -486,6 +498,64 @@ static void ResolveVacuumFoothold(void* pUserLocal, POINT pt)
 	g_pVacuumFoothold = reinterpret_cast<tGetFootholdClosest>(ADDR_GetFootholdClosest)(pSpace, pt.x, pt.y);
 }
 
+// Foothold under an arbitrary point, for a leash correction. The client's own geometric lookup decides
+// (the corrected point is not where the player stands), and the anchor's id is reused only when that
+// lookup lands on the anchor's own foothold object: a cached foothold id is what the client reads back
+// when it re-bases a mob, and one that resolves to a platform the mob is not standing on is worse than
+// leaving the id the mob already carries.
+static void ResolveFootholdAt(POINT pt, void*& pFoothold, int& nFootholdId)
+{
+	pFoothold = nullptr;
+	nFootholdId = 0;
+
+	void* pSpace = *reinterpret_cast<void**>(ADDR_PhysicalSpace);
+	if (pSpace == nullptr)
+	{
+		return;
+	}
+
+	pFoothold = reinterpret_cast<tGetFootholdClosest>(ADDR_GetFootholdClosest)(pSpace, pt.x, pt.y);
+	if (pFoothold != nullptr && pFoothold == g_pVacuumFoothold)
+	{
+		nFootholdId = g_nVacuumFootholdId;
+	}
+}
+
+// The anchor (the centre of the leash) follows the player, softly: while the player stays within
+// MOB_VACUUM_FOLLOW_DIST of it nothing happens at all - so a player who stands still, or moves a
+// little, never sees a mob move because of this module - and once they do walk off, every poll moves
+// the anchor a fraction of the gap instead of snapping it onto them. Gliding is what makes the leash
+// invisible: mobs inside it are untouched, and the one on the boundary only ever needs the pixels the
+// boundary itself moved.
+static void FollowPlayer(void* pUserLocal)
+{
+	POINT ptPlayer;
+	if (!GetPlayerPos(pUserLocal, ptPlayer))
+	{
+		return;
+	}
+
+	const int dx = ptPlayer.x - g_ptVacuum.x;
+	const int dy = ptPlayer.y - g_ptVacuum.y;
+	if (AbsDiff(dx, 0) <= MOB_VACUUM_FOLLOW_DIST && AbsDiff(dy, 0) <= MOB_VACUUM_FOLLOW_DIST)
+	{
+		return;   // still inside the deadzone: the leash centre stays where it is
+	}
+
+	g_ptVacuum.x += dx / MOB_VACUUM_FOLLOW_STEP;
+	g_ptVacuum.y += dy / MOB_VACUUM_FOLLOW_STEP;
+
+	const void* pOldFoothold = g_pVacuumFoothold;
+	ResolveVacuumFoothold(pUserLocal, g_ptVacuum);
+
+	if (MobVac::bDebug && g_pVacuumFoothold != pOldFoothold)
+	{
+		std::cout << "[mobvac] anchor (" << g_ptVacuum.x << "," << g_ptVacuum.y << ")"
+			<< " footing 0x" << std::hex << g_pVacuumFoothold << std::dec
+			<< " id=" << g_nVacuumFootholdId << std::endl;
+	}
+}
+
 static void ToggleVacuum(void* pUserLocal)
 {
 	if (!g_bActive)
@@ -513,7 +583,7 @@ static void ToggleVacuum(void* pUserLocal)
 
 		if (g_bActive)
 		{
-			std::cout << " point=(" << g_ptVacuum.x << "," << g_ptVacuum.y << ")"
+			std::cout << " anchor=(" << g_ptVacuum.x << "," << g_ptVacuum.y << ")"
 				<< " foothold=0x" << std::hex << g_pVacuumFoothold << std::dec
 				<< " id=" << g_nVacuumFootholdId;
 		}
@@ -569,10 +639,10 @@ static void SampleMob(MobPin* pPin, void* pMob, DWORD dwNow)
 }
 
 // The per-frame vacuum step, run BEFORE the client's own update of the mob (see the file header): a
-// mob that has really wandered off the point is put back on it - with the client's own position copies
-// moved along, so everything that reads them in this frame (attack range, the hit rectangle, the drawn
-// frame) sees the mob on the point - while a mob that is still where it was left is not touched at all,
-// and a mob pulled less than MOB_VACUUM_COOLDOWN_MS ago is left to walk.
+// mob that has left the leash around the anchor is pushed back onto the leash edge - with the client's
+// own position copies moved along, so everything that reads them in this frame (attack range, the hit
+// rectangle, the drawn frame) sees the mob there - while a mob inside the leash is not touched at all,
+// and a mob moved less than MOB_VACUUM_COOLDOWN_MS ago is left to walk.
 static void VacuumTick(void* pMob)
 {
 	const DWORD dwNow = GetTickCount();
@@ -583,10 +653,34 @@ static void VacuumTick(void* pMob)
 	pPin->ptPre = *reinterpret_cast<const POINT*>(pMobBytes + OFF_CMob_Pos);
 	SampleMob(pPin, pMob, dwNow);
 
-	if (AbsDiff(pPin->ptPre.x, g_ptVacuum.x) <= MOB_VACUUM_SLACK
-		&& AbsDiff(pPin->ptPre.y, g_ptVacuum.y) <= MOB_VACUUM_SLACK)
+	// Where the mob belongs: its own position, pushed back inside the leash rectangle around the
+	// anchor. Pushing to the edge rather than to the centre is the whole trick - the mob keeps the
+	// ground it has covered and is corrected by the pixels it overshot, so a leash held mob is nudged
+	// instead of yanked (a centre pull is what made them visibly snap back and forth).
+	POINT ptTarget = pPin->ptPre;
+	const int dxOut = pPin->ptPre.x - g_ptVacuum.x;
+	const int dyOut = pPin->ptPre.y - g_ptVacuum.y;
+	if (dxOut > MOB_VACUUM_LEASH)
 	{
-		return;   // on the point (or close enough): nothing to do for this mob this frame
+		ptTarget.x = g_ptVacuum.x + MOB_VACUUM_LEASH;
+	}
+	else if (dxOut < -MOB_VACUUM_LEASH)
+	{
+		ptTarget.x = g_ptVacuum.x - MOB_VACUUM_LEASH;
+	}
+
+	if (dyOut > MOB_VACUUM_LEASH)
+	{
+		ptTarget.y = g_ptVacuum.y + MOB_VACUUM_LEASH;
+	}
+	else if (dyOut < -MOB_VACUUM_LEASH)
+	{
+		ptTarget.y = g_ptVacuum.y - MOB_VACUUM_LEASH;
+	}
+
+	if (ptTarget.x == pPin->ptPre.x && ptTarget.y == pPin->ptPre.y)
+	{
+		return;   // inside the leash: nothing to do for this mob this frame
 	}
 
 	if (!IsLocallyActive(pMob))
@@ -601,7 +695,14 @@ static void VacuumTick(void* pMob)
 		return;
 	}
 
-	if (!TeleportMob(pMob, g_ptVacuum, g_pVacuumFoothold, g_nVacuumFootholdId))
+	// The foothold is resolved for the corrected point, not for the anchor: the mob is put back on the
+	// ground it is actually over, and the cached id is left alone unless that is the anchor's own
+	// foothold (see ResolveFootholdAt).
+	void* pFoothold = nullptr;
+	int nFootholdId = 0;
+	ResolveFootholdAt(ptTarget, pFoothold, nFootholdId);
+
+	if (!TeleportMob(pMob, ptTarget, pFoothold, nFootholdId))
 	{
 		++g_nRejected;
 
@@ -624,8 +725,8 @@ static void VacuumTick(void* pMob)
 	pPin->dwNextPull = dwNow + MOB_VACUUM_COOLDOWN_MS;
 	pPin->bPulledThisFrame = true;
 
-	*reinterpret_cast<POINT*>(pMobBytes + OFF_CMob_Pos) = g_ptVacuum;
-	*reinterpret_cast<POINT*>(pMobBytes + OFF_CMob_PosPrev) = g_ptVacuum;
+	*reinterpret_cast<POINT*>(pMobBytes + OFF_CMob_Pos) = ptTarget;
+	*reinterpret_cast<POINT*>(pMobBytes + OFF_CMob_PosPrev) = ptTarget;
 }
 
 // After the client's own update of the same frame - bookkeeping only, nothing is written here: where
@@ -673,7 +774,8 @@ static void DumpVacuumDiag()
 	GetPlayerPos(pUserLocal, ptPlayer);
 
 	std::cout << "[mobvac] " << (g_bActive ? "ON " : "off")
-		<< " point=(" << g_ptVacuum.x << "," << g_ptVacuum.y << ")"
+		<< " anchor=(" << g_ptVacuum.x << "," << g_ptVacuum.y << ")"
+		<< " leash=" << MOB_VACUUM_LEASH
 		<< " pc=(" << ptPlayer.x << "," << ptPlayer.y << ")"
 		<< " foothold=0x" << std::hex << g_pVacuumFoothold << std::dec
 		<< " id=" << g_nVacuumFootholdId
@@ -738,6 +840,12 @@ static DWORD WINAPI MobVacThread(LPVOID /*param*/)
 		{
 			g_bActive = false;   // not in field (login screen, cash shop, stage transition)
 			continue;
+		}
+
+		if (g_bActive)
+		{
+			// The leash centre follows the player while the vacuum is on (soft follow, see FollowPlayer).
+			FollowPlayer(pUser);
 		}
 
 		const HWND hForeground = GetForegroundWindow();
