@@ -65,6 +65,17 @@ static const int OFF_CUserLocal_Pos = 0x1170;
 // client keeps the motion the sprite follows.
 static const int OFF_CMob_VecCtrlRef = 0x50C;
 
+// CMob+0x118 holds the mob's CVecCtrl *as its IWzVector2D interface pointer* (the interface lives at
+// object+0x0C): CMob::Update reads it as `mov eax,[ebx+118h]` and then uses `eax-12` as the CVecCtrl*
+// for CVecCtrl::UpdatePassive. That object is what actually moves the mob - CMob+0x510 is only the
+// copy it refreshes, which is why writing +0x510 alone changes nothing on screen.
+static const int OFF_CMob_VecCtrlIf = 0x118;
+
+// IWzVector2D::raw_Move (0x009B5E7F) is CVecCtrl's own teleport: it writes x/y, zeroes the four
+// velocity doubles and (when a move path is attached) flags the path, so the mob stops where it is
+// put instead of continuing to walk. It hangs off the IWzVector2D vtable (0x00B3E1F8) as slot 19.
+static const int VTBL_INDEX_VEC_RAW_MOVE = 19;
+
 // Ctrl+0 toggles; the game itself does not bind that combination.
 static const int VK_TOGGLE_KEY = '0';
 
@@ -73,6 +84,10 @@ static const DWORD POLL_INTERVAL_MS = 15;
 
 typedef void(__thiscall* tCMobUpdate)(void* pThis);
 typedef void(__thiscall* tCUserLocalOnSetDead)(void* pThis, int bDead);
+typedef long(__stdcall* tVecRawMove)(void* pVecIf, long x, long y);
+
+// Distance (per axis, pixels) the mob may drift from the stored point before it is teleported again.
+static const int VACUUM_SLACK = 4;
 
 namespace MobVac { bool bDebug = false; }
 
@@ -126,6 +141,48 @@ static bool IsVacuumable(const void* pMob)
 	}
 
 	return *reinterpret_cast<const int*>(pTemplate + OFF_CMobTemplate_Boss) == 0;
+}
+
+static bool IsCodePointer(const void* p)
+{
+	const uintptr_t v = reinterpret_cast<uintptr_t>(p);
+	return v >= 0x00401000u && v < 0x00C00000u;
+}
+
+static bool IsDataPointer(const void* p)
+{
+	const uintptr_t v = reinterpret_cast<uintptr_t>(p);
+	return v >= 0x00AF0000u && v < 0x00C00000u;   // where the client keeps its vtables
+}
+
+// The mob's CVecCtrl, handed over as its IWzVector2D interface pointer.
+static void* GetVecCtrlIf(const void* pMob)
+{
+	return *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_VecCtrlIf);
+}
+
+// Teleport the mob through the vector controller - the object that really drives it.
+static bool MoveVecCtrl(void* pVecIf, POINT pt)
+{
+	if (pVecIf == nullptr)
+	{
+		return false;
+	}
+
+	void** ppVtbl = *reinterpret_cast<void***>(pVecIf);
+	if (ppVtbl == nullptr || !IsDataPointer(ppVtbl))
+	{
+		return false;
+	}
+
+	void* pRawMove = ppVtbl[VTBL_INDEX_VEC_RAW_MOVE];
+	if (!IsCodePointer(pRawMove))
+	{
+		return false;
+	}
+
+	reinterpret_cast<tVecRawMove>(pRawMove)(pVecIf, pt.x, pt.y);
+	return true;
 }
 
 static void ToggleVacuum(void* pUserLocal)
@@ -243,9 +300,25 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 	char* pMob = reinterpret_cast<char*>(pThis);
 	POINT* pLive = reinterpret_cast<POINT*>(pMob + OFF_CMob_Pos);
 	POINT* pPrev = reinterpret_cast<POINT*>(pMob + OFF_CMob_PosPrev);
+	void* pVecIf = GetVecCtrlIf(pThis);
 
-	// The "before" values matter: if a later frame still shows the wanted pair, the write sticks;
-	// if it shows the mob's own position again, something (the vector controller) rewrites it.
+	// The vector controller is what moves the mob and what the sprite follows; +0x510 is only the copy
+	// it refreshes every frame. Teleport it only once the mob has drifted off the point: raw_Move
+	// zeroes the velocity fields, so the mob then stays put - and the move path is not re-flagged
+	// every single frame.
+	const int nDx = pLive->x - g_ptVac.x;
+	const int nDy = pLive->y - g_ptVac.y;
+	const bool bOnPoint = nDx > -VACUUM_SLACK && nDx < VACUUM_SLACK && nDy > -VACUUM_SLACK && nDy < VACUUM_SLACK;
+	const bool bMoved = !bOnPoint && MoveVecCtrl(pVecIf, g_ptVac);
+
+	if (!bOnPoint)
+	{
+		*pLive = g_ptVac;
+		*pPrev = g_ptVac;
+	}
+
+	// What matters here is `moved`: if it stays 0 while the mob is off the point, the vector
+	// controller could not be reached (vecIf/vtbl are printed to see why).
 	if (MobVac::bDebug)
 	{
 		static DWORD s_dwNextLog = 0;
@@ -262,12 +335,12 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 				<< " prev=(" << pPrev->x << "," << pPrev->y << ")"
 				<< " want=(" << g_ptVac.x << "," << g_ptVac.y << ")"
 				<< " playerNow=(" << ptNow.x << "," << ptNow.y << ")"
-				<< " vecRef=0x" << std::hex << pVecRef << std::dec << std::endl;
+				<< " onPoint=" << bOnPoint << " moved=" << bMoved
+				<< " vecIf=0x" << std::hex << pVecIf
+				<< " vecVtbl=0x" << (pVecIf != nullptr ? *reinterpret_cast<void**>(pVecIf) : nullptr)
+				<< " vecRef=0x" << pVecRef << std::dec << std::endl;
 		}
 	}
-
-	*pLive = g_ptVac;
-	*pPrev = g_ptVac;
 }
 
 void Hook_MobVac(bool enable)
