@@ -149,20 +149,8 @@ static tCUserLocalOnSetDead g_origCUserLocalOnSetDead = nullptr;
 // The mobs this vacuum session has touched (they carry a STUN value we have to take back when the
 // vacuum ends). The list is only ever appended while the vacuum is on and is cleared whenever it
 // toggles; entries are validated before being written to, because a mob may have died meanwhile.
-static const int MAX_VAC_MOBS = 512;
-
-// One entry per mob this vacuum session touched. The layer's x/y is an offset from its origin (the
-// client never rewrites it for a stationary mob), so the original offset is recorded the first time
-// a mob is touched and put back verbatim when the vacuum ends.
-struct VacMob
-{
-	void* pMob;
-	long nOrigX;
-	long nOrigY;
-};
-
-static VacMob g_aVacMobs[MAX_VAC_MOBS];
-static int g_nVacMobs = 0;
+// No per-mob state is kept: the vacuum only ever writes the layer offset while it is on, and the
+// client re-bases that offset by itself as soon as the mob moves.
 
 static bool g_bEnabled = false;      // config.ini switch - the thread only starts when set
 static bool g_bActive = false;       // vacuum currently on (toggled by Ctrl+0)
@@ -231,44 +219,9 @@ static void* GetVecCtrlIf(const void* pMob)
 	return *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_VecCtrlIf);
 }
 
-// Is this still a live CMob we may write to? A mob that died while the vacuum was on would leave a
-// dangling pointer in the list, so the template pointer and its boss flag are checked first.
-static bool GetLayerPos(void* pLayer, long& x, long& y);
-static bool SetLayerPos(void* pLayer, long x, long y);
-
-static bool LooksLikeMob(const void* pMob)
-{
-	const char* pTemplate = *reinterpret_cast<const char* const*>(
-		reinterpret_cast<const char*>(pMob) + OFF_CMob_Template);
-
-	const uintptr_t t = reinterpret_cast<uintptr_t>(pTemplate);
-	if (t < 0x00010000u || t > 0x7FFFFFFFu)
-	{
-		return false;
-	}
-
-	const int nBoss = *reinterpret_cast<const int*>(pTemplate + OFF_CMobTemplate_Boss);
-	return nBoss == 0 || nBoss == 1;
-}
-
-static void ForgetVacuumMobs()
-{
-	// Hand every touched mob its own layer offset back. Skipped for entries that no longer look like
-	// a live mob (the pointer may be a recycled block by now).
-	for (int i = 0; i < g_nVacMobs; ++i)
-	{
-		if (!LooksLikeMob(g_aVacMobs[i].pMob))
-		{
-			continue;
-		}
-
-		void* pLayer = *reinterpret_cast<void* const*>(
-			reinterpret_cast<const char*>(g_aVacMobs[i].pMob) + OFF_CMob_Layer);
-		SetLayerPos(pLayer, g_aVacMobs[i].nOrigX, g_aVacMobs[i].nOrigY);
-	}
-
-	g_nVacMobs = 0;
-}
+// Nothing is written back when the vacuum ends: the client re-bases a layer's offset on its own once
+// the mob moves, and tracking the mobs to "restore" them would mean writing through pointers that
+// may already have been recycled. The vacuum only ever moves the sprite while it is on.
 
 // Teleport the mob through the vector controller - the object that really drives it.
 //
@@ -400,8 +353,6 @@ static bool ShiftMobLayer(const void* pMob, POINT ptMob, POINT ptWant)
 
 static void ToggleVacuum(void* pUserLocal)
 {
-	ForgetVacuumMobs();
-
 	if (g_bActive)
 	{
 		g_bActive = false;
@@ -502,38 +453,7 @@ static void __fastcall CUserLocal_OnSetDead_Hook(void* pThis, void* /*edx*/, int
 	g_origCUserLocalOnSetDead(pThis, bDead);
 }
 
-// First touch of a mob in this session: remember its layer offset so the vacuum can hand it back.
-static void RememberVacuumMob(void* pMob)
-{
-	for (int i = 0; i < g_nVacMobs; ++i)
-	{
-		if (g_aVacMobs[i].pMob == pMob)
-		{
-			return;
-		}
-	}
-
-	if (g_nVacMobs >= MAX_VAC_MOBS)
-	{
-		return;
-	}
-
-	VacMob& entry = g_aVacMobs[g_nVacMobs];
-	entry.pMob = pMob;
-	entry.nOrigX = 0;
-	entry.nOrigY = 0;
-
-	void* pLayer = *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_Layer);
-	long lx = 0;
-	long ly = 0;
-	if (GetLayerPos(pLayer, lx, ly))
-	{
-		entry.nOrigX = lx;
-		entry.nOrigY = ly;
-	}
-
-	++g_nVacMobs;
-}
+// First touch of a mob in this session: nothing to record (no state is written back).
 
 // Every mob, every frame: re-apply the stored point after the client's own update.
 static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
@@ -548,7 +468,6 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 	}
 
 	char* pMob = reinterpret_cast<char*>(pThis);
-	RememberVacuumMob(pThis);
 
 	// Where the mob really is (the client refreshes this from the vector controller every frame) and
 	// the point the player asked for. Only the sprite layer is moved - the mob's own coordinates, its
