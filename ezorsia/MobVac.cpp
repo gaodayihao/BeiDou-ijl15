@@ -48,18 +48,13 @@ static const DWORD ADDR_CUserLocal_OnSetDead = 0x0095AF4E;    // first bytes 83 
 static const DWORD ADDR_UserLocal_Instance = 0x00BEBF98;      // TSingleton<CUserLocal>::ms_pInstance
 static const DWORD ADDR_FieldCarrier = 0x00BEDED4;            // ZRef carrier; CField* at +4
 
-// The mob's own motion, which would put it back on its move path right after we teleport it:
-// CMob::Update calls CVecCtrl::UpdatePassive (0x006684E8 -> 0x009B16E8) and the controller-driven
-// integration runs through CVecCtrl::UpdateActive (0x009B1928 -> CVecCtrlMob::WorkUpdateActive
-// 0x009BCA2A). While a mob is being vacuumed both are skipped, so the position we set is the one
-// the frame renders - the sprite follows the vector controller lazily, which is exactly why the
-// teleport flashes for one frame before the mob walks back.
-static const DWORD ADDR_CVecCtrl_UpdateActive = 0x009B1928;   // void CVecCtrl::UpdateActive(void)
-static const DWORD ADDR_CVecCtrl_UpdatePassive = 0x009B16E8;  // __int64 CVecCtrl::UpdatePassive(const long*, const long*)
-
-// The vector controller's IWzVector2D interface sits at object+0x0C, which is also what CMob+0x118
-// stores - so "is this vecctrl one of the mobs we are vacuuming?" is a pointer comparison.
-static const int OFF_VecObject_Interface = 0x0C;
+// While a mob is vacuumed its own movement is what walks it back onto the path we pulled it off, so
+// it is put into the client's own "cannot act" state instead of hooking any of the movement code:
+// +0x234 is the STUN value slot, which both the movement logic and CMob::DoAttack (0x0066D9C0)
+// test - a mob with a non-zero slot does not move and does not attack. It is a plain data write, so
+// it cannot break the client's calling conventions the way a hook on a hot vector-controller entry
+// can (that route crashed the client during map load and was removed).
+static const int OFF_CMob_StunValue = 0x234;
 
 // Offsets inside CMob (relative to the CMob object itself, not to its CLife subobject).
 static const int OFF_CMob_Template = 0x188;
@@ -105,8 +100,6 @@ static const DWORD POLL_INTERVAL_MS = 15;
 typedef void(__thiscall* tCMobUpdate)(void* pThis);
 typedef void(__thiscall* tCUserLocalOnSetDead)(void* pThis, int bDead);
 typedef long(__stdcall* tVecRawMove)(void* pVecIf, long x, long y);
-typedef void(__thiscall* tVecUpdateActive)(void* pVec);
-typedef long long(__thiscall* tVecUpdatePassive)(void* pVec, const long* pA, const long* pB);
 
 // Distance (per axis, pixels) the mob may drift from the stored point before it is teleported again.
 static const int VACUUM_SLACK = 4;
@@ -115,12 +108,10 @@ namespace MobVac { bool bDebug = false; }
 
 static tCMobUpdate g_origCMobUpdate = nullptr;
 static tCUserLocalOnSetDead g_origCUserLocalOnSetDead = nullptr;
-static tVecUpdateActive g_origVecUpdateActive = nullptr;
-static tVecUpdatePassive g_origVecUpdatePassive = nullptr;
 
-// The mobs currently being vacuumed, so the vecctrl hooks can tell their controllers apart from
-// everybody else's (players, pets, summons). Both sides run on the client's own thread, so a plain
-// array is enough; entries are only added while the vacuum is on and cleared whenever it toggles.
+// The mobs this vacuum session has touched (they carry a STUN value we have to take back when the
+// vacuum ends). The list is only ever appended while the vacuum is on and is cleared whenever it
+// toggles; entries are validated before being written to, because a mob may have died meanwhile.
 static const int MAX_VAC_MOBS = 512;
 static void* g_apVacMobs[MAX_VAC_MOBS];
 static int g_nVacMobs = 0;
@@ -192,47 +183,39 @@ static void* GetVecCtrlIf(const void* pMob)
 	return *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_VecCtrlIf);
 }
 
-// Remember a mob for this vacuum session (deduplicated: the mob hook visits every mob every frame).
-static void RememberVacuumMob(void* pMob)
+// Is this still a live CMob we may write to? A mob that died while the vacuum was on would leave a
+// dangling pointer in the list, so the template pointer and its boss flag are checked first.
+static bool LooksLikeMob(const void* pMob)
 {
-	for (int i = 0; i < g_nVacMobs; ++i)
-	{
-		if (g_apVacMobs[i] == pMob)
-		{
-			return;
-		}
-	}
+	const char* pTemplate = *reinterpret_cast<const char* const*>(
+		reinterpret_cast<const char*>(pMob) + OFF_CMob_Template);
 
-	if (g_nVacMobs < MAX_VAC_MOBS)
-	{
-		g_apVacMobs[g_nVacMobs++] = pMob;
-	}
-}
-
-static void ForgetVacuumMobs()
-{
-	g_nVacMobs = 0;
-}
-
-// Is this vector controller one of the mobs we are pulling? `pVec` is the CVecCtrl* the client
-// passes around; CMob+0x118 holds the same object's interface pointer (object+0x0C).
-static bool IsVacuumedVecCtrl(const void* pVec)
-{
-	if (!g_bActive || pVec == nullptr)
+	const uintptr_t t = reinterpret_cast<uintptr_t>(pTemplate);
+	if (t < 0x00010000u || t > 0x7FFFFFFFu)
 	{
 		return false;
 	}
 
-	const void* pIf = reinterpret_cast<const char*>(pVec) + OFF_VecObject_Interface;
+	const int nBoss = *reinterpret_cast<const int*>(pTemplate + OFF_CMobTemplate_Boss);
+	return nBoss == 0 || nBoss == 1;
+}
+
+static void ForgetVacuumMobs()
+{
+	// Hand the mobs back their own state: the STUN value we set is ours, not the game's.
 	for (int i = 0; i < g_nVacMobs; ++i)
 	{
-		if (GetVecCtrlIf(g_apVacMobs[i]) == pIf)
+		if (LooksLikeMob(g_apVacMobs[i]))
 		{
-			return true;
+			char* pMob = reinterpret_cast<char*>(g_apVacMobs[i]);
+			if (*reinterpret_cast<int*>(pMob + OFF_CMob_StunValue) == 1)
+			{
+				*reinterpret_cast<int*>(pMob + OFF_CMob_StunValue) = 0;
+			}
 		}
 	}
 
-	return false;
+	g_nVacMobs = 0;
 }
 
 // Teleport the mob through the vector controller - the object that really drives it.
@@ -382,26 +365,23 @@ static void __fastcall CUserLocal_OnSetDead_Hook(void* pThis, void* /*edx*/, int
 	g_origCUserLocalOnSetDead(pThis, bDead);
 }
 
-// The vacuumed mobs must not integrate their own motion, or they walk straight back onto the move
-// path we pulled them off. Everybody else's vector controller goes through untouched.
-static void __fastcall VecCtrl_UpdateActive_Hook(void* pThis, void* /*edx*/)
+// The vacuumed mobs walk straight back onto the path they were pulled off, so they are put into the
+// client's own "cannot act" state (see OFF_CMob_StunValue) instead of hooking movement code.
+// Everybody else goes through untouched.
+static void RememberVacuumMob(void* pMob)
 {
-	if (IsVacuumedVecCtrl(pThis))
+	for (int i = 0; i < g_nVacMobs; ++i)
 	{
-		return;
+		if (g_apVacMobs[i] == pMob)
+		{
+			return;
+		}
 	}
 
-	g_origVecUpdateActive(pThis);
-}
-
-static long long __fastcall VecCtrl_UpdatePassive_Hook(void* pThis, void* /*edx*/, const long* pA, const long* pB)
-{
-	if (IsVacuumedVecCtrl(pThis))
+	if (g_nVacMobs < MAX_VAC_MOBS)
 	{
-		return 0;
+		g_apVacMobs[g_nVacMobs++] = pMob;
 	}
-
-	return g_origVecUpdatePassive(pThis, pA, pB);
 }
 
 // Every mob, every frame: re-apply the stored point after the client's own update.
@@ -416,9 +396,13 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 		return;
 	}
 
+	char* pMob = reinterpret_cast<char*>(pThis);
 	RememberVacuumMob(pThis);
 
-	char* pMob = reinterpret_cast<char*>(pThis);
+	// The client's own "this mob cannot act" state: it stops the mob walking back onto its path and
+	// keeps the pile from hitting the player. Handed back when the vacuum ends.
+	*reinterpret_cast<int*>(pMob + OFF_CMob_StunValue) = 1;
+
 	POINT* pLive = reinterpret_cast<POINT*>(pMob + OFF_CMob_Pos);
 	POINT* pPrev = reinterpret_cast<POINT*>(pMob + OFF_CMob_PosPrev);
 	void* pVecIf = GetVecCtrlIf(pThis);
@@ -486,47 +470,33 @@ void Hook_MobVac(bool enable)
 
 	// Sanity checks: every entry point we hook must look like this client build. CUserLocal::Update is
 	// deliberately not among them - BossHP owns that entry (see the header).
-	const bool bVecPrologue =
-		*reinterpret_cast<unsigned char*>(ADDR_CVecCtrl_UpdateActive) == 0x56
-		&& *reinterpret_cast<unsigned char*>(ADDR_CVecCtrl_UpdatePassive) == 0x56;
-
 	if (*reinterpret_cast<unsigned char*>(ADDR_CMob_Update) != 0xB8
-		|| *reinterpret_cast<unsigned char*>(ADDR_CUserLocal_OnSetDead) != 0x83
-		|| !bVecPrologue)
+		|| *reinterpret_cast<unsigned char*>(ADDR_CUserLocal_OnSetDead) != 0x83)
 	{
 		std::cout << "mob vacuum skipped: unexpected client build (CMob::Update=" << std::hex
 			<< static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CMob_Update))
 			<< " OnSetDead=" << static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CUserLocal_OnSetDead))
-			<< " vecActive=" << static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CVecCtrl_UpdateActive))
-			<< " vecPassive=" << static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CVecCtrl_UpdatePassive))
 			<< std::dec << ")" << std::endl;
 		return;
 	}
 
 	g_origCMobUpdate = reinterpret_cast<tCMobUpdate>(ADDR_CMob_Update);
 	g_origCUserLocalOnSetDead = reinterpret_cast<tCUserLocalOnSetDead>(ADDR_CUserLocal_OnSetDead);
-	g_origVecUpdateActive = reinterpret_cast<tVecUpdateActive>(ADDR_CVecCtrl_UpdateActive);
-	g_origVecUpdatePassive = reinterpret_cast<tVecUpdatePassive>(ADDR_CVecCtrl_UpdatePassive);
 
 	const bool bMobHook = Memory::SetHook(true, reinterpret_cast<void**>(&g_origCMobUpdate),
 		reinterpret_cast<void*>(&CMob_Update_Hook));
 	const bool bDeathHook = Memory::SetHook(true, reinterpret_cast<void**>(&g_origCUserLocalOnSetDead),
 		reinterpret_cast<void*>(&CUserLocal_OnSetDead_Hook));
-	const bool bVecActiveHook = Memory::SetHook(true, reinterpret_cast<void**>(&g_origVecUpdateActive),
-		reinterpret_cast<void*>(&VecCtrl_UpdateActive_Hook));
-	const bool bVecPassiveHook = Memory::SetHook(true, reinterpret_cast<void**>(&g_origVecUpdatePassive),
-		reinterpret_cast<void*>(&VecCtrl_UpdatePassive_Hook));
 
 	const HANDLE hThread = CreateThread(nullptr, 0, &MobVacThread, nullptr, 0, nullptr);
 
-	if (bMobHook && bDeathHook && bVecActiveHook && bVecPassiveHook && hThread != nullptr)
+	if (bMobHook && bDeathHook && hThread != nullptr)
 	{
 		std::cout << "mob vacuum hook created (Ctrl+0 toggles)" << std::endl;
 	}
 	else
 	{
 		std::cout << "mob vacuum hook FAILED (mob=" << bMobHook << " death=" << bDeathHook
-			<< " vecActive=" << bVecActiveHook << " vecPassive=" << bVecPassiveHook
 			<< " thread=" << (hThread != nullptr) << ")" << std::endl;
 	}
 }
