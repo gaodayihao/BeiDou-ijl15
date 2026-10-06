@@ -2,13 +2,15 @@
 
 // Mob vacuum - Ctrl+0 in game toggles it.
 //
-// While it is on, every non-boss mob the client knows about is held inside a leash around the point
-// the player stood on when the vacuum was switched on - and that point does not move afterwards. A mob
-// inside the leash is not touched at all, so it walks, attacks and animates normally; a mob that has
-// really left it is brought back onto the point, and no mob is moved twice within a second or so,
-// because each placement re-seeds the mob's move path and a mob moved every frame is frozen: unable to
-// move, to attack or to be hit. Mobs that spawn later join on their own - hooking CMob::Update covers
-// the whole pool, not a snapshot.
+// While it is on, every non-boss mob the client knows about is held on the point the player stood on
+// when the vacuum was switched on, and that point does not move afterwards. A mob the vacuum has
+// reached is pinned by the client's own stun value slot (CMob+0x234): stunned mobs neither walk nor
+// attack, so they cannot leave the point - and unlike clearing their move path, the sprite layer is
+// left alone, so they are drawn normally there. A mob that got away anyway (a fresh spawn, or one
+// whose stun the server overwrote) is pulled back onto the point, at most once per mob per 400ms,
+// because each pull re-seeds the mob's move path. Switching the vacuum off clears the stun again.
+// Mobs that spawn later join on their own - hooking CMob::Update covers the whole pool, not a
+// snapshot.
 //
 // Why the client can do this at all: in v83 the client owns mob movement. The client that controls
 // a mob generates its move path and reports it through MOVE_LIFE (0xBC); the server only checks that

@@ -59,17 +59,17 @@
 // on the same entry would have to chain through the first one's trampoline. Polling from our own
 // thread keeps this module out of the client's update chain entirely - it only reads globals.
 //
-// The correction runs BEFORE the client's own per-mob update, so that every decision that update makes
-// about this mob - attack range, skill choice, and the move path it reports to the server - is made
-// with the mob already on the point. It is applied only to a mob that has left the leash around the
-// point, and never more often than MOB_VACUUM_COOLDOWN_MS per mob: each placement re-seeds the mob's
-// move path, so a mob moved every frame cannot move, attack, or be hit.
+// The pull runs BEFORE the client's own per-mob update, so that every decision that update makes about
+// this mob - attack range, skill choice, and the move path it reports to the server - is made with the
+// mob already on the point. A mob that is on the point is then HELD there by the client's own stun
+// value slot (CMob+0x234): a stunned mob neither walks nor attacks, so it cannot leave the point and
+// there is nothing left to correct - which is what makes the vacuum calm. Pulling alone cannot do that
+// (a mob walks out, gets pulled back, walks out again: that is the snapping this module used to show),
+// so the pull is only the net for a mob that escaped anyway, rate limited per mob by
+// MOB_VACUUM_COOLDOWN_MS because each pull re-seeds the mob's move path.
 //
 // The point is the player's position at the moment the vacuum was switched on, and it does not follow
-// them. That is what the leash is for: a mob is left completely alone while it stays inside it, so the
-// mobs keep walking, attacking and animating; only a mob that has really left is brought back, which
-// is a jump by definition - hence the wide leash and the long cooldown, which are what keep those
-// jumps rare (and absent entirely while the player fights from the point itself).
+// them. The stun is cleared again for every mob this module stunned as soon as the vacuum is off.
 // ---------------------------------------------------------------------------------------------
 
 static const DWORD ADDR_CMob_Update = 0x006675A8;             // first byte B8
@@ -78,6 +78,7 @@ static const DWORD ADDR_CVecCtrlMob_SetActive = 0x009BBD3D;   // first bytes 55 
 static const DWORD ADDR_GetFootholdClosest = 0x00A45677;      // first bytes 55 8B EC 51
 static const DWORD ADDR_GetFoothold = 0x0050D811;             // first byte B8 (id -> foothold)
 static const DWORD ADDR_CMob_SetChaseTarget = 0x0066B562;     // first bytes 56 8B F1
+static const DWORD ADDR_CMob_SetActive = 0x006637EC;          // first bytes 53 56 57
 static const DWORD ADDR_PhysicalSpace = 0x00BEBFA0;           // CWvsPhysicalSpace2D* (global)
 static const DWORD ADDR_UserLocal_Instance = 0x00BEBF98;      // TSingleton<CUserLocal>::ms_pInstance
 static const DWORD ADDR_FieldCarrier = 0x00BEDED4;            // ZRef carrier; CField* at +4
@@ -124,17 +125,24 @@ static const int VK_TOGGLE_KEY_PAD = VK_NUMPAD0;
 // How often the vacuum thread looks at the keyboard, in milliseconds.
 static const DWORD POLL_INTERVAL_MS = 15;
 
-// The leash: how far (per axis, pixels) a mob may get from the point before it is brought back onto it.
-// Mobiles inside the leash are not touched at all, so the mobs' own walking, attacks and animations run
-// undisturbed; the leash is what decides how much of that freedom they get before the vacuum re-gathers
-// them. Wide on purpose - a re-gather is a jump by definition, so the point is to need as few as
-// possible, and a mob swinging around the point is not worth one.
-static const int MOB_VACUUM_LEASH = 300;
+// The leash: how far (per axis, pixels) a mob may get from the point before the vacuum pulls it back.
+// Small, because the stun below is what holds the mobs: this is only the net that catches a mob that
+// somehow got away (one that was just gathered and has not been stunned yet, or one whose stun the
+// server overwrote).
+static const int MOB_VACUUM_LEASH = 60;
 
-// The shortest interval between two placements of the same mob. Even a re-gather re-seeds the
-// controller's move path, so a mob moved every frame never finishes a movement - it cannot act, and
-// the action rectangle CMob::GetHitPoint builds never appears (so it cannot be hit either).
-static const DWORD MOB_VACUUM_COOLDOWN_MS = 1200;
+// The shortest interval between two pulls of the same mob - only a mob that escaped is pulled at all.
+// Even a pull re-seeds the controller's move path, so a mob moved every frame cannot act; this keeps
+// the pulls (each of which is a position jump) rare.
+static const DWORD MOB_VACUUM_COOLDOWN_MS = 400;
+
+// CMob+0x234: the stun value slot. A mob with a non-zero value here neither walks nor attacks - the
+// client's own movement checks and CMob::DoAttack read it - so it stays exactly where the vacuum put
+// it, which is what "the mobs cannot leave the point" means (and unlike clearing the move path, it
+// leaves the sprite layer alone: a stunned mob is drawn normally and can still be attacked). Written
+// every frame while the vacuum is on, and cleared again once it is switched off.
+static const int OFF_CMob_Stun = 0x234;
+static const int STUN_VALUE = 1;
 
 // The per-mob diagnostics are sampled at most this often, and a pin that has not been ticked for
 // MOB_PIN_TTL_MS counts as gone. Both matter for safety: a mob that leaves the field has its CMob
@@ -151,6 +159,7 @@ typedef void*(__thiscall* tGetFootholdClosest)(void* pSpace, int x, int y);
 typedef void*(__thiscall* tGetFoothold)(void* pSpace, int footholdId);
 typedef long(__stdcall* tVecGetAxis)(void* pVecIf, long* pOut);
 typedef void(__thiscall* tCMobSetChaseTarget)(void* pMob, int bEnable, void* pTargetOwner, int nFlags);
+typedef void(__thiscall* tCMobSetActive)(void* pMob, int bActive);
 
 // IWzVector2D slots on the *interface* table (the one [mob+0x118] points into).
 static const int VTBL_INDEX_VEC_GET_X = 8;
@@ -189,6 +198,7 @@ struct MobPin
 {
 	void* pMob;
 	bool bPulledThisFrame;
+	bool bStunned;       // this module set CMob+0x234 for it and still has to clear it
 	bool bC1Ok;
 	bool bC2Ok;
 	DWORD dwNextPull;    // GetTickCount floor: this mob may not be pulled before it
@@ -204,10 +214,30 @@ struct MobPin
 	POINT ptCache;       // controller #1's acknowledged-point cache (sampled)
 	void* pFoothold1;    // controller #1's bound foothold (sampled) - has to match the cached id
 	int nCacheFhId;      // that cache's foothold id (sampled): a mismatch loses the mob off the map
+	int nStun;           // CMob+0x234 as the client sees it (sampled): non-zero while held
 };
 
 static const int MOB_PIN_SLOTS = 48;
 static MobPin g_pins[MOB_PIN_SLOTS] = {};
+
+// Set once the vacuum has been switched off: the stun a mob carries has to be cleared again, and the
+// only safe moment to touch a mob is while the client is ticking it (see CMob_Update_Hook).
+static bool g_bReleasing = false;
+
+// Look up a mob's entry without ever creating one - the release path runs for every mob in the pool
+// and must not fill the table with mobs this module never touched.
+static MobPin* FindPin(void* pMob)
+{
+	for (int i = 0; i < MOB_PIN_SLOTS; ++i)
+	{
+		if (g_pins[i].pMob == pMob)
+		{
+			return &g_pins[i];
+		}
+	}
+
+	return nullptr;
+}
 
 static MobPin* PinFor(void* pMob)
 {
@@ -455,6 +485,17 @@ static bool TeleportMob(void* pMob, POINT pt, void* pFoothold, int nFootholdId)
 			reinterpret_cast<char*>(pUserLocal) + 4, 0);
 	}
 
+	// The server has to hear about the new position, and the client's own way of saying it is the state
+	// CMob::SetActive(1) leaves behind: the tail of CMob::Update flushes the move path - i.e. sends the
+	// C->S 0xBC - whenever that state is 3. Calling it on a mob that is already active does nothing
+	// (it early-outs on the controller's own active flag), so the deactivate/activate pair is how the
+	// client itself re-seeds a mob it was told about: (0) drops controller #2, (1) puts it back on the
+	// point from the acknowledged-point cache we just wrote. Without this a stunned mob would never
+	// report anything again - a stunned mob generates no move paths - and the server would keep the
+	// position it had before the pull.
+	reinterpret_cast<tCMobSetActive>(ADDR_CMob_SetActive)(pMob, 0);
+	reinterpret_cast<tCMobSetActive>(ADDR_CMob_SetActive)(pMob, 1);
+
 	return true;
 }
 
@@ -514,6 +555,16 @@ static void ToggleVacuum(void* pUserLocal)
 
 	g_bActive = !g_bActive;
 
+	if (g_bActive)
+	{
+		g_bReleasing = false;   // a fresh session: nothing is waiting to be let go
+	}
+	else
+	{
+		// The mobs this module stunned have to be let go again (see ReleaseStun).
+		g_bReleasing = true;
+	}
+
 	if (MobVac::bDebug)
 	{
 		std::cout << "[mobvac] " << (g_bActive ? "ON" : "OFF");
@@ -569,6 +620,7 @@ static void SampleMob(MobPin* pPin, void* pMob, DWORD dwNow)
 	pPin->ptCache = POINT{ 0, 0 };
 	pPin->pFoothold1 = nullptr;
 	pPin->nCacheFhId = 0;
+	pPin->nStun = *reinterpret_cast<const int*>(pMobBytes + OFF_CMob_Stun);
 	if (pC1If != nullptr)
 	{
 		const char* pC1 = reinterpret_cast<const char*>(pC1If) - OFF_VecObject_Interface;
@@ -579,11 +631,48 @@ static void SampleMob(MobPin* pPin, void* pMob, DWORD dwNow)
 	}
 }
 
+// Hold a mob on the point by the client's own means: the stun value slot. A stunned mob neither walks
+// nor attacks, so it stays where the vacuum put it instead of drifting off and being pulled back -
+// walking out and being yanked back is exactly what made the mobs snap back and forth. Written every
+// frame, because a status packet from the server can overwrite it.
+static void StunMob(MobPin* pPin, void* pMob)
+{
+	*reinterpret_cast<int*>(reinterpret_cast<char*>(pMob) + OFF_CMob_Stun) = STUN_VALUE;
+	pPin->bStunned = true;
+}
+
+// Clear the stun of a mob this module stunned, once the vacuum is off. Runs from the same hook, so the
+// mob is alive by construction, and only touches entries this module set.
+static void ReleaseStun(void* pMob)
+{
+	if (!g_bReleasing)
+	{
+		return;
+	}
+
+	MobPin* pPin = FindPin(pMob);
+	if (pPin == nullptr || !pPin->bStunned)
+	{
+		return;
+	}
+
+	if (GetTickCount() - pPin->dwLastSeen > MOB_PIN_TTL_MS)
+	{
+		// Not a mob this module stunned: the entry outlived its mob and the address is a new occupant
+		// (the same recycling that made a stale pointer crash the diagnostics, see MOB_PIN_TTL_MS).
+		pPin->bStunned = false;
+		return;
+	}
+
+	*reinterpret_cast<int*>(reinterpret_cast<char*>(pMob) + OFF_CMob_Stun) = 0;
+	pPin->bStunned = false;
+}
+
 // The per-frame vacuum step, run BEFORE the client's own update of the mob (see the file header): a mob
-// that has left the leash is brought back onto the point - with the client's own position copies moved
-// along, so everything that reads them in this frame (attack range, the hit rectangle, the drawn frame)
-// sees the mob there - while a mob inside the leash is not touched at all, and a mob moved less than
-// MOB_VACUUM_COOLDOWN_MS ago is left to walk.
+// on the point is stunned there and left alone, a mob that has left the leash is pulled back onto the
+// point - with the client's own position copies moved along, so everything that reads them in this
+// frame (attack range, the hit rectangle, the drawn frame) sees the mob there - and a mob pulled less
+// than MOB_VACUUM_COOLDOWN_MS ago is left to walk.
 static void VacuumTick(void* pMob)
 {
 	const DWORD dwNow = GetTickCount();
@@ -597,7 +686,13 @@ static void VacuumTick(void* pMob)
 	if (AbsDiff(pPin->ptPre.x, g_ptVacuum.x) <= MOB_VACUUM_LEASH
 		&& AbsDiff(pPin->ptPre.y, g_ptVacuum.y) <= MOB_VACUUM_LEASH)
 	{
-		return;   // inside the leash: nothing to do for this mob this frame
+		// On the point already: hold it there and touch nothing else about it.
+		if (IsLocallyActive(pMob))
+		{
+			StunMob(pPin, pMob);
+		}
+
+		return;
 	}
 
 	if (!IsLocallyActive(pMob))
@@ -642,6 +737,8 @@ static void VacuumTick(void* pMob)
 
 	*reinterpret_cast<POINT*>(pMobBytes + OFF_CMob_Pos) = g_ptVacuum;
 	*reinterpret_cast<POINT*>(pMobBytes + OFF_CMob_PosPrev) = g_ptVacuum;
+
+	StunMob(pPin, pMob);   // and keep it there: the pull only decides where it stops
 }
 
 // After the client's own update of the same frame - bookkeeping only, nothing is written here: where
@@ -726,6 +823,7 @@ static void DumpVacuumDiag()
 			<< " cache1=(" << pin.ptCache.x << "," << pin.ptCache.y << ")"
 			<< " fh1=0x" << std::hex << pin.pFoothold1 << std::dec
 			<< " fhId=" << pin.nCacheFhId
+			<< " stun=" << pin.nStun
 			<< std::endl;
 	}
 }
@@ -799,6 +897,7 @@ static DWORD WINAPI MobVacThread(LPVOID /*param*/)
 static void __fastcall CUserLocal_OnSetDead_Hook(void* pThis, void* /*edx*/, int bDead)
 {
 	g_bActive = false;
+	g_bReleasing = true;   // the stunned mobs are still in the field: let them go
 	g_origCUserLocalOnSetDead(pThis, bDead);
 }
 
@@ -813,11 +912,16 @@ static void __fastcall CUserLocal_OnSetDead_Hook(void* pThis, void* /*edx*/, int
 // single frame and the mob would never get to act at all (see MOB_VACUUM_COOLDOWN_MS).
 static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 {
-	const bool bHandled = pThis != nullptr && g_bActive && IsVacuumable(pThis);
+	const bool bMob = pThis != nullptr && IsVacuumable(pThis);
+	const bool bHandled = bMob && g_bActive;
 
 	if (bHandled)
 	{
 		VacuumTick(pThis);
+	}
+	else if (bMob)
+	{
+		ReleaseStun(pThis);   // no-op unless the vacuum has been switched off
 	}
 
 	g_origCMobUpdate(pThis);
@@ -859,7 +963,10 @@ void Hook_MobVac(bool enable)
 		|| *reinterpret_cast<unsigned char*>(ADDR_GetFoothold) != 0xB8
 		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetChaseTarget) != 0x56
 		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetChaseTarget + 1) != 0x8B
-		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetChaseTarget + 2) != 0xF1)
+		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetChaseTarget + 2) != 0xF1
+		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetActive) != 0x53
+		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetActive + 1) != 0x56
+		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetActive + 2) != 0x57)
 	{
 		std::cout << "mob vacuum skipped: unexpected client build (CMob::Update=" << std::hex
 			<< static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CMob_Update))
