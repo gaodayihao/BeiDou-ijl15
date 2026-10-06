@@ -73,10 +73,14 @@ static const int OFF_CMob_VecCtrlIf = 0x118;
 
 // IWzVector2D::raw_Move (0x009B5E7F) is CVecCtrl's own teleport: it writes x/y, zeroes the four
 // velocity doubles and (when a move path is attached) rebuilds it through SetMovePathAttribute, so
-// the mob stops where it is put instead of continuing to walk. It hangs off the IWzVector2D vtable
-// (0x00B3E1F8) as slot 19 - and CVecCtrl's subclasses carry their own copies of that table, so the
-// gate below checks the FUNCTION, not the table address.
-static const int VTBL_INDEX_VEC_RAW_MOVE = 19;
+// the mob stops where it is put instead of continuing to walk.
+//
+// Slot index: the interface vtable starts at QueryInterface, so its layout is 0=QueryInterface,
+// 1=AddRef, 2=Release, ... 8=get_x, 9=put_x, 10=get_y, 11=put_y, 12..15=get/put_x2/y2,
+// **16 = raw_Move (+0x40)**, 17=raw_Offset, 18=raw_Scale, 19=raw_Insert, 20=raw_Remove,
+// 21=raw_Init. (Taking the table 12 bytes early - at QueryInterface-3 - shifts every index up by
+// three and lands on raw_Insert, which inserts a VARIANT and corrupts the heap.)
+static const int VTBL_INDEX_VEC_RAW_MOVE = 16;
 static const DWORD ADDR_VecCtrl_raw_Move = 0x009B5E7F;
 
 // Ctrl+0 toggles; the game itself does not bind that combination.
@@ -332,8 +336,9 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 	// it refreshes every frame. Teleport it only once the mob has drifted off the point: raw_Move
 	// zeroes the velocity fields, so the mob then stays put - and the move path is not rebuilt
 	// every single frame.
-	const int nDx = pLive->x - g_ptVac.x;
-	const int nDy = pLive->y - g_ptVac.y;
+	const POINT ptBefore = *pLive;   // before our write: what the client left this frame
+	const int nDx = ptBefore.x - g_ptVac.x;
+	const int nDy = ptBefore.y - g_ptVac.y;
 	const bool bOnPoint = nDx > -VACUUM_SLACK && nDx < VACUUM_SLACK && nDy > -VACUUM_SLACK && nDy < VACUUM_SLACK;
 
 	bool bMoved = false;
@@ -363,8 +368,8 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 			POINT ptNow = { 0, 0 };
 			GetPlayerPos(const_cast<void*>(pUser), ptNow);
 			std::cout << "[mobvac] mob 0x" << std::hex << pThis << std::dec
-				<< " live=(" << pLive->x << "," << pLive->y << ")"
-				<< " prev=(" << pPrev->x << "," << pPrev->y << ")"
+				<< " liveBefore=(" << ptBefore.x << "," << ptBefore.y << ")"
+				<< " liveNow=(" << pLive->x << "," << pLive->y << ")"
 				<< " want=(" << g_ptVac.x << "," << g_ptVac.y << ")"
 				<< " playerNow=(" << ptNow.x << "," << ptNow.y << ")"
 				<< " onPoint=" << bOnPoint << " moved=" << bMoved
