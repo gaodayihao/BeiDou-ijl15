@@ -198,7 +198,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		PetAutoBuff::Hook();  // pet auto-buff refresh: re-cast them when they run out
 		PetBuffConfig::Hook(); // pet auto-buff configuration: save to / load from the server (0x1001)
 		Hook_ManaReflectLevelFix(manaReflectFix); // fix: Mana Reflection level row for I/L + Bishop mages
-		Hook_MobVac(mobVac); // mob vacuum: Ctrl+0 pulls every non-boss mob to the point you pressed it on
+		Hook_MobVac(mobVac); // mob vacuum: Ctrl+0 keeps every non-boss mob on you (Ctrl+0 again stops it)
 		Client::WorldMap();
 		Client::RefreshRate(); 
 		Client::DeleteChar();

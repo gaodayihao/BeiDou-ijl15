@@ -11,160 +11,155 @@
 //     (slot 10 = 0x00AF8270), i.e. once per frame for every mob in the pool - hooking its entry
 //     covers the whole pool, including mobs that spawn later, with no pool walk of our own.
 //
-//   * The mob's live position is CMob+0x510 ({x,y}): the CLife interface subobject sits at CMob+4
-//     and CMob::GetPos (0x006625A0, vtable slot 5) is `lea eax,[ecx+50Ch]`. CMob+0x518 is the
-//     previous-position copy: CMob::Init (0x00662884) seeds +0x518/+0x51C from the spawn packet
-//     and then copies them into +0x510/+0x514, and the tail of every Update refreshes the copy
-//     (0x006685CD: +0x518 <- +0x510, +0x51C <- +0x514). Both are written so the frame sees no
-//     velocity at all.
+//   * The mob's sprite layer (CMob+0x4C0) is bound to the mob's vector controller, so moving the
+//     controller moves the sprite: CMob::Init creates the layer and hands the controller's
+//     IWzVector2D interface ([mob+0x118]) to IWzGr2DLayer::put_origin (call site 0x00662BD5 = layer
+//     vtable +0x64). The engine reads a layer's position off its origin, so the layer's own x/y is
+//     only an offset from the controller. (Shifting that offset is what made the first attempt's
+//     mobs vanish - its basis is not the mob's world position.)
 //
-//   * CMob+0x188 is the CMobTemplate*. The template loader (0x0067CF06, at 0x0067EF42) writes a
-//     WZ-derived boolean to template+0x208, and CMob::Update skips the per-mob HP tag loop when it
-//     is set (0x00668748: `cmp [eax+208h], 0` / `jnz`) - that is, the mobs drawn with the big gage.
-//     Those are the bosses, and they are left alone.
+//   * The controller is repositioned through the client's own API rather than by writing fields:
+//     CVecCtrl::SetActive (0x009B12A8, CVecCtrlMob override 0x009BBD3D) takes
+//     (bActive, x, y, vx, vy, bFloat, foothold); it clamps to the map bounds, writes the position
+//     doubles, binds the foothold and re-seeds the move path at the new point. A mob carries two such
+//     controllers (both created by CMob::Init): [mob+0x118] is the one the sprite layer's origin is
+//     bound to, the one CMob::Update advances and gates on, and the one whose acknowledged-point
+//     cache the AI re-bases from; [mob+0x11C] is the one the AI re-bases and flushes. The first is
+//     the one this module places (see TeleportMob).
 //
-//   * The local player's position is the POINT at CUserLocal+0x1170 (CUser inherits it; the offset
-//     is what CUser::GetPos returns). The CUserLocal members that move the character write that
-//     very field off their own `this` - TryDoingTeleport 0x0094E878 and OnTeleport 0x0095977B are
-//     `mov [edi+1170h],...`, CUser::Init 0x0092E5ED is `mov [ebx+1170h],eax` - so the offset can be
-//     read straight off the singleton at 0x00BEBF98.
+//   * Foothold: the controller carries a CStaticFoothold* at +0x110, and CMob::Update skips the
+//     whole move-path generation - and with it the C->S 0xBC report - while that pointer is null.
+//     CVecCtrl::raw_Move (0x009B5E7F) clears exactly that pointer, which is why the first attempt's
+//     raw_Move teleport left the mob logically at the target but with no ground under it. This
+//     module resolves the foothold at the destination through CWvsPhysicalSpace2D::GetFootholdClosest
+//     (0x00A45677) on the space object the client keeps at 0x00BEBFA0, and never passes null.
 //
-//   * The current field comes from the ZRef carrier at 0x00BEDED4: get_field (0x00437A0C) is
-//     `mov esi,[0BEDED4h]` / `mov eax,[esi+4]`, so the CField* is the payload at carrier+4. A
-//     change of that payload means map change / relogin.
+//   * The C->S report needs no packet of ours, but it does need controller #1's own "last
+//     acknowledged point" cache to move with the mob. That controller embeds its CMovePath at +0x1AC
+//     and keeps at +0x1F0 a 24-byte copy of the last movement element it reported (+0x1F2 x, +0x1F4 y,
+//     +0x1F6 vx, +0x1F8 vy, +0x1FA bFloat, +0x1FC foothold id) - exactly the fields CMob::SetActive
+//     (0x006637EC) reads and CMob::GenerateMovePath (0x0066B6FC) re-places the controller from. That
+//     re-basing is deliberate: every new move path starts on a point the server has already
+//     acknowledged. A teleport that skips the cache is therefore drawn for one frame, re-based away
+//     by the next AI decision, and never reported. This module writes the cache together with the
+//     position, and from then on the client's own MOVE_LIFE (0xBC, built at 0x0066BC67 and accepted
+//     by the server because the reporting player is the mob's controller) carries the target.
+//
+//   * The local player's position is the POINT at CUserLocal+0x1170: CUser::GetPos returns it, and
+//     the CUserLocal members that move the character write that very field.
+//
+//   * CMob+0x188 is the CMobTemplate*, and template+0x208 is the WZ-derived boss flag - the value
+//     CMob::Update tests before it skips its per-mob HP tag loop. Bosses are left alone.
+//
+//   * The current field comes from the ZRef carrier at 0x00BEDED4 (payload at +4). A change of that
+//     payload, of the CUserLocal singleton, or a death ends the session.
 //
 // The hotkey and the state machine run on a thread this module owns rather than on a hook of
 // CUserLocal::Update: BossHP.cpp already detours that entry (0x0094A144), and a second DetourAttach
 // on the same entry would have to chain through the first one's trampoline. Polling from our own
 // thread keeps this module out of the client's update chain entirely - it only reads globals.
 //
-// The mob write is deliberately done AFTER the client's own update: whatever the mob AI and its
-// vector controller did during the frame is overwritten before the frame is drawn, so the mob stays
-// on the stored point without disabling or re-routing the movement system.
+// The teleport runs BEFORE the client's own per-mob update and is re-asserted after it: before, so
+// that every decision the update makes about this mob - attack range, skill choice, and the move path
+// it reports to the server - is made with the mob already on the point; after, so that the frame is
+// drawn there even if the tick's own physics moved the mob. The point is the player's position at the
+// moment the vacuum is switched on; it does not follow the player afterwards.
 // ---------------------------------------------------------------------------------------------
 
 static const DWORD ADDR_CMob_Update = 0x006675A8;             // first byte B8
-static const DWORD ADDR_CUserLocal_OnSetDead = 0x0095AF4E;    // first bytes 83 7C 24 04 00
+static const DWORD ADDR_CUserLocal_OnSetDead = 0x0095AF4E;    // first byte 83
+static const DWORD ADDR_CVecCtrlMob_SetActive = 0x009BBD3D;   // first bytes 55 8B EC
+static const DWORD ADDR_GetFootholdClosest = 0x00A45677;      // first bytes 55 8B EC 51
+static const DWORD ADDR_GetFoothold = 0x0050D811;             // first byte B8 (id -> foothold)
+static const DWORD ADDR_CMob_SetChaseTarget = 0x0066B562;     // first bytes 56 8B F1
+static const DWORD ADDR_PhysicalSpace = 0x00BEBFA0;           // CWvsPhysicalSpace2D* (global)
 static const DWORD ADDR_UserLocal_Instance = 0x00BEBF98;      // TSingleton<CUserLocal>::ms_pInstance
 static const DWORD ADDR_FieldCarrier = 0x00BEDED4;            // ZRef carrier; CField* at +4
 
-// While a mob is vacuumed its own movement is what walks it back onto the path we pulled it off, so
-// it is put into the client's own "cannot act" state instead of hooking any of the movement code:
-// +0x234 is the STUN value slot, which both the movement logic and CMob::DoAttack (0x0066D9C0)
-// test - a mob with a non-zero slot does not move and does not attack. It is a plain data write, so
-// it cannot break the client's calling conventions the way a hook on a hot vector-controller entry
-// can (that route crashed the client during map load and was removed).
-static const int OFF_CMob_StunValue = 0x234;
-
-// The mob's sprite lives in the IWzGr2DLayer at CMob+0x4C0 - CMob::PrepareActionLayer (0x00664990)
-// animates exactly that object (IWzGr2DLayer::RemoveCanvas / ::Animate). The vacuum only shifts this
-// layer: the mob's coordinates, move path, animation and the server's idea of where it is all stay
-// untouched, which is the whole point - moving the vector controller instead detaches the layer from
-// its origin (documented in the reverse manual) and the mob stops being drawn at all.
-static const int OFF_CMob_Layer = 0x4C0;
-
-// IWzVector2D slot layout, read off the CVecCtrl implementation of the same interface
-// (vtable 0x00B3E5C8): 0 QueryInterface, 1 AddRef, 2 Release, 3..7 property methods,
-// 8 get_x, 9 put_x, 10 get_y, 11 put_y. COM fixes the order, so a layer uses the same indices.
-static const int VTBL_INDEX_VEC_GET_X = 8;
-static const int VTBL_INDEX_VEC_PUT_X = 9;
-static const int VTBL_INDEX_VEC_GET_Y = 10;
-static const int VTBL_INDEX_VEC_PUT_Y = 11;
-
 // Offsets inside CMob (relative to the CMob object itself, not to its CLife subobject).
 static const int OFF_CMob_Template = 0x188;
-static const int OFF_CMob_Pos = 0x510;       // {x,y} - what CLife::GetPos returns
-static const int OFF_CMob_PosPrev = 0x518;   // {x,y} - refreshed from the above every Update
+static const int OFF_CMob_Pos = 0x510;        // {x,y} - what CLife::GetPos returns
+static const int OFF_CMob_PosPrev = 0x518;    // {x,y} - refreshed from the above every Update
+static const int OFF_CMob_VecCtrlIf = 0x118;  // controller #1: the sprite layer's origin, the +0x110
+                                              // foothold gate and the +0x1F0 acknowledged-point cache
+static const int OFF_CMob_VecCtrl = 0x11C;    // controller #2: the one the AI re-bases and flushes
 
 // Offset inside CMobTemplate: set for the mobs that use the big gage (bosses).
 static const int OFF_CMobTemplate_Boss = 0x208;
 
+// Offsets inside the controller object (base = interface pointer - 0x0C: the IWzVector2D interface
+// subobject sits at object+0x0C, which is what CMob stores).
+static const int OFF_VecObject_Interface = 0x0C;
+static const int VTBL_INDEX_VEC_SET_ACTIVE = 1;   // CVecCtrlMob::SetActive
+static const int OFF_VecCtrl_Foothold = 0x110;    // CStaticFoothold* (null => no move path, no report)
+static const int OFF_VecCtrl_Active = 0x18;       // int: the controller's own active flag (left alone)
+
+// The controller's "last acknowledged point" cache (CMovePath+0x44, see the header comment).
+static const int OFF_VecCtrl_AbsPos_X = 0x1F2;        // short
+static const int OFF_VecCtrl_AbsPos_Y = 0x1F4;        // short
+static const int OFF_VecCtrl_AbsPos_VX = 0x1F6;       // short
+static const int OFF_VecCtrl_AbsPos_VY = 0x1F8;       // short
+static const int OFF_VecCtrl_AbsPos_BFLOAT = 0x1FA;   // byte
+static const int OFF_VecCtrl_AbsPos_FOOTHOLD = 0x1FC; // short, id (fed to CWvsPhysicalSpace2D::GetFoothold)
+
 // Offset of the local player's position inside CUserLocal (CUser::GetPos returns &(this+0x1170)).
 static const int OFF_CUserLocal_Pos = 0x1170;
 
-// CMob+0x50C holds a reference-counted pointer to the mob's vector controller (CLife's own accessor
-// for it is vtable slot 4 = sub_66B6D2, which refcounts that very dword). Only read for the
-// diagnostics: if the position write turns out not to survive the frame, that object is where the
-// client keeps the motion the sprite follows.
-static const int OFF_CMob_VecCtrlRef = 0x50C;
+// Offset of the local player's own controller, as its IWzVector2D interface pointer - the same slot
+// shape a mob has (interface at object+0x0C, so the object is the pointer minus 0x0C). It keeps the
+// same AbsPos cache, so the foothold the player stands on can be read straight off it.
+static const int OFF_CUserLocal_VecCtrl = 0x11A4;
 
-// CMob+0x118 holds the mob's CVecCtrl *as its IWzVector2D interface pointer* (the interface lives at
-// object+0x0C): CMob::Update reads it as `mov eax,[ebx+118h]` and then uses `eax-12` as the CVecCtrl*
-// for CVecCtrl::UpdatePassive. That object is what actually moves the mob - CMob+0x510 is only the
-// copy it refreshes, which is why writing +0x510 alone changes nothing on screen.
-static const int OFF_CMob_VecCtrlIf = 0x118;
-
-// IWzVector2D::raw_Move (0x009B5E7F) is CVecCtrl's own teleport: it writes x/y, zeroes the four
-// velocity doubles and (when a move path is attached) rebuilds it through SetMovePathAttribute, so
-// the mob stops where it is put instead of continuing to walk.
-//
-// Slot index: the interface vtable starts at QueryInterface, so its layout is 0=QueryInterface,
-// 1=AddRef, 2=Release, ... 8=get_x, 9=put_x, 10=get_y, 11=put_y, 12..15=get/put_x2/y2,
-// **16 = raw_Move (+0x40)**, 17=raw_Offset, 18=raw_Scale, 19=raw_Insert, 20=raw_Remove,
-// 21=raw_Init. (Taking the table 12 bytes early - at QueryInterface-3 - shifts every index up by
-// three and lands on raw_Insert, which inserts a VARIANT and corrupts the heap.)
-static const int VTBL_INDEX_VEC_RAW_MOVE = 16;
-static const DWORD ADDR_VecCtrl_raw_Move = 0x009B5E7F;
-
-// raw_Move only moves the mob - its move path is rebuilt by that same call and keeps pulling it
-// back, so the path is discarded right afterwards through the client's own API:
-// CMovePath::DiscardByInterrupt (0x0068B16F), whose `this` is the path embedded in the vector
-// controller at +0x1AC, with the vecctrl itself as the third argument. Every one of its five call
-// sites in the client (CMob::SetActive 0x6638ED, GenerateMovePath 0x66B92B, OnMove 0x66BF3F /
-// 0x66BF89, OnDoomed 0x66D891) is shaped exactly like this, and with the second argument outside
-// {1, 2} and the fourth zero it takes the branch that clears the path and re-seeds it from the
-// vecctrl's current state - i.e. "you are here, and you have nowhere else to go". The function
-// starts with `if (*(path+0x18))` and does nothing at all while no path is attached.
-static const DWORD ADDR_CMovePath_DiscardByInterrupt = 0x0068B16F;
-static const int OFF_VecCtrl_MovePath = 0x1AC;
-
-// The vector controller's IWzVector2D interface lives at object+0x0C, which is what CMob+0x118
-// stores - so the object base is that pointer minus 0x0C.
-static const int OFF_VecObject_Interface = 0x0C;
-
-// Only call the path API when this build really starts it with `push ebp / mov ebp,esp`.
-static bool g_bPathDiscardUsable = false;
-
-// Ctrl+0 toggles; the game itself does not bind that combination.
+// Ctrl+0 toggles; the game itself does not bind that combination. Both the top-row and the numpad
+// zero are accepted, because which one "0" means is a keyboard-layout detail.
 static const int VK_TOGGLE_KEY = '0';
+static const int VK_TOGGLE_KEY_PAD = VK_NUMPAD0;
 
-// How often the vacuum thread looks at the keyboard / the player position.
+// How often the vacuum thread looks at the keyboard, in milliseconds.
 static const DWORD POLL_INTERVAL_MS = 15;
+
+// How far (per axis, pixels) a mob may stray from the point before it is put back on it. This is
+// deliberately generous: every placement re-seeds the controller's move path, and the mob's action
+// machine (animation, attack decision, and the hit rectangle that CMob::GetHitPoint builds from
+// CMob+0x510) is driven by that path. Pinning a mob every frame therefore freezes it - motionless,
+// unable to attack and impossible to hit - so the mob is left alone until it really wanders off.
+static const int VACUUM_SLACK = 50;
 
 typedef void(__thiscall* tCMobUpdate)(void* pThis);
 typedef void(__thiscall* tCUserLocalOnSetDead)(void* pThis, int bDead);
-typedef long(__stdcall* tVecRawMove)(void* pVecIf, long x, long y);
-typedef long(__stdcall* tVecGet)(void* pVec, long* pOut);
-typedef long(__stdcall* tVecPut)(void* pVec, long nValue);
-typedef void(__thiscall* tMovePathDiscardByInterrupt)(void* pPath, long a2, void* pVec, int a4);
+typedef void(__thiscall* tVecSetActive)(void* pVec, int bActive, int x, int y, int vx, int vy, int bFloat, void* pFoothold);
+typedef void*(__thiscall* tGetFootholdClosest)(void* pSpace, int x, int y);
+typedef void*(__thiscall* tGetFoothold)(void* pSpace, int footholdId);
+typedef long(__stdcall* tVecGetAxis)(void* pVecIf, long* pOut);
+typedef void(__thiscall* tCMobSetChaseTarget)(void* pMob, int bEnable, void* pTargetOwner, int nFlags);
 
-// Distance (per axis, pixels) the mob may drift from the stored point before it is teleported again.
-static const int VACUUM_SLACK = 4;
+// IWzVector2D slots on the *interface* table (the one [mob+0x118] points into).
+static const int VTBL_INDEX_VEC_GET_X = 8;
+static const int VTBL_INDEX_VEC_GET_Y = 10;
+static const DWORD ADDR_VecCtrl_get_x = 0x009B5D5B;
+static const DWORD ADDR_VecCtrl_get_y = 0x009B5DCB;
 
 namespace MobVac { bool bDebug = false; }
 
 static tCMobUpdate g_origCMobUpdate = nullptr;
 static tCUserLocalOnSetDead g_origCUserLocalOnSetDead = nullptr;
 
-// The mobs this vacuum session has touched (they carry a STUN value we have to take back when the
-// vacuum ends). The list is only ever appended while the vacuum is on and is cleared whenever it
-// toggles; entries are validated before being written to, because a mob may have died meanwhile.
-// No per-mob state is kept: the vacuum only ever writes the layer offset while it is on, and the
-// client re-bases that offset by itself as soon as the mob moves.
-
 static bool g_bEnabled = false;      // config.ini switch - the thread only starts when set
 static bool g_bActive = false;       // vacuum currently on (toggled by Ctrl+0)
 static bool g_bComboDown = false;    // Ctrl+0 edge detection
-static POINT g_ptVac = { 0, 0 };     // the point the mobs are pulled to (player position at toggle)
 static void* g_pLastField = nullptr; // current CField*, to notice a map change
 static void* g_pLastUser = nullptr;  // CUserLocal*, to notice a relogin/character change
-static long g_nMobUpdates = 0;       // how often the mob hook fired (diagnostics only)
 
-// raw_Move rebuilds the mob's move path, so the calls are rationed: the poll thread refills this
-// budget every tick, which spreads "the whole map comes to me at once" over a few frames instead of
-// rebuilding a hundred paths inside a single pool update.
-static const long MOVE_BUDGET_PER_TICK = 64;
-static long g_nMoveBudget = MOVE_BUDGET_PER_TICK;
+// Diagnostics only.
+static long g_nMobUpdates = 0;       // mob ticks seen (proves the hook covers the pool)
+static long g_nTeleports = 0;        // mobs put back on the target
+static long g_nRejected = 0;         // mobs whose controller did not validate - never written through
+
+// The point the mobs are held on: the local player's position at the moment the vacuum was switched
+// on. It does not follow the player; the foothold under it is resolved once, with it.
+static POINT g_ptVacuum = { 0, 0 };
+static void* g_pVacuumFoothold = nullptr;
+static int g_nVacuumFootholdId = 0;
 
 // get_field (0x00437A0C) in two instructions, without calling into the client.
 static void* GetCurrentField()
@@ -213,27 +208,62 @@ static bool IsDataPointer(const void* p)
 	return v >= 0x00AF0000u && v < 0x00C00000u;   // where the client keeps its vtables
 }
 
-// The mob's CVecCtrl, handed over as its IWzVector2D interface pointer.
-static void* GetVecCtrlIf(const void* pMob)
+// The foothold the local player is standing on, as the id the client's own caches carry. Taking it
+// from the player's controller keeps the id and the foothold object this module binds consistent
+// (CWvsPhysicalSpace2D::GetFoothold turns it back into the object). 0 = the player has no foothold
+// (in the air).
+static int GetPlayerFootholdId(void* pUserLocal)
 {
-	return *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_VecCtrlIf);
+	if (pUserLocal == nullptr)
+	{
+		return 0;
+	}
+
+	void* pVecIf = *reinterpret_cast<void**>(reinterpret_cast<char*>(pUserLocal) + OFF_CUserLocal_VecCtrl);
+	if (pVecIf == nullptr)
+	{
+		return 0;
+	}
+
+	const char* pVec = reinterpret_cast<const char*>(pVecIf) - OFF_VecObject_Interface;
+	return *reinterpret_cast<const short*>(pVec + OFF_VecCtrl_AbsPos_FOOTHOLD);
 }
 
-// Nothing is written back when the vacuum ends: the client re-bases a layer's offset on its own once
-// the mob moves, and tracking the mobs to "restore" them would mean writing through pointers that
-// may already have been recycled. The vacuum only ever moves the sprite while it is on.
-
-// Teleport the mob through the vector controller - the object that really drives it.
+// Place one of the mob's controllers on a point through the client's own repositioning call.
 //
-// The gate is strict on purpose: slot 19 must be exactly CVecCtrl::raw_Move. Every write raw_Move
-// performs lands inside the vector controller itself (interface-0x0C ... interface+0x104), so once
-// the entry really is raw_Move the call cannot touch anything else; with a looser check (any data
-// page plus any code pointer) a mob whose +0x118 is not a vector controller makes it call a foreign
-// function with a foreign `this`, which corrupts that object and crashes the pool update later.
-static bool ResolveVecRawMove(void* pVecIf, void*& pRawMoveOut)
+// The gate is strict on purpose: the call goes through vtable slot 1, and that slot has to be
+// CVecCtrlMob::SetActive. A mismatch means the object behind the slot is not what this module thinks
+// it is - and calling a foreign function with a foreign `this` corrupts that object and crashes the
+// pool update later. In that case the mob is simply left where it is.
+static bool PlaceController(void* pVecIf, POINT pt, void* pFoothold, int nActiveFlag)
 {
-	pRawMoveOut = nullptr;
+	if (pVecIf == nullptr)
+	{
+		return false;
+	}
 
+	char* pVec = reinterpret_cast<char*>(pVecIf) - OFF_VecObject_Interface;
+
+	void** ppVtbl = *reinterpret_cast<void***>(pVec);
+	if (ppVtbl == nullptr || !IsDataPointer(ppVtbl))
+	{
+		return false;
+	}
+
+	void* pSetActive = ppVtbl[VTBL_INDEX_VEC_SET_ACTIVE];
+	if (pSetActive != reinterpret_cast<void*>(ADDR_CVecCtrlMob_SetActive))
+	{
+		return false;
+	}
+
+	reinterpret_cast<tVecSetActive>(pSetActive)(pVec, nActiveFlag, pt.x, pt.y, 0, 0, 0, pFoothold);
+	return true;
+}
+
+// Live position of a controller, read through its own IWzVector2D accessors (the same ones the sprite
+// layer's origin uses) - diagnostics only, and gated on both slots being CVecCtrl's getters.
+static bool GetControllerPos(void* pVecIf, POINT& ptOut)
+{
 	if (pVecIf == nullptr)
 	{
 		return false;
@@ -245,142 +275,307 @@ static bool ResolveVecRawMove(void* pVecIf, void*& pRawMoveOut)
 		return false;
 	}
 
-	void* pRawMove = ppVtbl[VTBL_INDEX_VEC_RAW_MOVE];
-	if (pRawMove != reinterpret_cast<void*>(ADDR_VecCtrl_raw_Move))
-	{
-		return false;
-	}
-
-	pRawMoveOut = pRawMove;
-	return true;
-}
-
-static bool MoveVecCtrl(void* pVecIf, void* pRawMove, POINT pt)
-{
-	if (pVecIf == nullptr || pRawMove == nullptr)
-	{
-		return false;
-	}
-
-	reinterpret_cast<tVecRawMove>(pRawMove)(pVecIf, pt.x, pt.y);
-	return true;
-}
-
-// Anything in a loaded module is callable; the 2D engine lives in Gr2D_DX8.dll, not in BeiDou.exe,
-// so the check cannot be limited to one image.
-static bool IsCallable(const void* p)
-{
-	const uintptr_t v = reinterpret_cast<uintptr_t>(p);
-	return v >= 0x00010000u && v < 0x80000000u;
-}
-
-static bool GetLayerPos(void* pLayer, long& x, long& y)
-{
-	if (pLayer == nullptr)
-	{
-		return false;
-	}
-
-	void** ppVtbl = *reinterpret_cast<void***>(pLayer);
-	if (ppVtbl == nullptr)
-	{
-		return false;
-	}
-
 	void* pGetX = ppVtbl[VTBL_INDEX_VEC_GET_X];
 	void* pGetY = ppVtbl[VTBL_INDEX_VEC_GET_Y];
-	if (!IsCallable(pGetX) || !IsCallable(pGetY))
+	if (pGetX != reinterpret_cast<void*>(ADDR_VecCtrl_get_x) || pGetY != reinterpret_cast<void*>(ADDR_VecCtrl_get_y))
 	{
 		return false;
 	}
 
 	long lx = 0;
 	long ly = 0;
-	reinterpret_cast<tVecGet>(pGetX)(pLayer, &lx);
-	reinterpret_cast<tVecGet>(pGetY)(pLayer, &ly);
-	x = lx;
-	y = ly;
+	// Empirically these two slots are the other way round: reading the local player's own controller
+	// through them while the player's position is known independently (CMob+0x1170) returns the y
+	// from slot 8 and the x from slot 10, so they are read swapped here.
+	reinterpret_cast<tVecGetAxis>(pGetX)(pVecIf, &ly);
+	reinterpret_cast<tVecGetAxis>(pGetY)(pVecIf, &lx);
+	ptOut.x = lx;
+	ptOut.y = ly;
 	return true;
 }
 
-static bool SetLayerPos(void* pLayer, long x, long y)
-{
-	if (pLayer == nullptr)
-	{
-		return false;
-	}
-
-	void** ppVtbl = *reinterpret_cast<void***>(pLayer);
-	if (ppVtbl == nullptr)
-	{
-		return false;
-	}
-
-	void* pPutX = ppVtbl[VTBL_INDEX_VEC_PUT_X];
-	void* pPutY = ppVtbl[VTBL_INDEX_VEC_PUT_Y];
-	if (!IsCallable(pPutX) || !IsCallable(pPutY))
-	{
-		return false;
-	}
-
-	reinterpret_cast<tVecPut>(pPutX)(pLayer, x);
-	reinterpret_cast<tVecPut>(pPutY)(pLayer, y);
-	return true;
-}
-
-// Put the mob's sprite on the stored point without touching anything the game logic reads.
+// Put the mob on a point.
 //
-// The layer's x/y is an offset from its origin (the client gives layers an origin and the mob's
-// origin is what its vector controller drives), so the sprite is moved by writing the offset
-// `point - mobPosition` - an absolute assignment, never an addition: adding to whatever the layer
-// currently holds compounds every frame (60 x the offset per second) and throws the sprite tens of
-// thousands of pixels away.
-static bool ShiftMobLayer(const void* pMob, POINT ptMob, POINT ptWant)
+// A mob carries TWO controllers, both CVecCtrlMob, both created by CMob::Init:
+//   [mob+0x118] - the one the sprite layer's origin is bound to (CMob::Init's put_origin), the one
+//                 CMob::Update advances and gates on (+0x110 foothold), and the one whose +0x1F0
+//                 cache CMob::GenerateMovePath / CMob::SetActive re-base from;
+//   [mob+0x11C] - the one the AI re-bases and flushes, and whose move path is mirrored into the
+//                 first one's path on the way out as the 0xBC report.
+// This module therefore places the first one (leaving its active flag as it is - only the position is
+// ours to change) and moves that one's +0x1F0 cache onto the target: the next AI decision re-bases
+// the second controller here, rebuilds its path from here, mirrors it back and reports it, which
+// keeps sprite, foothold gate and the server's copy on the same point without a packet of ours.
+static bool TeleportMob(void* pMob, POINT pt, void* pFoothold, int nFootholdId)
 {
-	void* pLayer = *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_Layer);
-	if (pLayer == nullptr)
+	char* pMobBytes = reinterpret_cast<char*>(pMob);
+	void* pAckedIf = *reinterpret_cast<void**>(pMobBytes + OFF_CMob_VecCtrlIf);
+	if (pAckedIf == nullptr)
+	{
+		return false;   // CMob::Init has not run for this instance yet
+	}
+
+	char* pAcked = reinterpret_cast<char*>(pAckedIf) - OFF_VecObject_Interface;
+
+	if (pFoothold == nullptr)
+	{
+		// Last resort: keep the foothold it already had rather than dropping the mob into free fall.
+		pFoothold = *reinterpret_cast<void**>(pAcked + OFF_VecCtrl_Foothold);
+	}
+
+	// Only locally active mobs are placed (see TeleportIfDrifted), so both controllers go back to
+	// active as the client itself leaves them.
+	if (!PlaceController(pAckedIf, pt, pFoothold, 1))
 	{
 		return false;
 	}
 
-	return SetLayerPos(pLayer, ptWant.x - ptMob.x, ptWant.y - ptMob.y);
+	// Both controllers are placed, not only the rendered one: they are separate instances with
+	// different roles - one is advanced by CMob::Update and feeds CMob+0x510 (which the hit rectangle
+	// and the attack-range check are built from), the other is the one the AI re-bases and flushes -
+	// so they have to agree on the point before the client's own update of this mob runs.
+	void* pActiveIf = *reinterpret_cast<void**>(pMobBytes + OFF_CMob_VecCtrl);
+	if (pActiveIf != nullptr && pActiveIf != pAckedIf)
+	{
+		PlaceController(pActiveIf, pt, pFoothold, 1);   // best effort: the first call is the gate
+	}
+
+	// Move the client's own "last acknowledged point" cache onto the target (see the header comment):
+	// the AI re-bases every new move path - and with it every 0xBC report - on this cache, so a
+	// teleport that leaves it behind is re-based away on the next AI decision and never reported.
+	*reinterpret_cast<short*>(pAcked + OFF_VecCtrl_AbsPos_X) = static_cast<short>(pt.x);
+	*reinterpret_cast<short*>(pAcked + OFF_VecCtrl_AbsPos_Y) = static_cast<short>(pt.y);
+	*reinterpret_cast<short*>(pAcked + OFF_VecCtrl_AbsPos_VX) = 0;
+	*reinterpret_cast<short*>(pAcked + OFF_VecCtrl_AbsPos_VY) = 0;
+	*reinterpret_cast<char*>(pAcked + OFF_VecCtrl_AbsPos_BFLOAT) = 0;
+	if (nFootholdId != 0)
+	{
+		*reinterpret_cast<short*>(pAcked + OFF_VecCtrl_AbsPos_FOOTHOLD) = static_cast<short>(nFootholdId);
+	}
+
+	// SetActive takes the mob's chase target away: CVecCtrlMob::SetActive zeroes +0x250 and tears down
+	// the movement attribute, and the client only restores both inside CMob::GenerateMovePath - which
+	// the AI has to decide to call first. Without this the mob stays frozen where it was put: no
+	// chasing, no attacks, and no prepared action rectangle to be hit in. CMobPool::SetLocalMob pairs
+	// the two calls the same way after it activates a mob, so this is the client's own recipe:
+	// sub_66B562(mob, 1, player controller owner, 0)
+	//   = CMob::IsActive gate + CVecCtrlMob::ChaseTargetImp([mob+0x11C]-12, ...) + CMob::SetShoeAttr.
+	void* pUserLocal = *reinterpret_cast<void**>(ADDR_UserLocal_Instance);
+	if (pUserLocal != nullptr)
+	{
+		reinterpret_cast<tCMobSetChaseTarget>(ADDR_CMob_SetChaseTarget)(pMob, 1,
+			reinterpret_cast<char*>(pUserLocal) + 4, 0);
+	}
+
+	return true;
 }
 
-// CMovePath::DiscardByInterrupt is deliberately NOT used: the sprite is pushed along the move path
-// by the client's own update, so cutting the path froze the mob at its old spot instead of pinning
-// it to the point. The address and the argument shape stay documented above for the day a path-level
-// solution is needed.
-
-static void ToggleVacuum(void* pUserLocal)
+static int AbsDiff(int a, int b)
 {
-	if (g_bActive)
+	return a > b ? a - b : b - a;
+}
+
+// Foothold under the vacuum point, resolved once when the vacuum is switched on. The player's own
+// controller carries the id of the foothold it is standing on, so the object and the id written into
+// the controller cache agree; a point without one falls back to the client's geometric lookup (and
+// then the id stays 0 - the cache keeps whatever id it had).
+static void ResolveVacuumFoothold(void* pUserLocal, POINT pt)
+{
+	g_pVacuumFoothold = nullptr;
+	g_nVacuumFootholdId = 0;
+
+	void* pSpace = *reinterpret_cast<void**>(ADDR_PhysicalSpace);
+	if (pSpace == nullptr)
 	{
-		g_bActive = false;
-		if (MobVac::bDebug)
-		{
-			std::cout << "[mobvac] OFF" << std::endl;
-		}
 		return;
 	}
 
-	POINT pt;
-	if (GetPlayerPos(pUserLocal, pt))
+	const int nPlayerFootholdId = GetPlayerFootholdId(pUserLocal);
+	if (nPlayerFootholdId != 0)
 	{
-		g_ptVac = pt;
-		g_bActive = true;
-		if (MobVac::bDebug)
+		void* pById = reinterpret_cast<tGetFoothold>(ADDR_GetFoothold)(pSpace, nPlayerFootholdId);
+		if (pById != nullptr)
 		{
-			std::cout << "[mobvac] ON point=(" << pt.x << "," << pt.y << "), mob ticks seen so far = " << g_nMobUpdates << std::endl;
+			g_pVacuumFoothold = pById;
+			g_nVacuumFootholdId = nPlayerFootholdId;
+			return;
 		}
 	}
-	else if (MobVac::bDebug)
+
+	g_pVacuumFoothold = reinterpret_cast<tGetFootholdClosest>(ADDR_GetFootholdClosest)(pSpace, pt.x, pt.y);
+}
+
+static void ToggleVacuum(void* pUserLocal)
+{
+	if (!g_bActive)
 	{
-		std::cout << "[mobvac] ON rejected: player position out of range (wrong CUserLocal base?)" << std::endl;
+		// Switching on: the point is where the player stands right now.
+		POINT pt;
+		if (!GetPlayerPos(pUserLocal, pt))
+		{
+			if (MobVac::bDebug)
+			{
+				std::cout << "[mobvac] ON rejected: player position out of range (wrong CUserLocal base?)" << std::endl;
+			}
+			return;
+		}
+
+		g_ptVacuum = pt;
+		ResolveVacuumFoothold(pUserLocal, pt);
+	}
+
+	g_bActive = !g_bActive;
+
+	if (MobVac::bDebug)
+	{
+		std::cout << "[mobvac] " << (g_bActive ? "ON" : "OFF");
+
+		if (g_bActive)
+		{
+			std::cout << " point=(" << g_ptVacuum.x << "," << g_ptVacuum.y << ")"
+				<< " foothold=0x" << std::hex << g_pVacuumFoothold << std::dec
+				<< " id=" << g_nVacuumFootholdId;
+		}
+
+		std::cout << " (mob ticks seen = " << g_nMobUpdates
+			<< ", teleports = " << g_nTeleports
+			<< ", rejected = " << g_nRejected << ")" << std::endl;
 	}
 }
 
-// Own thread: keep the state tied to one character/field, poll the hotkey. It only reads globals -
-// no client function is called from here.
+// Is this mob one the server handed to this player? That is CMob::IsActive, i.e. the second
+// controller's own flag (+0x18 of the object at [mob+0x11C]). Mobs that are not ours are driven by
+// the server's data instead: placing them every frame only fights that stream (it re-seeds them) and
+// churns their move path, so they are left alone.
+static bool IsLocallyActive(const void* pMob)
+{
+	void* pActiveIf = *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_VecCtrl);
+	if (pActiveIf == nullptr)
+	{
+		return false;
+	}
+
+	const char* pActive = reinterpret_cast<const char*>(pActiveIf) - OFF_VecObject_Interface;
+	return *reinterpret_cast<const int*>(pActive + OFF_VecCtrl_Active) != 0;
+}
+
+// Put a mob that drifted off the vacuum point back on it, and keep the client's own position copies
+// with it - everything that reads them in this frame (attack range, hit rectangles, the drawn frame)
+// then sees the mob on the point.
+static void TeleportIfDrifted(void* pMob)
+{
+	char* pMobBytes = reinterpret_cast<char*>(pMob);
+	const POINT ptMob = *reinterpret_cast<const POINT*>(pMobBytes + OFF_CMob_Pos);
+
+	if (AbsDiff(ptMob.x, g_ptVacuum.x) <= VACUUM_SLACK && AbsDiff(ptMob.y, g_ptVacuum.y) <= VACUUM_SLACK)
+	{
+		return;   // already on the point
+	}
+
+	if (!IsLocallyActive(pMob))
+	{
+		return;   // not this player's mob: the server drives it, leave it be
+	}
+
+	if (!TeleportMob(pMob, g_ptVacuum, g_pVacuumFoothold, g_nVacuumFootholdId))
+	{
+		++g_nRejected;
+
+		if (MobVac::bDebug)
+		{
+			static DWORD s_dwNextWarn = 0;
+			const DWORD dwNow = GetTickCount();
+			if (dwNow >= s_dwNextWarn)
+			{
+				s_dwNextWarn = dwNow + 1000;
+				std::cout << "[mobvac] mob 0x" << std::hex << pMob << std::dec
+					<< " not teleported: controller did not validate" << std::endl;
+			}
+		}
+
+		return;
+	}
+
+	++g_nTeleports;
+
+	*reinterpret_cast<POINT*>(pMobBytes + OFF_CMob_Pos) = g_ptVacuum;
+	*reinterpret_cast<POINT*>(pMobBytes + OFF_CMob_PosPrev) = g_ptVacuum;
+}
+
+// One diagnostic line a second: where the mob reads as being (CMob+0x510, the field the hit
+// rectangle is built from), where each of its two controllers says it is, and what the rendered
+// controller's acknowledged-point cache holds. This is what tells a "the client put it back" apart
+// from "the client never looked at it".
+static void DumpMobDiag(void* pMob)
+{
+	static DWORD s_dwNextLog = 0;
+	const DWORD dwNow = GetTickCount();
+	if (dwNow < s_dwNextLog)
+	{
+		return;
+	}
+
+	s_dwNextLog = dwNow + 1000;
+
+	char* pMobBytes = reinterpret_cast<char*>(pMob);
+	const POINT ptMob = *reinterpret_cast<const POINT*>(pMobBytes + OFF_CMob_Pos);
+
+	void* pAckedIf = *reinterpret_cast<void**>(pMobBytes + OFF_CMob_VecCtrlIf);
+	void* pActiveIf = *reinterpret_cast<void**>(pMobBytes + OFF_CMob_VecCtrl);
+
+	POINT ptAcked = { 0, 0 };
+	POINT ptActive = { 0, 0 };
+	const bool bAckedOk = GetControllerPos(pAckedIf, ptAcked);
+	const bool bActiveOk = GetControllerPos(pActiveIf, ptActive);
+
+	POINT ptCache = { 0, 0 };
+	if (pAckedIf != nullptr)
+	{
+		const char* pAcked = reinterpret_cast<const char*>(pAckedIf) - OFF_VecObject_Interface;
+		ptCache.x = *reinterpret_cast<const short*>(pAcked + OFF_VecCtrl_AbsPos_X);
+		ptCache.y = *reinterpret_cast<const short*>(pAcked + OFF_VecCtrl_AbsPos_Y);
+	}
+
+	// The player's own controller, read through the very same accessors: its true position is known
+	// independently (the ON line prints it), so it settles whether these two slots really are x and y.
+	POINT ptPlayer = { 0, 0 };
+	void* pUserLocal = *reinterpret_cast<void**>(ADDR_UserLocal_Instance);
+	void* pPlayerIf = pUserLocal != nullptr
+		? *reinterpret_cast<void**>(reinterpret_cast<char*>(pUserLocal) + OFF_CUserLocal_VecCtrl)
+		: nullptr;
+	const bool bPlayerOk = GetControllerPos(pPlayerIf, ptPlayer);
+
+	// Raw state slots, so the same mob can be compared with the vacuum on and off: the difference is
+	// what freezes it. (0x234 = the stun value slot, 0x250 = the second controller's chase target,
+	// 0x138 = the mob's secure action/state value, 0x3C8 = its action delay, 0x334 / 0x468 / 0x524 /
+	// 0x528 = the flags CMob::Update tests around its movement and damage paths.)
+	const int nChase2 = pActiveIf != nullptr
+		? *reinterpret_cast<const int*>(reinterpret_cast<const char*>(pActiveIf) - OFF_VecObject_Interface + 0x250)
+		: 0;
+
+	std::cout << "[mobvac] " << (g_bActive ? "ON " : "off")
+		<< " mob 0x" << std::hex << pMob << std::dec
+		<< " mob510=(" << ptMob.x << "," << ptMob.y << ")"
+		<< " c1=(" << ptAcked.x << "," << ptAcked.y << ")" << (bAckedOk ? "" : "?")
+		<< " c2=(" << ptActive.x << "," << ptActive.y << ")" << (bActiveOk ? "" : "?")
+		<< " cache1=(" << ptCache.x << "," << ptCache.y << ")"
+		<< " pc=(" << ptPlayer.x << "," << ptPlayer.y << ")" << (bPlayerOk ? "" : "?")
+		<< " chase2=0x" << std::hex << nChase2 << std::dec
+		<< " f144=" << *reinterpret_cast<const int*>(pMobBytes + 0x144)
+		<< " f148=" << *reinterpret_cast<const int*>(pMobBytes + 0x148)
+		<< " f234=" << *reinterpret_cast<const int*>(pMobBytes + 0x234)
+		<< " f334=" << *reinterpret_cast<const int*>(pMobBytes + 0x334)
+		<< " f468=" << *reinterpret_cast<const int*>(pMobBytes + 0x468)
+		<< " f524=" << *reinterpret_cast<const int*>(pMobBytes + 0x524)
+		<< " f528=" << *reinterpret_cast<const int*>(pMobBytes + 0x528)
+		<< " st138=" << *reinterpret_cast<const int*>(pMobBytes + 0x138)
+		<< " f3C8=" << *reinterpret_cast<const int*>(pMobBytes + 0x3C8)
+		<< " point=(" << g_ptVacuum.x << "," << g_ptVacuum.y << ")"
+		<< " teleports=" << g_nTeleports
+		<< " rejected=" << g_nRejected << std::endl;
+}
+
+// Own thread: keep the state tied to one character/field and poll the hotkey. It only reads globals.
 static DWORD WINAPI MobVacThread(LPVOID /*param*/)
 {
 	for (;;)
@@ -392,14 +587,12 @@ static DWORD WINAPI MobVacThread(LPVOID /*param*/)
 			continue;
 		}
 
-		g_nMoveBudget = MOVE_BUDGET_PER_TICK;   // refill the teleport budget for this tick
-
 		void* pField = GetCurrentField();
 		void* pUser = *reinterpret_cast<void**>(ADDR_UserLocal_Instance);
 
 		if (pUser != g_pLastUser || pField != g_pLastField)
 		{
-			// Map change, relogin or character change: the stored point belongs to the old map.
+			// Map change, relogin or character change: the mobs of the old field are gone.
 			g_pLastUser = pUser;
 			g_pLastField = pField;
 			g_bActive = false;
@@ -419,7 +612,8 @@ static DWORD WINAPI MobVacThread(LPVOID /*param*/)
 		}
 
 		const bool bCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-		const bool bKey = (GetAsyncKeyState(VK_TOGGLE_KEY) & 0x8000) != 0;
+		const bool bKey = ((GetAsyncKeyState(VK_TOGGLE_KEY) & 0x8000) != 0)
+			|| ((GetAsyncKeyState(VK_TOGGLE_KEY_PAD) & 0x8000) != 0);
 		const bool bFocused = dwPid == GetCurrentProcessId();
 		const bool bDown = bFocused && bCtrl && bKey;
 
@@ -453,46 +647,33 @@ static void __fastcall CUserLocal_OnSetDead_Hook(void* pThis, void* /*edx*/, int
 	g_origCUserLocalOnSetDead(pThis, bDead);
 }
 
-// First touch of a mob in this session: nothing to record (no state is written back).
-
-// Every mob, every frame: re-apply the stored point after the client's own update.
+// Every mob, every frame.
+//
+// The teleport runs BEFORE the client's own update, and is re-asserted after it. Everything the mob
+// decides inside that update - whether the player is in attack range, which skill or body attack to
+// use, and the move path that carries the C->S 0xBC report - reads the mob's position, so a teleport
+// applied only afterwards is on the vacuum point for the eye and nowhere else: the mob never
+// attacks, the player's attacks miss it, and the server keeps the old coordinates, which is exactly
+// where the mob snaps back to once the vacuum is switched off.
 static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 {
+	if (MobVac::bDebug && pThis != nullptr)
+	{
+		DumpMobDiag(pThis);   // the client's own values, before this module touches anything
+	}
+
+	if (g_bActive && pThis != nullptr && IsVacuumable(pThis))
+	{
+		TeleportIfDrifted(pThis);
+	}
+
 	g_origCMobUpdate(pThis);
 
 	++g_nMobUpdates;
 
-	if (!g_bActive || pThis == nullptr || !IsVacuumable(pThis))
+	if (g_bActive && pThis != nullptr && IsVacuumable(pThis))
 	{
-		return;
-	}
-
-	char* pMob = reinterpret_cast<char*>(pThis);
-
-	// Where the mob really is (the client refreshes this from the vector controller every frame) and
-	// the point the player asked for. Only the sprite layer is moved - the mob's own coordinates, its
-	// move path and the server's copy stay exactly as they are.
-	const POINT ptMob = *reinterpret_cast<const POINT*>(pMob + OFF_CMob_Pos);
-	const bool bShifted = ShiftMobLayer(pThis, ptMob, g_ptVac);
-
-	if (MobVac::bDebug)
-	{
-		static DWORD s_dwNextLog = 0;
-		const DWORD dwNow = GetTickCount();
-		if (dwNow >= s_dwNextLog)
-		{
-			s_dwNextLog = dwNow + 1000;
-			const void* pLayer = *reinterpret_cast<void* const*>(pMob + OFF_CMob_Layer);
-			long lx = 0;
-			long ly = 0;
-			GetLayerPos(const_cast<void*>(pLayer), lx, ly);
-			std::cout << "[mobvac] mob 0x" << std::hex << pThis << std::dec
-				<< " mobPos=(" << ptMob.x << "," << ptMob.y << ")"
-				<< " layer=0x" << std::hex << pLayer << std::dec
-				<< " layerPos=(" << lx << "," << ly << ")"
-				<< " want=(" << g_ptVac.x << "," << g_ptVac.y << ")"
-				<< " shift=" << bShifted << " offset=(" << (g_ptVac.x - ptMob.x) << "," << (g_ptVac.y - ptMob.y) << ")" << std::endl;
-		}
+		TeleportIfDrifted(pThis);
 	}
 }
 
@@ -506,26 +687,33 @@ void Hook_MobVac(bool enable)
 		return;
 	}
 
-	// Sanity checks: every entry point we hook must look like this client build. CUserLocal::Update is
-	// deliberately not among them - BossHP owns that entry (see the header).
+	// Sanity checks: every entry point has to look like this client build, and the two functions
+	// this module calls directly get their own byte checks before anything is hooked.
 	if (*reinterpret_cast<unsigned char*>(ADDR_CMob_Update) != 0xB8
-		|| *reinterpret_cast<unsigned char*>(ADDR_CUserLocal_OnSetDead) != 0x83)
+		|| *reinterpret_cast<unsigned char*>(ADDR_CUserLocal_OnSetDead) != 0x83
+		|| *reinterpret_cast<unsigned char*>(ADDR_CVecCtrlMob_SetActive) != 0x55
+		|| *reinterpret_cast<unsigned char*>(ADDR_CVecCtrlMob_SetActive + 1) != 0x8B
+		|| *reinterpret_cast<unsigned char*>(ADDR_CVecCtrlMob_SetActive + 2) != 0xEC
+		|| *reinterpret_cast<unsigned char*>(ADDR_GetFootholdClosest) != 0x55
+		|| *reinterpret_cast<unsigned char*>(ADDR_GetFootholdClosest + 1) != 0x8B
+		|| *reinterpret_cast<unsigned char*>(ADDR_GetFootholdClosest + 2) != 0xEC
+		|| *reinterpret_cast<unsigned char*>(ADDR_GetFootholdClosest + 3) != 0x51
+		|| *reinterpret_cast<unsigned char*>(ADDR_GetFoothold) != 0xB8
+		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetChaseTarget) != 0x56
+		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetChaseTarget + 1) != 0x8B
+		|| *reinterpret_cast<unsigned char*>(ADDR_CMob_SetChaseTarget + 2) != 0xF1)
 	{
 		std::cout << "mob vacuum skipped: unexpected client build (CMob::Update=" << std::hex
 			<< static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CMob_Update))
 			<< " OnSetDead=" << static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CUserLocal_OnSetDead))
+			<< " VecSetActive=" << static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CVecCtrlMob_SetActive))
+			<< " GetFootholdClosest=" << static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_GetFootholdClosest))
 			<< std::dec << ")" << std::endl;
 		return;
 	}
 
 	g_origCMobUpdate = reinterpret_cast<tCMobUpdate>(ADDR_CMob_Update);
 	g_origCUserLocalOnSetDead = reinterpret_cast<tCUserLocalOnSetDead>(ADDR_CUserLocal_OnSetDead);
-
-	// The path API is called directly (never hooked), so it gets its own byte check.
-	g_bPathDiscardUsable =
-		*reinterpret_cast<unsigned char*>(ADDR_CMovePath_DiscardByInterrupt) == 0x55
-		&& *reinterpret_cast<unsigned char*>(ADDR_CMovePath_DiscardByInterrupt + 1) == 0x8B
-		&& *reinterpret_cast<unsigned char*>(ADDR_CMovePath_DiscardByInterrupt + 2) == 0xEC;
 
 	const bool bMobHook = Memory::SetHook(true, reinterpret_cast<void**>(&g_origCMobUpdate),
 		reinterpret_cast<void*>(&CMob_Update_Hook));
