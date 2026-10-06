@@ -147,7 +147,7 @@ static long g_nMobUpdates = 0;       // how often the mob hook fired (diagnostic
 // raw_Move rebuilds the mob's move path, so the calls are rationed: the poll thread refills this
 // budget every tick, which spreads "the whole map comes to me at once" over a few frames instead of
 // rebuilding a hundred paths inside a single pool update.
-static const long MOVE_BUDGET_PER_TICK = 4;
+static const long MOVE_BUDGET_PER_TICK = 64;
 static long g_nMoveBudget = MOVE_BUDGET_PER_TICK;
 
 // get_field (0x00437A0C) in two instructions, without calling into the client.
@@ -281,19 +281,10 @@ static bool MoveVecCtrl(void* pVecIf, void* pRawMove, POINT pt)
 	return true;
 }
 
-// Drop whatever is left of the mob's move path, so nothing walks it back off the point.
-static bool DiscardMovePath(void* pVecIf)
-{
-	if (!g_bPathDiscardUsable || pVecIf == nullptr)
-	{
-		return false;
-	}
-
-	char* pVec = reinterpret_cast<char*>(pVecIf) - OFF_VecObject_Interface;   // the CVecCtrl itself
-	reinterpret_cast<tMovePathDiscardByInterrupt>(ADDR_CMovePath_DiscardByInterrupt)(
-		pVec + OFF_VecCtrl_MovePath, 0, pVec, 0);
-	return true;
-}
+// CMovePath::DiscardByInterrupt is deliberately NOT used: the sprite is pushed along the move path
+// by the client's own update, so cutting the path froze the mob at its old spot instead of pinning
+// it to the point. The address and the argument shape stay documented above for the day a path-level
+// solution is needed.
 
 static void ToggleVacuum(void* pUserLocal)
 {
@@ -438,7 +429,6 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 	*reinterpret_cast<int*>(pMob + OFF_CMob_StunValue) = 1;
 
 	POINT* pLive = reinterpret_cast<POINT*>(pMob + OFF_CMob_Pos);
-	POINT* pPrev = reinterpret_cast<POINT*>(pMob + OFF_CMob_PosPrev);
 	void* pVecIf = GetVecCtrlIf(pThis);
 	void* pRawMove = nullptr;
 	const bool bVecOk = ResolveVecRawMove(pVecIf, pRawMove);
@@ -453,23 +443,18 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 	const bool bOnPoint = nDx > -VACUUM_SLACK && nDx < VACUUM_SLACK && nDy > -VACUUM_SLACK && nDy < VACUUM_SLACK;
 
 	bool bMoved = false;
-	bool bDiscarded = false;
 	if (!bOnPoint)
 	{
 		if (g_nMoveBudget > 0)
 		{
 			--g_nMoveBudget;
 			bMoved = MoveVecCtrl(pVecIf, pRawMove, g_ptVac);
-			if (bMoved)
-			{
-				// Move first, then cut the path: the rebuild that raw_Move performs would otherwise
-				// keep steering the mob towards the spot its AI had picked.
-				bDiscarded = DiscardMovePath(pVecIf);
-			}
 		}
 
-		*pLive = g_ptVac;
-		*pPrev = g_ptVac;
+		// NB: CMob+0x510/+0x518 are deliberately NOT written here. The client refreshes them from the
+		// vector controller every frame, and writing them made the next frame's "am I on the point?"
+		// test read back our own value - so the teleport was skipped and the mob never actually moved.
+		// The vector controller is the only thing worth touching.
 	}
 
 	// What matters here is `moved`: if it stays 0 while the mob is off the point, the vector
@@ -490,7 +475,7 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 				<< " liveNow=(" << pLive->x << "," << pLive->y << ")"
 				<< " want=(" << g_ptVac.x << "," << g_ptVac.y << ")"
 				<< " playerNow=(" << ptNow.x << "," << ptNow.y << ")"
-				<< " onPoint=" << bOnPoint << " moved=" << bMoved << " disc=" << bDiscarded
+				<< " onPoint=" << bOnPoint << " moved=" << bMoved
 				<< " vecOk=" << bVecOk << " rawMove=0x" << std::hex << pRawMove
 				<< " vecIf=0x" << pVecIf
 				<< " vecVtbl=0x" << (pVecIf != nullptr ? *reinterpret_cast<void**>(pVecIf) : nullptr)
