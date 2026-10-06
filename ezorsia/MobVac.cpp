@@ -131,6 +131,14 @@ static const int MOB_VACUUM_SLACK = 80;
 // A pulled mob is therefore left alone for this long before it may be moved again.
 static const DWORD MOB_VACUUM_COOLDOWN_MS = 400;
 
+// The per-mob diagnostics are sampled at most this often, and a pin that has not been ticked for
+// MOB_PIN_TTL_MS counts as gone. Both matter for safety: a mob that leaves the field has its CMob
+// freed by the pool, and a pointer kept past that is dangling - a newly spawned mob recycles the very
+// same heap block. Everything the dump prints is therefore read while the mob is being ticked (inside
+// the hook, where it is alive by construction), never from the table afterwards.
+static const DWORD MOB_SAMPLE_INTERVAL_MS = 250;
+static const DWORD MOB_PIN_TTL_MS = 1000;
+
 typedef void(__thiscall* tCMobUpdate)(void* pThis);
 typedef void(__thiscall* tCUserLocalOnSetDead)(void* pThis, int bDead);
 typedef void(__thiscall* tVecSetActive)(void* pVec, int bActive, int x, int y, int vx, int vy, int bFloat, void* pFoothold);
@@ -169,17 +177,26 @@ static void* g_pVacuumFoothold = nullptr;
 static int g_nVacuumFootholdId = 0;
 
 // One entry per mob the vacuum has checked, so a pull can be rate-limited per mob and the diagnostics
-// can show each mob's own story. See MOB_VACUUM_COOLDOWN_MS for why the rate limit is the point.
+// can show each mob's own story. See MOB_VACUUM_COOLDOWN_MS for why the rate limit is the point; the
+// controller readings are sampled while the mob is being ticked (SampleMob), because the entry outlives
+// the mob: the pool frees a mob that leaves the field and the next spawn reuses that memory.
 struct MobPin
 {
 	void* pMob;
 	bool bPulledThisFrame;
-	DWORD dwNextPull;   // GetTickCount floor: this mob may not be pulled before it
+	bool bC1Ok;
+	bool bC2Ok;
+	DWORD dwNextPull;    // GetTickCount floor: this mob may not be pulled before it
+	DWORD dwLastSeen;    // last frame this mob was ticked - a pin stops being read once it goes stale
+	DWORD dwNextSample;  // next GetTickCount at which the controllers and the cache are read again
 	long nPulls;
-	long nCooling;      // checks that found drift while the cooldown still held the mob
-	POINT ptPre;        // CMob+0x510 when the mob was checked (the drift evidence)
-	POINT ptPost;       // ... and after the client's own update of that frame
-	POINT ptSettled;    // ... on a frame that was pulled: where the pull left it
+	long nCooling;       // checks that found drift while the cooldown still held the mob
+	POINT ptPre;         // CMob+0x510 when the mob was checked (the drift evidence)
+	POINT ptPost;        // ... and after the client's own update of that frame
+	POINT ptSettled;     // ... on a frame that was pulled: where the pull left it
+	POINT ptC1;          // controller #1 as its own accessors report it (sampled)
+	POINT ptC2;          // controller #2 likewise
+	POINT ptCache;       // controller #1's acknowledged-point cache (sampled)
 };
 
 static const int MOB_PIN_SLOTS = 48;
@@ -187,6 +204,7 @@ static MobPin g_pins[MOB_PIN_SLOTS] = {};
 
 static MobPin* PinFor(void* pMob)
 {
+	const DWORD dwNow = GetTickCount();
 	MobPin* pFree = nullptr;
 	MobPin* pEvict = nullptr;
 
@@ -194,6 +212,14 @@ static MobPin* PinFor(void* pMob)
 	{
 		if (g_pins[i].pMob == pMob)
 		{
+			if (dwNow - g_pins[i].dwLastSeen > MOB_PIN_TTL_MS)
+			{
+				// A different mob at a recycled address: start it clean rather than inherit the
+				// pull cooldown and the readings of the CMob that used to live here.
+				g_pins[i] = MobPin{};
+				g_pins[i].pMob = pMob;
+			}
+
 			return &g_pins[i];
 		}
 
@@ -514,6 +540,34 @@ static bool IsLocallyActive(const void* pMob)
 	return *reinterpret_cast<const int*>(pActive + OFF_VecCtrl_Active) != 0;
 }
 
+// Read this mob's controllers and acknowledged-point cache into its pin - only ever called with a mob
+// the client is ticking right now, because that is the only moment the mob is certainly alive. Rate
+// limited, since the readings are for the once-a-second dump and not for any decision.
+static void SampleMob(MobPin* pPin, void* pMob, DWORD dwNow)
+{
+	if (dwNow < pPin->dwNextSample)
+	{
+		return;
+	}
+
+	pPin->dwNextSample = dwNow + MOB_SAMPLE_INTERVAL_MS;
+
+	const char* pMobBytes = reinterpret_cast<const char*>(pMob);
+	void* pC1If = *reinterpret_cast<void* const*>(pMobBytes + OFF_CMob_VecCtrlIf);
+	void* pC2If = *reinterpret_cast<void* const*>(pMobBytes + OFF_CMob_VecCtrl);
+
+	pPin->bC1Ok = GetControllerPos(pC1If, pPin->ptC1);
+	pPin->bC2Ok = GetControllerPos(pC2If, pPin->ptC2);
+
+	pPin->ptCache = POINT{ 0, 0 };
+	if (pC1If != nullptr)
+	{
+		const char* pC1 = reinterpret_cast<const char*>(pC1If) - OFF_VecObject_Interface;
+		pPin->ptCache.x = *reinterpret_cast<const short*>(pC1 + OFF_VecCtrl_AbsPos_X);
+		pPin->ptCache.y = *reinterpret_cast<const short*>(pC1 + OFF_VecCtrl_AbsPos_Y);
+	}
+}
+
 // The per-frame vacuum step, run BEFORE the client's own update of the mob (see the file header): a
 // mob that has really wandered off the point is put back on it - with the client's own position copies
 // moved along, so everything that reads them in this frame (attack range, the hit rectangle, the drawn
@@ -521,10 +575,13 @@ static bool IsLocallyActive(const void* pMob)
 // and a mob pulled less than MOB_VACUUM_COOLDOWN_MS ago is left to walk.
 static void VacuumTick(void* pMob)
 {
+	const DWORD dwNow = GetTickCount();
 	MobPin* pPin = PinFor(pMob);
 	char* pMobBytes = reinterpret_cast<char*>(pMob);
 
+	pPin->dwLastSeen = dwNow;
 	pPin->ptPre = *reinterpret_cast<const POINT*>(pMobBytes + OFF_CMob_Pos);
+	SampleMob(pPin, pMob, dwNow);
 
 	if (AbsDiff(pPin->ptPre.x, g_ptVacuum.x) <= MOB_VACUUM_SLACK
 		&& AbsDiff(pPin->ptPre.y, g_ptVacuum.y) <= MOB_VACUUM_SLACK)
@@ -537,7 +594,6 @@ static void VacuumTick(void* pMob)
 		return;   // not this player's mob: the server drives it, leave it be
 	}
 
-	const DWORD dwNow = GetTickCount();
 	if (dwNow < pPin->dwNextPull)
 	{
 		++g_nCooling;
@@ -578,7 +634,10 @@ static void VacuumTick(void* pMob)
 // point on the target means the client's own frame left it where this module put it.
 static void VacuumPostUpdate(void* pMob)
 {
+	const DWORD dwNow = GetTickCount();
 	MobPin* pPin = PinFor(pMob);
+
+	pPin->dwLastSeen = dwNow;
 	pPin->ptPost = *reinterpret_cast<const POINT*>(reinterpret_cast<const char*>(pMob) + OFF_CMob_Pos);
 
 	if (pPin->bPulledThisFrame)
@@ -588,11 +647,16 @@ static void VacuumPostUpdate(void* pMob)
 	}
 }
 
-// One diagnostic block a second: the counters, then one row per mob the vacuum has checked - how far
-// it was from the point when it was checked, where the client's own update of that frame left it,
+// One diagnostic block a second: the counters, then one row per mob the vacuum is still ticking - how
+// far it was from the point when it was checked, where the client's own update of that frame left it,
 // where the pull applied that frame left it, and what its two controllers and the acknowledged-point
-// cache say. Together those tell "the pull did not stick" apart from "the mob is pulled every frame"
-// and from "the mob simply walked off between two pulls".
+// cache said when it was last sampled. Together those tell "the pull did not stick" apart from "the mob
+// is pulled every frame" and from "the mob simply walked off between two pulls".
+//
+// Only values SampleMob stored are printed: a pin whose mob has not been ticked for MOB_PIN_TTL_MS is
+// dropped instead of followed. That is not tidiness - a mob that left the field has its CMob freed, and
+// the spawn that recycles that block turns the leftover entry into a garbage pointer; following one
+// crashed the client inside GetControllerPos, with the shared pMob read coming back as 0x58.
 static void DumpVacuumDiag()
 {
 	static DWORD s_dwNextLog = 0;
@@ -621,39 +685,28 @@ static void DumpVacuumDiag()
 	int nRows = 0;
 	for (int i = 0; i < MOB_PIN_SLOTS && nRows < 8; ++i)
 	{
-		const MobPin& pin = g_pins[i];
+		MobPin& pin = g_pins[i];
 		if (pin.pMob == nullptr)
 		{
 			continue;
 		}
 
-		++nRows;
-
-		const char* pMobBytes = reinterpret_cast<const char*>(pin.pMob);
-		void* pC1If = *reinterpret_cast<void* const*>(pMobBytes + OFF_CMob_VecCtrlIf);
-		void* pC2If = *reinterpret_cast<void* const*>(pMobBytes + OFF_CMob_VecCtrl);
-
-		POINT ptC1 = { 0, 0 };
-		POINT ptC2 = { 0, 0 };
-		const bool bC1Ok = GetControllerPos(pC1If, ptC1);
-		const bool bC2Ok = GetControllerPos(pC2If, ptC2);
-
-		POINT ptCache = { 0, 0 };
-		if (pC1If != nullptr)
+		if (dwNow - pin.dwLastSeen > MOB_PIN_TTL_MS)
 		{
-			const char* pC1 = reinterpret_cast<const char*>(pC1If) - OFF_VecObject_Interface;
-			ptCache.x = *reinterpret_cast<const short*>(pC1 + OFF_VecCtrl_AbsPos_X);
-			ptCache.y = *reinterpret_cast<const short*>(pC1 + OFF_VecCtrl_AbsPos_Y);
+			pin = MobPin{};   // gone from the field: drop the entry, never read through the pointer
+			continue;
 		}
+
+		++nRows;
 
 		std::cout << "[mobvac]   mob 0x" << std::hex << pin.pMob << std::dec
 			<< " pulls=" << pin.nPulls << " cooling=" << pin.nCooling
 			<< " dPre=(" << (pin.ptPre.x - g_ptVacuum.x) << "," << (pin.ptPre.y - g_ptVacuum.y) << ")"
 			<< " post=(" << pin.ptPost.x << "," << pin.ptPost.y << ")"
 			<< " settled=(" << pin.ptSettled.x << "," << pin.ptSettled.y << ")"
-			<< " c1=(" << ptC1.x << "," << ptC1.y << ")" << (bC1Ok ? "" : "?")
-			<< " c2=(" << ptC2.x << "," << ptC2.y << ")" << (bC2Ok ? "" : "?")
-			<< " cache1=(" << ptCache.x << "," << ptCache.y << ")"
+			<< " c1=(" << pin.ptC1.x << "," << pin.ptC1.y << ")" << (pin.bC1Ok ? "" : "?")
+			<< " c2=(" << pin.ptC2.x << "," << pin.ptC2.y << ")" << (pin.bC2Ok ? "" : "?")
+			<< " cache1=(" << pin.ptCache.x << "," << pin.ptCache.y << ")"
 			<< std::endl;
 	}
 }
