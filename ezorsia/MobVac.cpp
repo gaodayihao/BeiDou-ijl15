@@ -13,7 +13,7 @@
 //
 //   * The mob's live position is CMob+0x510 ({x,y}): the CLife interface subobject sits at CMob+4
 //     and CMob::GetPos (0x006625A0, vtable slot 5) is `lea eax,[ecx+50Ch]`. CMob+0x518 is the
-//     previous-position copy: CMob::Init (0x006628D0) seeds +0x518/+0x51C from the spawn packet
+//     previous-position copy: CMob::Init (0x00662884) seeds +0x518/+0x51C from the spawn packet
 //     and then copies them into +0x510/+0x514, and the tail of every Update refreshes the copy
 //     (0x006685CD: +0x518 <- +0x510, +0x51C <- +0x514). Both are written so the frame sees no
 //     velocity at all.
@@ -23,27 +23,30 @@
 //     is set (0x00668748: `cmp [eax+208h], 0` / `jnz`) - that is, the mobs drawn with the big gage.
 //     Those are the bosses, and they are left alone.
 //
-//   * CUserLocal::Update (0x0094A144) is the local player's per-frame update and gives us both the
-//     CUserLocal* and a once-per-frame place for the hotkey. CUser::GetPos is vtable slot 2 of the
-//     CUserLocal vtable (0x00B3D1F4) and is `lea eax,[ecx+1170h]` (0x004B2386).
-//
 //   * The local player's position is the POINT at CUserLocal+0x1170 (CUser inherits it; the offset
 //     is what CUser::GetPos returns). The CUserLocal members that move the character write that
 //     very field off their own `this` - TryDoingTeleport 0x0094E878 and OnTeleport 0x0095977B are
 //     `mov [edi+1170h],...`, CUser::Init 0x0092E5ED is `mov [ebx+1170h],eax` - so the offset can be
-//     read straight off the object we get from CUserLocal::Update, with no vtable hop.
+//     read straight off the singleton at 0x00BEBF98.
 //
-//   * get_field (0x00437A0C) returns the current CField*; a change of it means map change/relogin.
+//   * The current field comes from the ZRef carrier at 0x00BEDED4: get_field (0x00437A0C) is
+//     `mov esi,[0BEDED4h]` / `mov eax,[esi+4]`, so the CField* is the payload at carrier+4. A
+//     change of that payload means map change / relogin.
 //
-// The write is deliberately done AFTER the client's own update: whatever the mob AI and its vector
-// controller did during the frame is overwritten before the frame is drawn, so the mob stays on the
-// stored point without disabling or re-routing the movement system.
+// The hotkey and the state machine run on a thread this module owns rather than on a hook of
+// CUserLocal::Update: BossHP.cpp already detours that entry (0x0094A144), and a second DetourAttach
+// on the same entry would have to chain through the first one's trampoline. Polling from our own
+// thread keeps this module out of the client's update chain entirely - it only reads globals.
+//
+// The mob write is deliberately done AFTER the client's own update: whatever the mob AI and its
+// vector controller did during the frame is overwritten before the frame is drawn, so the mob stays
+// on the stored point without disabling or re-routing the movement system.
 // ---------------------------------------------------------------------------------------------
 
 static const DWORD ADDR_CMob_Update = 0x006675A8;             // first byte B8
-static const DWORD ADDR_CUserLocal_Update = 0x0094A144;       // first byte B8
 static const DWORD ADDR_CUserLocal_OnSetDead = 0x0095AF4E;    // first bytes 83 7C 24 04 00
-static const DWORD ADDR_get_field = 0x00437A0C;
+static const DWORD ADDR_UserLocal_Instance = 0x00BEBF98;      // TSingleton<CUserLocal>::ms_pInstance
+static const DWORD ADDR_FieldCarrier = 0x00BEDED4;            // ZRef carrier; CField* at +4
 
 // Offsets inside CMob (relative to the CMob object itself, not to its CLife subobject).
 static const int OFF_CMob_Template = 0x188;
@@ -56,28 +59,44 @@ static const int OFF_CMobTemplate_Boss = 0x208;
 // Offset of the local player's position inside CUserLocal (CUser::GetPos returns &(this+0x1170)).
 static const int OFF_CUserLocal_Pos = 0x1170;
 
+// CMob+0x50C holds a reference-counted pointer to the mob's vector controller (CLife's own accessor
+// for it is vtable slot 4 = sub_66B6D2, which refcounts that very dword). Only read for the
+// diagnostics: if the position write turns out not to survive the frame, that object is where the
+// client keeps the motion the sprite follows.
+static const int OFF_CMob_VecCtrlRef = 0x50C;
+
 // Ctrl+0 toggles; the game itself does not bind that combination.
 static const int VK_TOGGLE_KEY = '0';
 
+// How often the vacuum thread looks at the keyboard / the player position.
+static const DWORD POLL_INTERVAL_MS = 15;
+
 typedef void(__thiscall* tCMobUpdate)(void* pThis);
-typedef void(__thiscall* tCUserLocalUpdate)(void* pThis);
 typedef void(__thiscall* tCUserLocalOnSetDead)(void* pThis, int bDead);
-typedef void* (__cdecl* tGetField)(void);
+
+namespace MobVac { bool bDebug = false; }
 
 static tCMobUpdate g_origCMobUpdate = nullptr;
-static tCUserLocalUpdate g_origCUserLocalUpdate = nullptr;
 static tCUserLocalOnSetDead g_origCUserLocalOnSetDead = nullptr;
 
-static bool g_bEnabled = false;      // config.ini switch - the hooks are only installed when set
+static bool g_bEnabled = false;      // config.ini switch - the thread only starts when set
 static bool g_bActive = false;       // vacuum currently on (toggled by Ctrl+0)
 static bool g_bComboDown = false;    // Ctrl+0 edge detection
 static POINT g_ptVac = { 0, 0 };     // the point the mobs are pulled to (player position at toggle)
 static void* g_pLastField = nullptr; // current CField*, to notice a map change
 static void* g_pLastUser = nullptr;  // CUserLocal*, to notice a relogin/character change
+static long g_nMobUpdates = 0;       // how often the mob hook fired (diagnostics only)
 
-// The local player's position, read straight off the CUserLocal we are handed by its own Update.
-// The sanity window is the guard against a wrong base: a misread would give a wild pair, while real
-// map coordinates stay far inside it.
+// get_field (0x00437A0C) in two instructions, without calling into the client.
+static void* GetCurrentField()
+{
+	void* pCarrier = *reinterpret_cast<void**>(ADDR_FieldCarrier);
+	return pCarrier != nullptr ? *reinterpret_cast<void**>(reinterpret_cast<char*>(pCarrier) + 4) : nullptr;
+}
+
+// The local player's position, read straight off the CUserLocal singleton. The sanity window is the
+// guard against a wrong base: a misread would give a wild pair, while real map coordinates stay far
+// inside it.
 static bool GetPlayerPos(void* pUserLocal, POINT& ptOut)
 {
 	if (pUserLocal == nullptr)
@@ -114,6 +133,10 @@ static void ToggleVacuum(void* pUserLocal)
 	if (g_bActive)
 	{
 		g_bActive = false;
+		if (MobVac::bDebug)
+		{
+			std::cout << "[mobvac] OFF" << std::endl;
+		}
 		return;
 	}
 
@@ -122,48 +145,81 @@ static void ToggleVacuum(void* pUserLocal)
 	{
 		g_ptVac = pt;
 		g_bActive = true;
+		if (MobVac::bDebug)
+		{
+			std::cout << "[mobvac] ON point=(" << pt.x << "," << pt.y << "), mob ticks seen so far = " << g_nMobUpdates << std::endl;
+		}
+	}
+	else if (MobVac::bDebug)
+	{
+		std::cout << "[mobvac] ON rejected: player position out of range (wrong CUserLocal base?)" << std::endl;
 	}
 }
 
-// Once per frame: keep the state tied to one character/field, poll the hotkey.
-static void __fastcall CUserLocal_Update_Hook(void* pThis, void* /*edx*/)
+// Own thread: keep the state tied to one character/field, poll the hotkey. It only reads globals -
+// no client function is called from here.
+static DWORD WINAPI MobVacThread(LPVOID /*param*/)
 {
-	g_origCUserLocalUpdate(pThis);
-
-	if (!g_bEnabled)
+	for (;;)
 	{
-		return;
+		Sleep(POLL_INTERVAL_MS);
+
+		if (!g_bEnabled)
+		{
+			continue;
+		}
+
+		void* pField = GetCurrentField();
+		void* pUser = *reinterpret_cast<void**>(ADDR_UserLocal_Instance);
+
+		if (pUser != g_pLastUser || pField != g_pLastField)
+		{
+			// Map change, relogin or character change: the stored point belongs to the old map.
+			g_pLastUser = pUser;
+			g_pLastField = pField;
+			g_bActive = false;
+		}
+
+		if (pUser == nullptr || pField == nullptr)
+		{
+			g_bActive = false;   // not in field (login screen, cash shop, stage transition)
+			continue;
+		}
+
+		const HWND hForeground = GetForegroundWindow();
+		DWORD dwPid = 0;
+		if (hForeground != nullptr)
+		{
+			GetWindowThreadProcessId(hForeground, &dwPid);
+		}
+
+		const bool bCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+		const bool bKey = (GetAsyncKeyState(VK_TOGGLE_KEY) & 0x8000) != 0;
+		const bool bFocused = dwPid == GetCurrentProcessId();
+		const bool bDown = bFocused && bCtrl && bKey;
+
+		static bool s_bWarnedUnfocused = false;
+		if (bCtrl && bKey && !bFocused && !s_bWarnedUnfocused)
+		{
+			s_bWarnedUnfocused = true;
+			if (MobVac::bDebug)
+			{
+				std::cout << "[mobvac] Ctrl+0 pressed while the game window is not the foreground one - ignored" << std::endl;
+			}
+		}
+
+		if (bDown && !g_bComboDown)
+		{
+			g_bComboDown = true;
+			ToggleVacuum(pUser);
+		}
+		else if (!bDown)
+		{
+			g_bComboDown = false;
+		}
 	}
 
-	void* pField = reinterpret_cast<tGetField>(ADDR_get_field)();
-	if (pThis != g_pLastUser || pField != g_pLastField)
-	{
-		// Map change, relogin or character change: the stored point belongs to the old map.
-		g_pLastUser = pThis;
-		g_pLastField = pField;
-		g_bActive = false;
-	}
-
-	const HWND hForeground = GetForegroundWindow();
-	DWORD dwPid = 0;
-	if (hForeground != nullptr)
-	{
-		GetWindowThreadProcessId(hForeground, &dwPid);
-	}
-
-	const bool bDown = dwPid == GetCurrentProcessId()
-		&& (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0
-		&& (GetAsyncKeyState(VK_TOGGLE_KEY) & 0x8000) != 0;
-
-	if (bDown && !g_bComboDown)
-	{
-		g_bComboDown = true;
-		ToggleVacuum(pThis);
-	}
-	else if (!bDown)
-	{
-		g_bComboDown = false;
-	}
+	return 0;
 }
 
 static void __fastcall CUserLocal_OnSetDead_Hook(void* pThis, void* /*edx*/, int bDead)
@@ -177,14 +233,41 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 {
 	g_origCMobUpdate(pThis);
 
+	++g_nMobUpdates;
+
 	if (!g_bActive || pThis == nullptr || !IsVacuumable(pThis))
 	{
 		return;
 	}
 
 	char* pMob = reinterpret_cast<char*>(pThis);
-	*reinterpret_cast<POINT*>(pMob + OFF_CMob_Pos) = g_ptVac;
-	*reinterpret_cast<POINT*>(pMob + OFF_CMob_PosPrev) = g_ptVac;
+	POINT* pLive = reinterpret_cast<POINT*>(pMob + OFF_CMob_Pos);
+	POINT* pPrev = reinterpret_cast<POINT*>(pMob + OFF_CMob_PosPrev);
+
+	// The "before" values matter: if a later frame still shows the wanted pair, the write sticks;
+	// if it shows the mob's own position again, something (the vector controller) rewrites it.
+	if (MobVac::bDebug)
+	{
+		static DWORD s_dwNextLog = 0;
+		const DWORD dwNow = GetTickCount();
+		if (dwNow >= s_dwNextLog)
+		{
+			s_dwNextLog = dwNow + 1000;
+			const void* pVecRef = *reinterpret_cast<const void* const*>(pMob + OFF_CMob_VecCtrlRef);
+			const void* pUser = *reinterpret_cast<void**>(ADDR_UserLocal_Instance);
+			POINT ptNow = { 0, 0 };
+			GetPlayerPos(const_cast<void*>(pUser), ptNow);
+			std::cout << "[mobvac] mob 0x" << std::hex << pThis << std::dec
+				<< " live=(" << pLive->x << "," << pLive->y << ")"
+				<< " prev=(" << pPrev->x << "," << pPrev->y << ")"
+				<< " want=(" << g_ptVac.x << "," << g_ptVac.y << ")"
+				<< " playerNow=(" << ptNow.x << "," << ptNow.y << ")"
+				<< " vecRef=0x" << std::hex << pVecRef << std::dec << std::endl;
+		}
+	}
+
+	*pLive = g_ptVac;
+	*pPrev = g_ptVac;
 }
 
 void Hook_MobVac(bool enable)
@@ -197,32 +280,35 @@ void Hook_MobVac(bool enable)
 		return;
 	}
 
-	// Sanity checks: the three entry points we hook must look like this client build.
+	// Sanity checks: the two entry points we hook must look like this client build. Only these two
+	// are checked - CUserLocal::Update is not hooked here (BossHP owns that entry; see the header).
 	if (*reinterpret_cast<unsigned char*>(ADDR_CMob_Update) != 0xB8
-		|| *reinterpret_cast<unsigned char*>(ADDR_CUserLocal_Update) != 0xB8
 		|| *reinterpret_cast<unsigned char*>(ADDR_CUserLocal_OnSetDead) != 0x83)
 	{
-		std::cout << "mob vacuum skipped: unexpected client build" << std::endl;
+		std::cout << "mob vacuum skipped: unexpected client build (CMob::Update=" << std::hex
+			<< static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CMob_Update))
+			<< " OnSetDead=" << static_cast<int>(*reinterpret_cast<unsigned char*>(ADDR_CUserLocal_OnSetDead))
+			<< std::dec << ")" << std::endl;
 		return;
 	}
 
 	g_origCMobUpdate = reinterpret_cast<tCMobUpdate>(ADDR_CMob_Update);
-	g_origCUserLocalUpdate = reinterpret_cast<tCUserLocalUpdate>(ADDR_CUserLocal_Update);
 	g_origCUserLocalOnSetDead = reinterpret_cast<tCUserLocalOnSetDead>(ADDR_CUserLocal_OnSetDead);
 
 	const bool bMobHook = Memory::SetHook(true, reinterpret_cast<void**>(&g_origCMobUpdate),
 		reinterpret_cast<void*>(&CMob_Update_Hook));
-	const bool bUserHook = Memory::SetHook(true, reinterpret_cast<void**>(&g_origCUserLocalUpdate),
-		reinterpret_cast<void*>(&CUserLocal_Update_Hook));
 	const bool bDeathHook = Memory::SetHook(true, reinterpret_cast<void**>(&g_origCUserLocalOnSetDead),
 		reinterpret_cast<void*>(&CUserLocal_OnSetDead_Hook));
 
-	if (bMobHook && bUserHook && bDeathHook)
+	const HANDLE hThread = CreateThread(nullptr, 0, &MobVacThread, nullptr, 0, nullptr);
+
+	if (bMobHook && bDeathHook && hThread != nullptr)
 	{
 		std::cout << "mob vacuum hook created (Ctrl+0 toggles)" << std::endl;
 	}
 	else
 	{
-		std::cout << "mob vacuum hook FAILED" << std::endl;
+		std::cout << "mob vacuum hook FAILED (mob=" << bMobHook << " death=" << bDeathHook
+			<< " thread=" << (hThread != nullptr) << ")" << std::endl;
 	}
 }

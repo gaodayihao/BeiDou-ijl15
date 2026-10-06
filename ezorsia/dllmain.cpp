@@ -130,6 +130,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			BossHP::bShowText = reader.GetBoolean("optional", "bossHpText", true);
 			BossHP::bShowTextName = reader.GetBoolean("optional", "bossHpTextShowName", true);
 			BossHP::bTextDebug = Client::debug; // diagnostics follow the existing [debug] debug= switch
+			MobVac::bDebug = Client::debug; // same switch for the mob vacuum module
 			QuestBulb::bFixed = reader.GetBoolean("optional", "questBulbFixed", true);
 			QuestBulb::nFixedX = reader.GetInteger("optional", "questBulbX", 10);
 			QuestBulb::nFixedY = reader.GetInteger("optional", "questBulbY", -1);
@@ -145,6 +146,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			BuffTimer::nOffsetX = reader.GetInteger("optional", "buffTimerX", 4);
 			BuffTimer::nOffsetY = reader.GetInteger("optional", "buffTimerY", 17);
 				}
+
+		if (Client::debug) {
+			CreateConsole(); // [debug] debug=true: every module's std::cout becomes visible
+			std::cout << "debug console attached" << std::endl;
+		}
 
 		Hook_CreateMutexA(true); //multiclient //ty darter, angel, and alias!
 		HookCreateWindowExA(true); //default ezorsia

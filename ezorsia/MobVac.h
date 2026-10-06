@@ -16,13 +16,19 @@
 //   * CMob::Update            - after the client's own update the mob is put back on the stored
 //                               point (current position + its previous-position copy), so nothing
 //                               of the mob's own AI/vector-controller motion survives the frame;
-//   * CUserLocal::Update      - once-per-frame place that polls the hotkey and snapshots the
-//                               player position;
+//   * a thread this module owns - polls Ctrl+0, snapshots the player position, and drops the state
+//                               when the character, the field or life state changes. It only reads
+//                               globals; the client's update chain stays untouched (BossHP already
+//                               detours CUserLocal::Update, and chaining onto it is avoidable);
 //   * CUserLocal::OnSetDead   - drops the state on death; a change of the current field
-//                               (get_field) drops it on map change / relogin.
+//                               (get_field's payload) drops it on map change / relogin.
 //
 // Bosses are deliberately excluded (CMobTemplate+0x208, the flag that makes the client skip its
 // per-mob HP tag loop and use the big gage instead).
 //
 // Enable with [optional] mobVac=true in config.ini (default off).
+// With [debug] debug=true the module logs to the console DllMain allocates: the install result, the
+// toggle, and (once a second while the vacuum runs) one mob's live/previous/wanted position.
+namespace MobVac { extern bool bDebug; }
+
 void Hook_MobVac(bool enable);
