@@ -17,6 +17,7 @@
 #include "PetAutoBuff.h"
 #include "PetBuffConfig.h"
 #include "ManaReflectLevelFix.h"
+#include "MobVac.h"
 #pragma comment(lib, "ws2_32.lib")
 
 // config.ini can use IP or hostname (ServerIP_Address=...).
@@ -79,6 +80,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		bool itemWndExpanded = true; // Item window opens in the expanded layout by default (see ItemWndExpanded.cpp)
 		bool itemWndRemember = true; // and the expand/collapse choice survives a session (same module)
 		bool manaReflectFix = true; // fix the Mana Reflection reflect rate for I/L + Bishop mages (ManaReflectLevelFix.cpp)
+		bool mobVac = false; // mob vacuum, Ctrl+0 toggles it (MobVac.cpp); off unless config.ini says otherwise
 		INIReader reader("config.ini");
 		if (reader.ParseError() == 0) {
 			Client::m_nGameWidth = reader.GetInteger("general", "width", 1280);
@@ -116,6 +118,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			itemWndExpanded = reader.GetBoolean("optional", "itemWndExpanded", true);
 			itemWndRemember = reader.GetBoolean("optional", "itemWndRemember", true);
 			manaReflectFix = reader.GetBoolean("debug", "manaReflectFix", true);
+			mobVac = reader.GetBoolean("optional", "mobVac", false);
 			PetSkillSlot::bEnabled = reader.GetBoolean("optional", "petBuff", true);
 			PetSkillSlot::nLabelFont = reader.GetInteger("optional", "petSkillSlotFont", 43);
 			PetSkillSlot::nFontSize = reader.GetInteger("optional", "petSkillSlotFontSize", 11);
@@ -189,6 +192,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		PetAutoBuff::Hook();  // pet auto-buff refresh: re-cast them when they run out
 		PetBuffConfig::Hook(); // pet auto-buff configuration: save to / load from the server (0x1001)
 		Hook_ManaReflectLevelFix(manaReflectFix); // fix: Mana Reflection level row for I/L + Bishop mages
+		Hook_MobVac(mobVac); // mob vacuum: Ctrl+0 pulls every non-boss mob to the point you pressed it on
 		Client::WorldMap();
 		Client::RefreshRate(); 
 		Client::DeleteChar();
