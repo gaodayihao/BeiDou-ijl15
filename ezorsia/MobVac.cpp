@@ -91,6 +91,25 @@ static const int OFF_CMob_VecCtrlIf = 0x118;
 static const int VTBL_INDEX_VEC_RAW_MOVE = 16;
 static const DWORD ADDR_VecCtrl_raw_Move = 0x009B5E7F;
 
+// raw_Move only moves the mob - its move path is rebuilt by that same call and keeps pulling it
+// back, so the path is discarded right afterwards through the client's own API:
+// CMovePath::DiscardByInterrupt (0x0068B16F), whose `this` is the path embedded in the vector
+// controller at +0x1AC, with the vecctrl itself as the third argument. Every one of its five call
+// sites in the client (CMob::SetActive 0x6638ED, GenerateMovePath 0x66B92B, OnMove 0x66BF3F /
+// 0x66BF89, OnDoomed 0x66D891) is shaped exactly like this, and with the second argument outside
+// {1, 2} and the fourth zero it takes the branch that clears the path and re-seeds it from the
+// vecctrl's current state - i.e. "you are here, and you have nowhere else to go". The function
+// starts with `if (*(path+0x18))` and does nothing at all while no path is attached.
+static const DWORD ADDR_CMovePath_DiscardByInterrupt = 0x0068B16F;
+static const int OFF_VecCtrl_MovePath = 0x1AC;
+
+// The vector controller's IWzVector2D interface lives at object+0x0C, which is what CMob+0x118
+// stores - so the object base is that pointer minus 0x0C.
+static const int OFF_VecObject_Interface = 0x0C;
+
+// Only call the path API when this build really starts it with `push ebp / mov ebp,esp`.
+static bool g_bPathDiscardUsable = false;
+
 // Ctrl+0 toggles; the game itself does not bind that combination.
 static const int VK_TOGGLE_KEY = '0';
 
@@ -100,6 +119,7 @@ static const DWORD POLL_INTERVAL_MS = 15;
 typedef void(__thiscall* tCMobUpdate)(void* pThis);
 typedef void(__thiscall* tCUserLocalOnSetDead)(void* pThis, int bDead);
 typedef long(__stdcall* tVecRawMove)(void* pVecIf, long x, long y);
+typedef void(__thiscall* tMovePathDiscardByInterrupt)(void* pPath, long a2, void* pVec, int a4);
 
 // Distance (per axis, pixels) the mob may drift from the stored point before it is teleported again.
 static const int VACUUM_SLACK = 4;
@@ -261,6 +281,20 @@ static bool MoveVecCtrl(void* pVecIf, void* pRawMove, POINT pt)
 	return true;
 }
 
+// Drop whatever is left of the mob's move path, so nothing walks it back off the point.
+static bool DiscardMovePath(void* pVecIf)
+{
+	if (!g_bPathDiscardUsable || pVecIf == nullptr)
+	{
+		return false;
+	}
+
+	char* pVec = reinterpret_cast<char*>(pVecIf) - OFF_VecObject_Interface;   // the CVecCtrl itself
+	reinterpret_cast<tMovePathDiscardByInterrupt>(ADDR_CMovePath_DiscardByInterrupt)(
+		pVec + OFF_VecCtrl_MovePath, 0, pVec, 0);
+	return true;
+}
+
 static void ToggleVacuum(void* pUserLocal)
 {
 	ForgetVacuumMobs();
@@ -419,12 +453,19 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 	const bool bOnPoint = nDx > -VACUUM_SLACK && nDx < VACUUM_SLACK && nDy > -VACUUM_SLACK && nDy < VACUUM_SLACK;
 
 	bool bMoved = false;
+	bool bDiscarded = false;
 	if (!bOnPoint)
 	{
 		if (g_nMoveBudget > 0)
 		{
 			--g_nMoveBudget;
 			bMoved = MoveVecCtrl(pVecIf, pRawMove, g_ptVac);
+			if (bMoved)
+			{
+				// Move first, then cut the path: the rebuild that raw_Move performs would otherwise
+				// keep steering the mob towards the spot its AI had picked.
+				bDiscarded = DiscardMovePath(pVecIf);
+			}
 		}
 
 		*pLive = g_ptVac;
@@ -449,7 +490,7 @@ static void __fastcall CMob_Update_Hook(void* pThis, void* /*edx*/)
 				<< " liveNow=(" << pLive->x << "," << pLive->y << ")"
 				<< " want=(" << g_ptVac.x << "," << g_ptVac.y << ")"
 				<< " playerNow=(" << ptNow.x << "," << ptNow.y << ")"
-				<< " onPoint=" << bOnPoint << " moved=" << bMoved
+				<< " onPoint=" << bOnPoint << " moved=" << bMoved << " disc=" << bDiscarded
 				<< " vecOk=" << bVecOk << " rawMove=0x" << std::hex << pRawMove
 				<< " vecIf=0x" << pVecIf
 				<< " vecVtbl=0x" << (pVecIf != nullptr ? *reinterpret_cast<void**>(pVecIf) : nullptr)
@@ -482,6 +523,12 @@ void Hook_MobVac(bool enable)
 
 	g_origCMobUpdate = reinterpret_cast<tCMobUpdate>(ADDR_CMob_Update);
 	g_origCUserLocalOnSetDead = reinterpret_cast<tCUserLocalOnSetDead>(ADDR_CUserLocal_OnSetDead);
+
+	// The path API is called directly (never hooked), so it gets its own byte check.
+	g_bPathDiscardUsable =
+		*reinterpret_cast<unsigned char*>(ADDR_CMovePath_DiscardByInterrupt) == 0x55
+		&& *reinterpret_cast<unsigned char*>(ADDR_CMovePath_DiscardByInterrupt + 1) == 0x8B
+		&& *reinterpret_cast<unsigned char*>(ADDR_CMovePath_DiscardByInterrupt + 2) == 0xEC;
 
 	const bool bMobHook = Memory::SetHook(true, reinterpret_cast<void**>(&g_origCMobUpdate),
 		reinterpret_cast<void*>(&CMob_Update_Hook));
