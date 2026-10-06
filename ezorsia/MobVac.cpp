@@ -27,6 +27,12 @@
 //     CUserLocal* and a once-per-frame place for the hotkey. CUser::GetPos is vtable slot 2 of the
 //     CUserLocal vtable (0x00B3D1F4) and is `lea eax,[ecx+1170h]` (0x004B2386).
 //
+//   * The local player's position is the POINT at CUserLocal+0x1170 (CUser inherits it; the offset
+//     is what CUser::GetPos returns). The CUserLocal members that move the character write that
+//     very field off their own `this` - TryDoingTeleport 0x0094E878 and OnTeleport 0x0095977B are
+//     `mov [edi+1170h],...`, CUser::Init 0x0092E5ED is `mov [ebx+1170h],eax` - so the offset can be
+//     read straight off the object we get from CUserLocal::Update, with no vtable hop.
+//
 //   * get_field (0x00437A0C) returns the current CField*; a change of it means map change/relogin.
 //
 // The write is deliberately done AFTER the client's own update: whatever the mob AI and its vector
@@ -47,8 +53,8 @@ static const int OFF_CMob_PosPrev = 0x518;   // {x,y} - refreshed from the above
 // Offset inside CMobTemplate: set for the mobs that use the big gage (bosses).
 static const int OFF_CMobTemplate_Boss = 0x208;
 
-// vtable slot of CUser::GetPos inside the CUserLocal vtable (0x00B3D1F4).
-static const int VTABLE_SLOT_CUser_GetPos = 2;
+// Offset of the local player's position inside CUserLocal (CUser::GetPos returns &(this+0x1170)).
+static const int OFF_CUserLocal_Pos = 0x1170;
 
 // Ctrl+0 toggles; the game itself does not bind that combination.
 static const int VK_TOGGLE_KEY = '0';
@@ -57,7 +63,6 @@ typedef void(__thiscall* tCMobUpdate)(void* pThis);
 typedef void(__thiscall* tCUserLocalUpdate)(void* pThis);
 typedef void(__thiscall* tCUserLocalOnSetDead)(void* pThis, int bDead);
 typedef void* (__cdecl* tGetField)(void);
-typedef POINT* (__thiscall* tGetPos)(void* pThis);
 
 static tCMobUpdate g_origCMobUpdate = nullptr;
 static tCUserLocalUpdate g_origCUserLocalUpdate = nullptr;
@@ -70,15 +75,9 @@ static POINT g_ptVac = { 0, 0 };     // the point the mobs are pulled to (player
 static void* g_pLastField = nullptr; // current CField*, to notice a map change
 static void* g_pLastUser = nullptr;  // CUserLocal*, to notice a relogin/character change
 
-static bool IsCodePointer(const void* p)
-{
-	const uintptr_t v = reinterpret_cast<uintptr_t>(p);
-	return v >= 0x00401000u && v < 0x00C00000u;
-}
-
-// The client's own position accessor, called through the object's vtable: that keeps us independent
-// of where exactly the CUser subobject sits inside CUserLocal (slot 2 is CUser::GetPos in the
-// CUser and the CUserLocal vtable alike, and both use the same `this` we read the vtable from).
+// The local player's position, read straight off the CUserLocal we are handed by its own Update.
+// The sanity window is the guard against a wrong base: a misread would give a wild pair, while real
+// map coordinates stay far inside it.
 static bool GetPlayerPos(void* pUserLocal, POINT& ptOut)
 {
 	if (pUserLocal == nullptr)
@@ -86,25 +85,13 @@ static bool GetPlayerPos(void* pUserLocal, POINT& ptOut)
 		return false;
 	}
 
-	void** ppVtbl = *reinterpret_cast<void***>(pUserLocal);
-	if (ppVtbl == nullptr)
+	const POINT pt = *reinterpret_cast<const POINT*>(reinterpret_cast<const char*>(pUserLocal) + OFF_CUserLocal_Pos);
+	if (pt.x <= -3000000 || pt.x >= 3000000 || pt.y <= -3000000 || pt.y >= 3000000)
 	{
 		return false;
 	}
 
-	void* pGetPos = ppVtbl[VTABLE_SLOT_CUser_GetPos];
-	if (!IsCodePointer(pGetPos))
-	{
-		return false;
-	}
-
-	POINT* pPos = reinterpret_cast<tGetPos>(pGetPos)(pUserLocal);
-	if (pPos == nullptr)
-	{
-		return false;
-	}
-
-	ptOut = *pPos;
+	ptOut = pt;
 	return true;
 }
 
