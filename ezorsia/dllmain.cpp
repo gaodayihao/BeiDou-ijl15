@@ -119,6 +119,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			itemWndRemember = reader.GetBoolean("optional", "itemWndRemember", true);
 			manaReflectFix = reader.GetBoolean("debug", "manaReflectFix", true);
 			mobVac = reader.GetBoolean("optional", "mobVac", false);
+			MobVac::nRange = reader.GetInteger("optional", "mobVacRange", MobVac::nRange);
+			MobVac::nIntervalMs = reader.GetInteger("optional", "mobVacIntervalMs", MobVac::nIntervalMs);
 			PetSkillSlot::bEnabled = reader.GetBoolean("optional", "petBuff", true);
 			PetSkillSlot::nLabelFont = reader.GetInteger("optional", "petSkillSlotFont", 43);
 			PetSkillSlot::nFontSize = reader.GetInteger("optional", "petSkillSlotFontSize", 11);
@@ -198,7 +200,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		PetAutoBuff::Hook();  // pet auto-buff refresh: re-cast them when they run out
 		PetBuffConfig::Hook(); // pet auto-buff configuration: save to / load from the server (0x1001)
 		Hook_ManaReflectLevelFix(manaReflectFix); // fix: Mana Reflection level row for I/L + Bishop mages
-		Hook_MobVac(mobVac); // mob vacuum: Ctrl+0 keeps every non-boss mob on you (Ctrl+0 again stops it)
+		Hook_MobVac(mobVac); // mob vacuum: Ctrl+0 holds every non-boss mob on the spot you pressed it at
 		Client::WorldMap();
 		Client::RefreshRate(); 
 		Client::DeleteChar();

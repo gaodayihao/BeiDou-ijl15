@@ -3,14 +3,14 @@
 // Mob vacuum - Ctrl+0 in game toggles it.
 //
 // While it is on, every non-boss mob the client knows about is held on the point the player stood on
-// when the vacuum was switched on, and that point does not move afterwards. A mob the vacuum has
-// reached is pinned by the client's own stun value slot (CMob+0x234): stunned mobs neither walk nor
-// attack, so they cannot leave the point - and unlike clearing their move path, the sprite layer is
-// left alone, so they are drawn normally there. A mob that got away anyway (a fresh spawn, or one
-// whose stun the server overwrote) is pulled back onto the point, at most once per mob per 400ms,
-// because each pull re-seeds the mob's move path. Switching the vacuum off clears the stun again.
-// Mobs that spawn later join on their own - hooking CMob::Update covers the whole pool, not a
-// snapshot.
+// at the moment the vacuum was switched on: before the mob's own update runs, a mob further than
+// mobVacRange (default 80px, per axis) from that point is put back on it. A mob that is still on the
+// point is not touched at all, and no mob is pulled twice within mobVacIntervalMs (default 80ms) -
+// each pull re-seeds the mob's move path, so the interval is what decides how hard the mobs are held:
+// a small one pins them (they barely move) and a large one leaves them to walk and act in between,
+// with the extreme of a pull every frame freezing them completely (unable to attack or be hit). The
+// point does not follow the player, and mobs that spawn later join on their own - hooking
+// CMob::Update covers the whole pool, not a snapshot.
 //
 // Why the client can do this at all: in v83 the client owns mob movement. The client that controls
 // a mob generates its move path and reports it through MOVE_LIFE (0xBC); the server only checks that
@@ -21,16 +21,17 @@
 // What is touched (see MobVac.cpp for the addresses and the evidence behind them):
 //   * CMob::Update            - BEFORE the client's own update of the mob, so its attack-range /
 //                               skill / move-path decisions and the C->S report it derives from them
-//                               are made with the mob already on the point. A mob inside the leash is
-//                               left alone, and a mob that was moved is left alone for the cooldown -
-//                               the client's own update of that mob runs in between, which is what lets
-//                               it move, attack and be hit. The mob's vector controller is put on the
-//                               point through the client's own CVecCtrlMob::SetActive, which also
-//                               binds the foothold resolved for that point and re-seeds the move path
-//                               there. The controller's "last acknowledged point" cache is moved with
-//                               it - position and cached foothold id together, since the client re-bases
-//                               from that pair - and the mob's two position copies are written so the
-//                               rest of the frame sees a consistent mob;
+//                               are made with the mob already on the point. A mob inside
+//                               mobVacRange is left alone, and a mob that was pulled is left alone for
+//                               mobVacIntervalMs - the client's own update of that mob runs in
+//                               between, which is what lets it move, attack and be hit. The mob's
+//                               vector controller is put on the point through the client's own
+//                               CVecCtrlMob::SetActive, which also binds the foothold under that
+//                               point and re-seeds the move path there. The controller's "last
+//                               acknowledged point" cache is moved with it - without that the client
+//                               re-bases the mob onto the old point on its next movement decision and
+//                               keeps reporting the old point - and the mob's two position copies are
+//                               written so the rest of the frame sees a consistent mob;
 //   * a thread this module owns - polls Ctrl+0 and drops the state when the character, the field or
 //                               the life state changes. It only reads globals; the client's update
 //                               chain stays untouched (BossHP already detours CUserLocal::Update,
@@ -49,10 +50,16 @@
 //   * bosses, which are deliberately excluded (CMobTemplate+0x208, the flag that makes the client
 //     skip its per-mob HP tag loop and use the big gage instead).
 //
-// Enable with [optional] mobVac=true in config.ini (default off).
+// Enable with [optional] mobVac=true in config.ini (default off); mobVacRange (default 80, pixels per
+// axis) and mobVacIntervalMs (default 80, minimum gap between two pulls of the same mob) tune it.
 // With [debug] debug=true the module logs to the console DllMain allocates: the install result, the
 // toggle, and (once a second) the running counters plus one row per mob - where it was when it was
 // checked, where the frame left it, and what its controllers and its acknowledged-point cache say.
-namespace MobVac { extern bool bDebug; }
+namespace MobVac
+{
+	extern bool bDebug;
+	extern int nRange;        // mobVacRange: how far a mob may stray before it is pulled back
+	extern int nIntervalMs;   // mobVacIntervalMs: how long a pulled mob is left alone
+}
 
 void Hook_MobVac(bool enable);
