@@ -3,28 +3,33 @@
 // Mob vacuum - Ctrl+0 in game toggles it.
 //
 // While it is on, every non-boss mob the client knows about is held on the point the player stood on
-// at the moment the vacuum was switched on: each frame, before the mob's own update runs, a mob that
-// drifted more than a few pixels off that point is put back. The point does not follow the player,
-// and mobs that spawn later join on their own - hooking CMob::Update covers the whole pool, not a
-// snapshot.
+// at the moment the vacuum was switched on: before the mob's own update runs, a mob that has really
+// wandered off that point is put back on it. A mob that is still on the point is not touched at all,
+// and no mob is moved twice within a few hundred milliseconds - each placement re-seeds the mob's
+// move path, so a mob put back every frame would be frozen: unable to move, to attack or to be hit.
+// The point does not follow the player, and mobs that spawn later join on their own - hooking
+// CMob::Update covers the whole pool, not a snapshot.
 //
 // Why the client can do this at all: in v83 the client owns mob movement. The client that controls
 // a mob generates its move path and reports it through MOVE_LIFE (0xBC); the server only checks that
 // the reporter is the mob's controller and then follows the reported coordinates. So a local
-// reposition is also a server-visible one - there is no packet for this module to forge.
+// reposition is also a server-visible one - there is no packet for this module to forge, and the
+// server's copy does move: a relogin re-spawns the mobs from it, on the vacuum point.
 //
 // What is touched (see MobVac.cpp for the addresses and the evidence behind them):
-//   * CMob::Update            - BEFORE the client's own update of the mob (so its attack-range /
+//   * CMob::Update            - BEFORE the client's own update of the mob, so its attack-range /
 //                               skill / move-path decisions and the C->S report it derives from them
-//                               are made with the mob already on the point) and again after it (so
-//                               the frame is drawn there). The mob's vector controller is put on the
-//                               point through the client's own CVecCtrlMob::SetActive, which also
-//                               binds the foothold under that point and re-seeds the move path
-//                               there. The controller's "last acknowledged point" cache is moved with
-//                               it - without that the client re-bases the mob onto the old point on
-//                               its next movement decision and keeps reporting the old point - and
-//                               the mob's two position copies are written so the rest of the frame
-//                               sees a consistent mob;
+//                               are made with the mob already on the point. A mob on the point (or
+//                               within the slack) is left alone, and a mob that was moved is left
+//                               alone for the cooldown - the client's own update of that mob runs in
+//                               between, which is what lets it move, attack and be hit. The mob's
+//                               vector controller is put on the point through the client's own
+//                               CVecCtrlMob::SetActive, which also binds the foothold under that
+//                               point and re-seeds the move path there. The controller's "last
+//                               acknowledged point" cache is moved with it - without that the client
+//                               re-bases the mob onto the old point on its next movement decision and
+//                               keeps reporting the old point - and the mob's two position copies are
+//                               written so the rest of the frame sees a consistent mob;
 //   * a thread this module owns - polls Ctrl+0 and drops the state when the character, the field or
 //                               the life state changes. It only reads globals; the client's update
 //                               chain stays untouched (BossHP already detours CUserLocal::Update,
@@ -45,7 +50,8 @@
 //
 // Enable with [optional] mobVac=true in config.ini (default off).
 // With [debug] debug=true the module logs to the console DllMain allocates: the install result, the
-// toggle, and (once a second) one teleport plus the running counters.
+// toggle, and (once a second) the running counters plus one row per mob - where it was when it was
+// checked, where the frame left it, and what its controllers and its acknowledged-point cache say.
 namespace MobVac { extern bool bDebug; }
 
 void Hook_MobVac(bool enable);
