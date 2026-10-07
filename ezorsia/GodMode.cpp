@@ -70,6 +70,12 @@ static const int NO_DAMAGE_WINDOW_MS = 1000;
 // How often the thread looks at the keyboard, in milliseconds.
 static const DWORD POLL_INTERVAL_MS = 15;
 
+// How long the mode may keep running with no field at all before it is dropped. A map change is
+// normal for a moment: the client clears the field carrier before the new field exists (the stage
+// switch writes 0 to 0x00BEDED4), so treating "no field" as "left the game" would end the mode on
+// every map change. Only a long one - the login screen, character select - means it really is over.
+static const DWORD NO_FIELD_GRACE_MS = 5000;
+
 // Ctrl+9 toggles; the game itself does not bind that combination. Both the top-row and the numpad
 // nine are accepted, because which one "9" means is a keyboard-layout detail.
 static const int VK_TOGGLE_KEY = '9';
@@ -105,6 +111,7 @@ static bool g_bEnabled = false;      // config.ini switch - the thread only star
 static bool g_bActive = false;       // invincibility currently on (toggled by Ctrl+9)
 static bool g_bComboDown = false;    // Ctrl+9 edge detection
 static void* g_pLastUser = nullptr;  // CUserLocal*, to notice a relogin/character change
+static DWORD g_dwNoFieldSince = 0;   // tick the field first went away; 0 = a field is present
 
 // Is this GIVE_BUFF packet a debuff? See the file header: the server writes the mask as two longs
 // with the diseases always in the second one, so a mask whose first long is 0 and whose second long
@@ -209,15 +216,35 @@ static DWORD WINAPI GodModeThread(LPVOID /*param*/)
 			// Relogin or character change: the object the state was being held on is gone.
 			g_pLastUser = pUser;
 			g_bActive = false;
+			g_dwNoFieldSince = 0;
 		}
 
-		if (pUser == nullptr || pField == nullptr || !IsLiveUserLocal(pUser))
+		if (pUser == nullptr || !IsLiveUserLocal(pUser))
 		{
-			// Login screen, cash shop, or the object is not a live CUserLocal. A relogin always
-			// passes through here, so the state cannot survive one on a recycled address either.
-			// A map change inside the game is not one of these: the character keeps the state.
+			// Logged out, or the object is not a live CUserLocal: never write through it.
 			g_bActive = false;
+			g_dwNoFieldSince = 0;
 			continue;
+		}
+
+		// A map change is not the end of the mode (see NO_FIELD_GRACE_MS); a lasting absence of the
+		// field is. The character keeps the state across a map change either way.
+		const DWORD dwNow = GetTickCount();
+		if (pField == nullptr)
+		{
+			if (g_dwNoFieldSince == 0)
+			{
+				g_dwNoFieldSince = dwNow;
+			}
+			else if (dwNow - g_dwNoFieldSince >= NO_FIELD_GRACE_MS)
+			{
+				g_bActive = false;
+				continue;
+			}
+		}
+		else
+		{
+			g_dwNoFieldSince = 0;
 		}
 
 		if (g_bActive)

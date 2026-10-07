@@ -34,10 +34,11 @@
 //     and ZOMBIFY only changes the HP floor Character.applyHpMpChange :8227 uses;
 //   * damage the server applies on its own (GM commands, event scripts) is untouched.
 //
-// The state survives a map change (the character keeps it) and is dropped when the character changes,
-// when the client leaves the field (login screen, cash shop) and when the mode is switched off -
-// switching off also clears the timestamp, so the immunity ends immediately instead of running out
-// its last window.
+// The state survives a map change: while the client swaps fields it clears the field carrier first,
+// so a momentary "no field" is normal and is not taken as leaving the game (only a lasting one is,
+// e.g. the login screen or character select). It is dropped when the character object changes and
+// when the mode is switched off - switching off also clears the timestamp, so the immunity ends
+// immediately instead of running out its last window.
 //
 // Enable with [optional] godMode=true in config.ini (default off). There is nothing to tune.
 // The module prints nothing while it runs - only the one install/refuse line at startup.
