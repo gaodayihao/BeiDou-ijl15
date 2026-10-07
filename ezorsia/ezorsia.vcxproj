@@ -211,6 +211,7 @@
     <ClInclude Include="PetBuffConfig.h" />
     <ClInclude Include="ManaReflectLevelFix.h" />
     <ClInclude Include="MobVac.h" />
+    <ClInclude Include="GodMode.h" />
     <ClInclude Include="Memory.h" />
     <ClInclude Include="NMCO.h" />
     <ClInclude Include="SelectCharMacFix.h" />
@@ -237,6 +238,7 @@
     <ClCompile Include="PetBuffConfig.cpp" />
     <ClCompile Include="ManaReflectLevelFix.cpp" />
     <ClCompile Include="MobVac.cpp" />
+    <ClCompile Include="GodMode.cpp" />
     <ClCompile Include="Memory.cpp" />
     <ClCompile Include="NMCO.cpp" />
     <ClCompile Include="SelectCharMacFix.cpp" />

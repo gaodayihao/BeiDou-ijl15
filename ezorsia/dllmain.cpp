@@ -18,6 +18,7 @@
 #include "PetBuffConfig.h"
 #include "ManaReflectLevelFix.h"
 #include "MobVac.h"
+#include "GodMode.h"
 #pragma comment(lib, "ws2_32.lib")
 
 // config.ini can use IP or hostname (ServerIP_Address=...).
@@ -81,6 +82,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		bool itemWndRemember = true; // and the expand/collapse choice survives a session (same module)
 		bool manaReflectFix = true; // fix the Mana Reflection reflect rate for I/L + Bishop mages (ManaReflectLevelFix.cpp)
 		bool mobVac = false; // mob vacuum, Ctrl+0 toggles it (MobVac.cpp); off unless config.ini says otherwise
+		bool godMode = false; // invincibility, Ctrl+9 toggles it (GodMode.cpp); off unless config.ini says otherwise
 		INIReader reader("config.ini");
 		if (reader.ParseError() == 0) {
 			Client::m_nGameWidth = reader.GetInteger("general", "width", 1280);
@@ -119,6 +121,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			itemWndRemember = reader.GetBoolean("optional", "itemWndRemember", true);
 			manaReflectFix = reader.GetBoolean("debug", "manaReflectFix", true);
 			mobVac = reader.GetBoolean("optional", "mobVac", false);
+			godMode = reader.GetBoolean("optional", "godMode", false);
 			MobVac::nRange = reader.GetInteger("optional", "mobVacRange", MobVac::nRange);
 			MobVac::nIntervalMs = reader.GetInteger("optional", "mobVacIntervalMs", MobVac::nIntervalMs);
 			PetSkillSlot::bEnabled = reader.GetBoolean("optional", "petBuff", true);
@@ -200,6 +203,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		PetBuffConfig::Hook(); // pet auto-buff configuration: save to / load from the server (0x1001)
 		Hook_ManaReflectLevelFix(manaReflectFix); // fix: Mana Reflection level row for I/L + Bishop mages
 		Hook_MobVac(mobVac); // mob vacuum: Ctrl+0 holds every non-boss mob on the spot you pressed it at
+		Hook_GodMode(godMode); // invincibility: Ctrl+9 makes the player take no mob damage and no debuff
 		Client::WorldMap();
 		Client::RefreshRate(); 
 		Client::DeleteChar();
