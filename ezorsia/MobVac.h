@@ -52,12 +52,9 @@
 //
 // Enable with [optional] mobVac=true in config.ini (default off); mobVacRange (default 80, pixels per
 // axis) and mobVacIntervalMs (default 80, minimum gap between two pulls of the same mob) tune it.
-// With [debug] debug=true the module logs to the console DllMain allocates: the install result, the
-// toggle, and (once a second) the running counters plus one row per mob - where it was when it was
-// checked, where the frame left it, and what its controllers and its acknowledged-point cache say.
+// The module prints nothing while it runs - only the one install/refuse line at startup.
 namespace MobVac
 {
-	extern bool bDebug;
 	extern int nRange;        // mobVacRange: how far a mob may stray before it is pulled back
 	extern int nIntervalMs;   // mobVacIntervalMs: how long a pulled mob is left alone
 }

@@ -132,7 +132,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			BossHP::bShowText = reader.GetBoolean("optional", "bossHpText", true);
 			BossHP::bShowTextName = reader.GetBoolean("optional", "bossHpTextShowName", true);
 			BossHP::bTextDebug = Client::debug; // diagnostics follow the existing [debug] debug= switch
-			MobVac::bDebug = Client::debug; // same switch for the mob vacuum module
 			QuestBulb::bFixed = reader.GetBoolean("optional", "questBulbFixed", true);
 			QuestBulb::nFixedX = reader.GetInteger("optional", "questBulbX", 10);
 			QuestBulb::nFixedY = reader.GetInteger("optional", "questBulbY", -1);
