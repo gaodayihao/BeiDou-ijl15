@@ -16,6 +16,11 @@
 //     builds and sends CP_UserHit: COutPacket(0x30) at 0x009593FC, CClientSocket::SendPacket at
 //     0x00959585.
 //
+//   * The local user object is NOT stable across a map change: CField::Init (0x00529269, call at
+//     0x005293BE) calls CUserPool::CreateLocalUser (0x00971658), which allocates a fresh 0x3280-byte
+//     CUserLocal and runs its constructor + Init. So the singleton moves on every field entry, and
+//     anything keyed to the object has to follow it (see IsLiveUserLocal).
+//
 //   * CP_UserHit (0x30) has exactly four senders in the whole client. Three are inside
 //     CUserLocal::Update (0x0094B14F, 0x0094B290, 0x0094B8D7) and report FIELD damage: they log
 //     StringPool 0x1561 and none of them names a mob. The fourth is SetDamaged. So mob damage has a
@@ -76,6 +81,11 @@ static const DWORD POLL_INTERVAL_MS = 15;
 // every map change. Only a long one - the login screen, character select - means it really is over.
 static const DWORD NO_FIELD_GRACE_MS = 5000;
 
+// How far from "now" the object's own "no damage until" timestamp may be and still count as sane
+// (see IsLiveUserLocal). The game writes it as `now + <attack duration>` and this module as
+// `now + NO_DAMAGE_WINDOW_MS`, so anything outside a minute means the memory is not a live object.
+static const unsigned int SANE_TIMESTAMP_WINDOW_MS = 60000;
+
 // Ctrl+9 toggles; the game itself does not bind that combination. Both the top-row and the numpad
 // nine are accepted, because which one "9" means is a keyboard-layout detail.
 static const int VK_TOGGLE_KEY = '9';
@@ -110,7 +120,6 @@ static tOnTemporaryStatSet g_origOnTemporaryStatSet = nullptr;
 static bool g_bEnabled = false;      // config.ini switch - the thread only starts when set
 static bool g_bActive = false;       // invincibility currently on (toggled by Ctrl+9)
 static bool g_bComboDown = false;    // Ctrl+9 edge detection
-static void* g_pLastUser = nullptr;  // CUserLocal*, to notice a relogin/character change
 static DWORD g_dwNoFieldSince = 0;   // tick the field first went away; 0 = a field is present
 
 // Is this GIVE_BUFF packet a debuff? See the file header: the server writes the mask as two longs
@@ -162,10 +171,18 @@ static bool IsDataPointer(const void* p)
 	return v >= 0x00AF0000u && v < 0x00C00000u;   // where the client keeps its vtables
 }
 
-// Is the object at the singleton really a live CUserLocal? Its vtable has to sit in the client's own
-// vtable region and that vtable's SetDamaged slot (0x00B3D20C + 0x48 = 0x00B3D254) has to hold
-// CUserLocal::SetDamaged; a stale pointer left behind by a logout fails both. Nothing is written
-// unless this passes, so a wrong base cannot corrupt whatever is there now.
+// Is the object at the singleton really a live CUserLocal?
+//
+// Two things are checked, because the pointer is not stable: CField::Init calls
+// CUserPool::CreateLocalUser (0x5293BE -> 0x971658), which allocates a fresh 0x3280-byte CUserLocal
+// and runs its constructor + Init every time a field is entered - so the singleton changes on every
+// map change, and a stale pointer can also outlive a logout.
+//   * the vtable has to sit in the client's own vtable region, and that vtable's SetDamaged slot
+//     (0x00B3D20C + 0x48 = 0x00B3D254) has to hold CUserLocal::SetDamaged;
+//   * the "no damage until" field we are about to write has to hold something sane - 0 (a fresh
+//     object) or a timestamp within a minute of now (the game's own melee window, or ours). A freed
+//     or recycled block fails that.
+// Nothing is written unless this passes, so a wrong base cannot corrupt whatever is there now.
 static bool IsLiveUserLocal(void* pUser)
 {
 	if (pUser == nullptr)
@@ -179,7 +196,22 @@ static bool IsLiveUserLocal(void* pUser)
 		return false;
 	}
 
-	return ppVtbl[OFF_Vtbl_SetDamaged / 4] == reinterpret_cast<void*>(ADDR_CUserLocal_SetDamaged);
+	if (ppVtbl[OFF_Vtbl_SetDamaged / 4] != reinterpret_cast<void*>(ADDR_CUserLocal_SetDamaged))
+	{
+		return false;
+	}
+
+	const unsigned int nUntil = *reinterpret_cast<unsigned int*>(reinterpret_cast<char*>(pUser) + OFF_CUserLocal_NoDamageUntil);
+	if (nUntil != 0)
+	{
+		const unsigned int nNow = static_cast<unsigned int>(g_GetUpdateTime());
+		if (nNow - nUntil > SANE_TIMESTAMP_WINDOW_MS && nUntil - nNow > SANE_TIMESTAMP_WINDOW_MS)
+		{
+			return false;
+		}
+	}
+
+	return true;
 }
 
 // Hold the client's own invincibility state open: put the "no damage until" timestamp a window into
@@ -211,24 +243,10 @@ static DWORD WINAPI GodModeThread(LPVOID /*param*/)
 		void* pField = GetCurrentField();
 		void* pUser = *reinterpret_cast<void**>(ADDR_UserLocal_Instance);
 
-		if (pUser != g_pLastUser)
-		{
-			// Relogin or character change: the object the state was being held on is gone.
-			g_pLastUser = pUser;
-			g_bActive = false;
-			g_dwNoFieldSince = 0;
-		}
-
-		if (pUser == nullptr || !IsLiveUserLocal(pUser))
-		{
-			// Logged out, or the object is not a live CUserLocal: never write through it.
-			g_bActive = false;
-			g_dwNoFieldSince = 0;
-			continue;
-		}
-
-		// A map change is not the end of the mode (see NO_FIELD_GRACE_MS); a lasting absence of the
-		// field is. The character keeps the state across a map change either way.
+		// Only a lasting absence of the field means the character left the game. Entering a field
+		// rebuilds the local user (see IsLiveUserLocal) and clears the field carrier while it does,
+		// so neither a new object nor a momentary gap may end the mode - the state is carried over
+		// to the new object instead.
 		const DWORD dwNow = GetTickCount();
 		if (pField == nullptr)
 		{
@@ -247,7 +265,10 @@ static DWORD WINAPI GodModeThread(LPVOID /*param*/)
 			g_dwNoFieldSince = 0;
 		}
 
-		if (g_bActive)
+		// The object is written through only when it validates: a fresh one is mid-construction for
+		// a moment and a stale one must never be touched. A skipped tick costs nothing - the
+		// timestamp lasts a second and is re-pushed on the next one.
+		if (g_bActive && IsLiveUserLocal(pUser))
 		{
 			HoldInvincible(pUser);
 		}

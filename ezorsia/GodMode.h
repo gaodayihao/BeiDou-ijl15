@@ -34,11 +34,13 @@
 //     and ZOMBIFY only changes the HP floor Character.applyHpMpChange :8227 uses;
 //   * damage the server applies on its own (GM commands, event scripts) is untouched.
 //
-// The state survives a map change: while the client swaps fields it clears the field carrier first,
-// so a momentary "no field" is normal and is not taken as leaving the game (only a lasting one is,
-// e.g. the login screen or character select). It is dropped when the character object changes and
-// when the mode is switched off - switching off also clears the timestamp, so the immunity ends
-// immediately instead of running out its last window.
+// The state survives a map change, and two client behaviours have to be allowed for to make that
+// work: entering a field REBUILDS the local user (CField::Init calls CUserPool::CreateLocalUser, so
+// the object the timestamp is held on is replaced), and the field carrier is cleared while the client
+// swaps fields. The mode therefore follows the object instead of being tied to it, and only a lasting
+// absence of the field (login screen, character select) ends it - an object that fails to validate
+// only costs one tick, it does not end the mode. Switching the mode off also clears the timestamp, so
+// the immunity ends immediately instead of running out its last window.
 //
 // Enable with [optional] godMode=true in config.ini (default off). There is nothing to tune.
 // The module prints nothing while it runs - only the one install/refuse line at startup.
