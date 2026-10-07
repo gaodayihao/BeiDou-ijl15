@@ -119,7 +119,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 			fixNewCharEquipNull = reader.GetBoolean("optional", "fixNewCharEquipNull", true);
 			itemWndExpanded = reader.GetBoolean("optional", "itemWndExpanded", true);
 			itemWndRemember = reader.GetBoolean("optional", "itemWndRemember", true);
-			manaReflectFix = reader.GetBoolean("debug", "manaReflectFix", true);
+			manaReflectFix = reader.GetBoolean("optional", "manaReflectFix", true);
 			mobVac = reader.GetBoolean("optional", "mobVac", false);
 			godMode = reader.GetBoolean("optional", "godMode", false);
 			MobVac::nRange = reader.GetInteger("optional", "mobVacRange", MobVac::nRange);
